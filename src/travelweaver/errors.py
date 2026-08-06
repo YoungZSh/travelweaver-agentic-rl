@@ -27,3 +27,7 @@ class ConfigurationError(TravelWeaverError):
 
 class ApiRolloutError(TravelWeaverError):
     """An external model request failed during a rollout."""
+
+
+class TaskSpecError(TravelWeaverError):
+    """A task cannot be converted to a safe, supported TravelTaskSpec."""

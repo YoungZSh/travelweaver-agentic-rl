@@ -19,10 +19,24 @@ from ..paths import project_root
 CHINATRAVEL_DATASET = "LAMDA-NeSy/ChinaTravel"
 CHINATRAVEL_DATASET_REVISION = "802b18d9844a4a9927bb5750edd155e918c20913"
 EASY_CSV_SHA256 = "a74520d152c04c09f47850e1e313c2c285a679ed70ccc200592395085f74bf41"
-EASY_CSV_URL = (
-    "https://huggingface.co/datasets/LAMDA-NeSy/ChinaTravel/resolve/"
-    f"{CHINATRAVEL_DATASET_REVISION}/easy.csv"
-)
+_SPLITS: dict[str, tuple[int, str]] = {
+    "easy": (300, EASY_CSV_SHA256),
+    "medium": (150, "9cd49188a8f2a01b900abecc3f10263c257bcb761cf2635e5f0d4fb53d93f77b"),
+    "human": (154, "e6cfe692f2ad902ae075d55b005d7f8ff20cfbcd745da4f9c8e79ca69cb65fbe"),
+    "preference_base50": (
+        50,
+        "3c83ea677c3d312e1d5d792b3e379c7d0d0ec90fc91ea1d161877f2f6bae7331",
+    ),
+}
+
+
+def _split_url(split: str) -> str:
+    return (
+        "https://huggingface.co/datasets/LAMDA-NeSy/ChinaTravel/resolve/"
+        f"{CHINATRAVEL_DATASET_REVISION}/{split}.csv"
+    )
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         raise DataUnavailableError(
@@ -108,31 +122,40 @@ def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def import_easy_tasks(
-    output_dir: str | Path, *, source_csv: str | Path | None = None
+def import_task_split(
+    output_dir: str | Path,
+    *,
+    split: str,
+    source_csv: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Download, verify, split, and persist the pinned Easy task snapshot."""
+    """Download, verify, separate, and persist one pinned benchmark split."""
+
+    if split not in _SPLITS:
+        raise DataUnavailableError(f"Unsupported ChinaTravel task split: {split}")
+    expected_count, expected_digest = _SPLITS[split]
 
     temporary_path: Path | None = None
     if source_csv is None:
         with tempfile.NamedTemporaryFile(
-            prefix="travelweaver-easy-", suffix=".csv", delete=False
+            prefix=f"travelweaver-{split}-", suffix=".csv", delete=False
         ) as handle:
             temporary_path = Path(handle.name)
         try:
-            urllib.request.urlretrieve(EASY_CSV_URL, temporary_path)
+            urllib.request.urlretrieve(_split_url(split), temporary_path)
         except Exception as error:
             temporary_path.unlink(missing_ok=True)
-            raise DataUnavailableError(f"Failed to download pinned Easy split: {error}") from error
+            raise DataUnavailableError(
+                f"Failed to download pinned {split} split: {error}"
+            ) from error
         csv_path = temporary_path
     else:
         csv_path = Path(source_csv)
 
     try:
         digest = hashlib.sha256(csv_path.read_bytes()).hexdigest()
-        if source_csv is None and digest != EASY_CSV_SHA256:
+        if source_csv is None and digest != expected_digest:
             raise DataUnavailableError(
-                f"Easy split checksum mismatch: expected {EASY_CSV_SHA256}, got {digest}"
+                f"{split} split checksum mismatch: expected {expected_digest}, got {digest}"
             )
         public_rows: list[dict[str, Any]] = []
         oracle_rows: list[dict[str, Any]] = []
@@ -161,15 +184,17 @@ def import_easy_tasks(
                         "dataset_revision": CHINATRAVEL_DATASET_REVISION,
                     }
                 )
-        if source_csv is None and len(public_rows) != 300:
-            raise DataUnavailableError(f"Expected 300 Easy tasks, found {len(public_rows)}")
+        if source_csv is None and len(public_rows) != expected_count:
+            raise DataUnavailableError(
+                f"Expected {expected_count} {split} tasks, found {len(public_rows)}"
+            )
         output = Path(output_dir)
-        public_path = output / "easy.public.jsonl"
-        oracle_path = output / "easy.oracle.jsonl"
+        public_path = output / f"{split}.public.jsonl"
+        oracle_path = output / f"{split}.oracle.jsonl"
         _write_jsonl(public_path, public_rows)
         _write_jsonl(oracle_path, oracle_rows)
         return {
-            "split": "easy",
+            "split": split,
             "count": len(public_rows),
             "source_sha256": digest,
             "public_path": str(public_path),
@@ -178,3 +203,48 @@ def import_easy_tasks(
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def import_easy_tasks(
+    output_dir: str | Path, *, source_csv: str | Path | None = None
+) -> dict[str, Any]:
+    """Backward-compatible Easy split importer."""
+
+    return import_task_split(output_dir, split="easy", source_csv=source_csv)
+
+
+def import_benchmark_tasks(output_dir: str | Path) -> dict[str, Any]:
+    """Import and combine all 654 ChinaTravel tasks with executable oracle data."""
+
+    reports = [import_task_split(output_dir, split=split) for split in _SPLITS]
+    output = Path(output_dir)
+    public_rows: list[dict[str, Any]] = []
+    oracle_rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for split in _SPLITS:
+        split_public = _read_jsonl(output / f"{split}.public.jsonl")
+        split_oracle = _read_jsonl(output / f"{split}.oracle.jsonl")
+        for public, oracle in zip(split_public, split_oracle, strict=True):
+            uid = str(public["uid"])
+            if oracle["uid"] != uid:
+                raise DataUnavailableError(f"{split} public/oracle rows are out of order.")
+            if uid in seen_ids:
+                namespaced = f"{split}:{uid}"
+                public = {**public, "source_uid": uid, "uid": namespaced}
+                oracle = {**oracle, "source_uid": uid, "uid": namespaced}
+            seen_ids.add(str(public["uid"]))
+            public_rows.append(public)
+            oracle_rows.append(oracle)
+    if len(public_rows) != 654 or len({row["uid"] for row in public_rows}) != 654:
+        raise DataUnavailableError("Combined benchmark must contain 654 addressable task rows.")
+    public_path = output / "benchmark.public.jsonl"
+    oracle_path = output / "benchmark.oracle.jsonl"
+    _write_jsonl(public_path, public_rows)
+    _write_jsonl(oracle_path, oracle_rows)
+    return {
+        "split": "benchmark",
+        "count": len(public_rows),
+        "components": reports,
+        "public_path": str(public_path),
+        "oracle_path": str(oracle_path),
+    }

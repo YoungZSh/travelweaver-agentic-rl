@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..data.bootstrap import install_database, validate_database
-from ..data.tasks import JsonlTaskStore, import_easy_tasks
+from ..data.tasks import JsonlTaskStore, import_benchmark_tasks, import_task_split
 from ..env import ChinaTravelBackend, TravelWeaverEnv
 from ..errors import TravelWeaverError
 from ..paths import project_root
@@ -41,10 +41,14 @@ def _bootstrap(args: argparse.Namespace) -> int:
 
 
 def _import_tasks(args: argparse.Namespace) -> int:
-    if args.split != "easy":
-        raise TravelWeaverError("The MVP importer currently supports only --split easy.")
     output_dir = Path(args.output_dir) if args.output_dir else project_root() / "data" / "tasks"
-    _print(import_easy_tasks(output_dir, source_csv=args.source_csv))
+    if args.split == "benchmark":
+        if args.source_csv:
+            raise TravelWeaverError("--source-csv cannot be used with --split benchmark.")
+        report = import_benchmark_tasks(output_dir)
+    else:
+        report = import_task_split(output_dir, split=args.split, source_csv=args.source_csv)
+    _print(report)
     return 0
 
 
@@ -116,7 +120,11 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap.set_defaults(handler=_bootstrap)
 
     import_tasks = subparsers.add_parser("import-tasks", help="Import a pinned task split.")
-    import_tasks.add_argument("--split", default="easy", choices=["easy"])
+    import_tasks.add_argument(
+        "--split",
+        default="easy",
+        choices=["easy", "medium", "human", "preference_base50", "benchmark"],
+    )
     import_tasks.add_argument("--output-dir")
     import_tasks.add_argument("--source-csv", help="Testing/manual source instead of Hub download.")
     import_tasks.set_defaults(handler=_import_tasks)
