@@ -10,14 +10,20 @@ MVP 将 ChinaTravel 的固定数据快照包装为一个可回放的进程内 Py
 reset(task) -> 查询证据 -> 管理候选 -> submit_plan / finish_without_plan -> terminal
 ```
 
-环境已经包含完整的 13 工具状态闭环、一个确定性 Demo Agent，以及用于真实模型 smoke 测试的 OpenAI-compatible function-calling rollout；命令行当前提供 DeepSeek 官方 API 配置。当前所有有效动作的 Reward 仍为 `0.0`，确定性 Reward 留到环境协议稳定之后补全；SFT 数据处理与 veRL/GRPO 暂不实现，项目不引入 MCP。
+环境已经包含完整的 13 工具状态闭环、确定性 Demo Agent、OpenAI-compatible
+function-calling rollout、通用 TravelTaskSpec、终局 TravelReward 和严格 RFT 过滤。
+普通查询动作 Reward 为 `0.0`，只有提交、退出或截断产生终局 Reward。SFT 数据加工与
+veRL/GRPO 训练循环暂不实现，项目不引入 MCP。
 
 版本基线：
 
 - Python `3.10.19`，项目约束 `>=3.10,<3.11`；
 - ChinaTravel submodule commit `456b60a28ce0626875a968666c07094e3c90520e`；
 - 后续训练使用独立 Linux/CUDA 环境和 `verl==0.8.0`；
-- 环境、Observation、工具协议分别为 `travelweaver-environment-v0.2`、`travelweaver-observation-v2`、`travelweaver-tools-v1-agent`。
+- 环境、Observation、工具协议分别为 `travelweaver-environment-v0.3`、
+  `travelweaver-observation-v3`、`travelweaver-tools-v2-agent`；
+- TaskSpec、Reward 和轨迹协议分别为 `travelweaver-task-spec-v1`、
+  `travelweaver-reward-v1`、`travelweaver-trajectory-v3`。
 
 ## 2. 安装与数据准备
 
@@ -25,7 +31,7 @@ reset(task) -> 查询证据 -> 管理候选 -> submit_plan / finish_without_plan
 git submodule update --init --recursive
 uv sync --dev
 uv run travelweaver bootstrap chinatravel
-uv run travelweaver import-tasks --split easy
+uv run travelweaver import-tasks --split benchmark
 ```
 
 `bootstrap chinatravel` 会先检查 ChinaTravel 官方数据库；缺失时尝试下载官方 Google Drive 文件夹。也可以先从官方 Google Drive 或 NJU Drive 手动下载压缩包，再执行：
@@ -42,10 +48,16 @@ uv run travelweaver bootstrap chinatravel --verify-only
 
 校验清单包含：10 份景点、10 份餐厅、10 份酒店、10 份 POI、90 份有向火车数据、航班数据和地铁数据，共 132 个必要文件。
 
-任务导入器固定使用 Hugging Face `LAMDA-NeSy/ChinaTravel` revision `802b18d9844a4a9927bb5750edd155e918c20913`。Easy CSV 必须匹配 SHA-256 `a74520d152c04c09f47850e1e313c2c285a679ed70ccc200592395085f74bf41`，然后生成：
+任务导入器固定使用 Hugging Face `LAMDA-NeSy/ChinaTravel` revision
+`802b18d9844a4a9927bb5750edd155e918c20913`。`benchmark` 会校验并合并 Easy 300、
+Medium 150、Human 154 和 Preference base 50，共 654 行，然后生成：
 
-- `data/tasks/easy.public.jsonl`：Agent 可见的中文查询和基础元数据；
-- `data/tasks/easy.oracle.jsonl`：环境内部使用的约束字符串。
+- `data/tasks/benchmark.public.jsonl`：Agent 可见的中文查询和基础元数据；
+- `data/tasks/benchmark.oracle.jsonl`：环境内部使用的约束字符串；
+- 四个原始 split 各自对应的 public/oracle 文件。
+
+Preference base 50 的原始 UID 与 Easy 重复；合并快照将重复行命名为
+`preference_base50:<source_uid>` 并保留 `source_uid`，因此 654 行均可独立寻址。
 
 导入器使用 `ast.literal_eval` 将 `hard_logic_py` 解析为字符串列表，但绝不执行约束源码。
 
@@ -96,11 +108,29 @@ env.close()
 
 每页默认 10 条。Cursor 与 episode、查询和偏移绑定，使用一次后失效，不能跨轨迹复用。`inspect_place`、`search_nearby`、`get_route` 只接受本 episode 已经展示过的 `place_id`；`save_candidate` 也只能保存本 episode 已见的地点或交通 ID。
 
-`submit_plan` 会验证任务人数和城市、天数顺序、活动不重叠、候选证据引用、活动与实体类型匹配、往返城际交通、景点以及多日住宿。通过后以 `plan_submitted` 终止；暂不计算质量 Reward。
+`get_route` 返回 episode 内登记的稳定 `route_id`。同一天相邻同城地点活动必须在后一
+活动的 `route_from_previous_id` 中引用该路线；城际活动时间必须与车次/航班证据一致。
+住宿活动显式提交 `rooms` 和 `room_type`，门票、车票和出租车数量由环境按人数推导。
 
-稳定 ID 规则：景点和餐厅优先使用城市、类型和上游数字 ID；酒店使用城市、类型和规范化名称哈希；火车和航班使用独立 `transport_id`。
+`submit_plan` 验证任务元数据、天数、活动时序、候选和路线引用、营业时间、往返城际
+交通、景点、多日住宿及房间容量。环境重新计算所有单价、数量和总费用，并生成
+`PlanSnapshot` 与 `EvidenceBundle` 后调用确定性 Reward。
 
-## 5. 验证
+稳定 ID 规则：景点和餐厅优先使用城市、类型和上游数字 ID；酒店使用城市、类型和规范化名称哈希；火车和航班使用独立 `transport_id`；完整路线内容使用 `route_id`。
+
+## 5. TaskSpec、Reward 与 RFT
+
+每次 `reset` 都在 Actor 不可见的边界解析并冻结 `TravelTaskSpec`。ChinaTravel oracle
+通过安全 AST 适配器转换，654 行当前全部覆盖且绝不执行源码；自由文本任务可通过
+`LLMTaskSpecCompiler` 的单一 function call 生成候选 Spec，再以确定性校验失败关闭。
+
+所有检查返回 `pass | fail | unverifiable`。设硬检查通过率为 `H`、软约束满足率为
+`S`：无可评估提交为 `-1`；硬约束失败为 `-1+H`；全部硬约束通过为
+`0.5+0.5×S`；基础设施不可验证为 `0` 且 `reward_valid=false`。严格 RFT 过滤只接纳
+正常提交、Reward 有效且全部硬约束通过的轨迹。完整协议见
+[Reward 与离线评估协议](reward-and-evaluation.md)。
+
+## 6. 验证
 
 无需真实数据库即可运行完整单元测试：
 
@@ -109,7 +139,7 @@ uv run pytest
 uv run ruff check .
 ```
 
-安装真实数据库和 Easy 任务后运行：
+安装真实数据库和任务快照后运行：
 
 ```bash
 uv run travelweaver smoke-env --task-id e20241028160248698752
@@ -127,7 +157,7 @@ cp .env.example .env
 uv run travelweaver rollout-api --task-id e20241028160248698752
 ```
 
-默认模型为 `deepseek-v4-flash`，完整轨迹按 `travelweaver-trajectory-v2` 写入
+默认模型为 `deepseek-v4-flash`，完整轨迹按 `travelweaver-trajectory-v3` 写入
 `data/trajectories/deepseek-v4-flash.jsonl`。轨迹以标准 OpenAI-compatible
 `messages + tools` 作为可重放对话，同时独立保存已执行 `steps`、审计事件、终止状态
 和 token usage，但不会包含 API key。每个 assistant 回合只执行一个工具；若模型返回
@@ -139,7 +169,11 @@ uv run travelweaver rollout-api --task-id e20241028160248698752
 API 的配置和兼容入口。DeepSeek 的 `thinking` 是可选供应商字段，不属于环境工具
 协议；环境与其他 OpenAI-compatible 模型不依赖它。
 
-## 6. 许可与训练环境
+离线主观评价使用 `OfflineTravelJudge`：它只能看到公开 query、压缩后的工具摘要、
+最终计划和证据摘要，看不到 Reward、oracle 或原始数据库记录。确定性结果、Judge
+Rubric 和轨迹指标作为三个独立面板输出，不合成总分。
+
+## 7. 许可与训练环境
 
 ChinaTravel 上游源码以 Git submodule 引用，不复制到 TravelWeaver 包内。官方旅行数据不会由本项目重新分发；ChinaTravel 数据集卡标注为 CC BY-NC-SA 4.0，商业使用或再分发前需要单独检查授权。
 
