@@ -9,8 +9,8 @@ import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .errors import DataUnavailableError
-from .tasks import project_root
+from ..errors import DataUnavailableError
+from ..paths import project_root
 
 GOOGLE_DRIVE_FOLDER = "https://drive.google.com/drive/folders/1bJ7jA5cfExO_NKxKfi9qgcxEbkYeSdAU"
 NJU_DRIVE_FOLDER = "https://box.nju.edu.cn/d/dd83e5a4a9e242ed8eb4/"

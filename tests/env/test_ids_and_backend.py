@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from travelweaver_env.errors import BackendQueryError
-from travelweaver_env.ids import make_place_id, make_transport_id
+from travelweaver.env.ids import make_place_id, make_transport_id
+from travelweaver.errors import BackendQueryError
 
 
 def test_stable_place_ids() -> None:

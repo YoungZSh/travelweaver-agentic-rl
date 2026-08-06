@@ -11,10 +11,10 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from ..data.tasks import JsonlTaskStore
+from ..errors import BackendQueryError, EnvironmentStateError, TravelWeaverError
 from .backend import Backend
-from .errors import BackendQueryError, EnvironmentStateError, TravelWeaverError
 from .models import Observation, StepResult
-from .tasks import JsonlTaskStore
 from .tool_schemas import parameter_schema, tool_schemas
 
 ENVIRONMENT_VERSION = "travelweaver-environment-v0.2"

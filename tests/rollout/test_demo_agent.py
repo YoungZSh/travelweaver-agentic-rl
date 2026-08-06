@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from travelweaver_env import DemoTravelAgent
+from travelweaver.rollout import DemoTravelAgent
 
 
 def test_demo_agent_reaches_plan_submitted(env) -> None:

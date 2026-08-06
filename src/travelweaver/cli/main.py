@@ -9,12 +9,18 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from .agent import DemoTravelAgent
-from .backend import ChinaTravelBackend
-from .bootstrap import install_database, validate_database
-from .environment import TravelWeaverEnv
-from .errors import TravelWeaverError
-from .tasks import JsonlTaskStore, import_easy_tasks, project_root
+from ..data.bootstrap import install_database, validate_database
+from ..data.tasks import JsonlTaskStore, import_easy_tasks
+from ..env import ChinaTravelBackend, TravelWeaverEnv
+from ..errors import TravelWeaverError
+from ..paths import project_root
+from ..rollout import (
+    DeepSeekConfig,
+    DeepSeekToolAgent,
+    DemoTravelAgent,
+    append_trajectory,
+    default_trajectory_path,
+)
 
 
 def _print(payload: Any) -> None:
@@ -72,9 +78,30 @@ def _run_agent(args: argparse.Namespace) -> int:
         env.close()
 
 
+def _rollout_api(args: argparse.Namespace) -> int:
+    config = DeepSeekConfig.from_env(args.env_file)
+    store = JsonlTaskStore.default(split="easy")
+    env = TravelWeaverEnv(ChinaTravelBackend(), store)
+    try:
+        run = DeepSeekToolAgent(
+            env,
+            config,
+            max_api_turns=args.max_api_turns,
+        ).run(task_id=args.task_id, seed=args.seed)
+    finally:
+        env.close()
+
+    output_path = Path(args.output) if args.output else default_trajectory_path(config.model)
+    destination = append_trajectory(output_path, run.to_dict(include_trajectory=True))
+    payload = run.to_dict(include_trajectory=args.verbose)
+    payload["trajectory_path"] = str(destination.resolve())
+    _print(payload)
+    return 0 if run.success else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="travelweaver", description="TravelWeaverEnv data and smoke-test utilities."
+        prog="travelweaver", description="TravelWeaver environment and rollout utilities."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -106,6 +133,19 @@ def build_parser() -> argparse.ArgumentParser:
     run_agent.add_argument("--seed", type=int, default=0)
     run_agent.add_argument("--verbose", action="store_true", help="Include the full trajectory.")
     run_agent.set_defaults(handler=_run_agent)
+
+    rollout_api = subparsers.add_parser(
+        "rollout-api", help="Run a model-driven episode through the DeepSeek tool API."
+    )
+    rollout_api.add_argument("--task-id")
+    rollout_api.add_argument("--seed", type=int, default=0)
+    rollout_api.add_argument("--env-file", default=str(project_root() / ".env"))
+    rollout_api.add_argument("--output", help="Append the complete run to this JSONL file.")
+    rollout_api.add_argument("--max-api-turns", type=int, default=40)
+    rollout_api.add_argument(
+        "--verbose", action="store_true", help="Also print the complete trajectory."
+    )
+    rollout_api.set_defaults(handler=_rollout_api)
     return parser
 
 

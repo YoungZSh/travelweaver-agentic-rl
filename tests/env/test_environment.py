@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from travelweaver_env import InMemoryBackend, TravelWeaverEnv
-from travelweaver_env.errors import EnvironmentStateError
+from travelweaver.env import InMemoryBackend, TravelWeaverEnv
+from travelweaver.errors import EnvironmentStateError
 
 
 def _step(env: TravelWeaverEnv, tool: str, **arguments: object):

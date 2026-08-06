@@ -3,7 +3,7 @@ from __future__ import annotations
 import zipfile
 from pathlib import Path
 
-from travelweaver_env.bootstrap import (
+from travelweaver.data.bootstrap import (
     expected_database_files,
     install_database,
     validate_database,

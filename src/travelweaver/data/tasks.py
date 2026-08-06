@@ -13,7 +13,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from .errors import DataUnavailableError, TaskNotFoundError
+from ..errors import DataUnavailableError, TaskNotFoundError
+from ..paths import project_root
 
 CHINATRAVEL_DATASET = "LAMDA-NeSy/ChinaTravel"
 CHINATRAVEL_DATASET_REVISION = "802b18d9844a4a9927bb5750edd155e918c20913"
@@ -22,12 +23,6 @@ EASY_CSV_URL = (
     "https://huggingface.co/datasets/LAMDA-NeSy/ChinaTravel/resolve/"
     f"{CHINATRAVEL_DATASET_REVISION}/easy.csv"
 )
-
-
-def project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         raise DataUnavailableError(

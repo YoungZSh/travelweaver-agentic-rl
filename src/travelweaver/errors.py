@@ -19,3 +19,11 @@ class EnvironmentStateError(TravelWeaverError):
 
 class TaskNotFoundError(TravelWeaverError):
     """A requested task identifier is not present in the task store."""
+
+
+class ConfigurationError(TravelWeaverError):
+    """Required runtime configuration is absent or invalid."""
+
+
+class ApiRolloutError(TravelWeaverError):
+    """An external model request failed during a rollout."""

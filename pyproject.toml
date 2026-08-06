@@ -17,8 +17,14 @@ dependencies = [
   "pandas>=2.2,<3",
 ]
 
+[project.optional-dependencies]
+api = [
+  "openai>=1.0,<3",
+  "python-dotenv>=1.0,<2",
+]
+
 [project.scripts]
-travelweaver = "travelweaver_env.cli:main"
+travelweaver = "travelweaver.cli.main:main"
 
 [dependency-groups]
 dev = [
@@ -28,7 +34,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/travelweaver_env"]
+packages = ["src/travelweaver"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

@@ -13,7 +13,8 @@ from typing import Any, Protocol
 
 from geopy.distance import geodesic
 
-from .errors import BackendQueryError, DataUnavailableError
+from ..errors import BackendQueryError, DataUnavailableError
+from ..paths import project_root
 from .ids import make_place_id, make_transport_id, normalize_name
 
 
@@ -417,7 +418,7 @@ class ChinaTravelBackend(RecordBackend):
         if lang != "zh":
             raise ValueError("The MVP currently supports lang='zh' only.")
         if source_root is None:
-            source_root = Path(__file__).resolve().parents[2] / "vendor" / "ChinaTravel"
+            source_root = project_root() / "vendor" / "ChinaTravel"
         self.source_root = Path(source_root).resolve()
         if not (self.source_root / "chinatravel").is_dir():
             raise DataUnavailableError(

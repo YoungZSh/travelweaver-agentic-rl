@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from travelweaver_env.errors import DataUnavailableError, TaskNotFoundError
-from travelweaver_env.tasks import JsonlTaskStore, import_easy_tasks
+from travelweaver.data.tasks import JsonlTaskStore, import_easy_tasks
+from travelweaver.errors import DataUnavailableError, TaskNotFoundError
 
 FIELDNAMES = [
     "uid",

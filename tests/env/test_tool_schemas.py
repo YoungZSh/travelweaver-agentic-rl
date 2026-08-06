@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from travelweaver_env.tool_schemas import parameter_schema, tool_schemas
+from travelweaver.env.tool_schemas import parameter_schema, tool_schemas
 
 
 def test_tool_schema_names_and_defensive_copy() -> None:

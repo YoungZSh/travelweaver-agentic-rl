@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .environment import TravelWeaverEnv
-from .models import Observation, StepResult
+from ..env.environment import TravelWeaverEnv
+from ..env.models import Observation, StepResult
 
 
 @dataclass(frozen=True)

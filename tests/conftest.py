@@ -5,8 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from travelweaver_env import InMemoryBackend, JsonlTaskStore, TravelWeaverEnv
-from travelweaver_env.ids import make_place_id, make_transport_id
+from travelweaver.data import JsonlTaskStore
+from travelweaver.env import InMemoryBackend, TravelWeaverEnv
+from travelweaver.env.ids import make_place_id, make_transport_id
 
 
 def _place(
