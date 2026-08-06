@@ -10,7 +10,7 @@ MVP 将 ChinaTravel 的固定数据快照包装为一个可回放的进程内 Py
 reset(task) -> 查询证据 -> 管理候选 -> submit_plan / finish_without_plan -> terminal
 ```
 
-环境已经包含完整的 13 工具状态闭环和一个确定性 Demo Agent。当前所有有效动作的 Reward 仍为 `0.0`；确定性 Reward、MCP/HTTP、veRL Agent Loop、SFT/GRPO 数据生产留到后续里程碑。
+环境已经包含完整的 13 工具状态闭环、一个确定性 Demo Agent，以及用于真实模型 smoke 测试的 OpenAI-compatible function-calling rollout；命令行当前提供 DeepSeek 官方 API 配置。当前所有有效动作的 Reward 仍为 `0.0`，确定性 Reward 留到环境协议稳定之后补全；SFT 数据处理与 veRL/GRPO 暂不实现，项目不引入 MCP。
 
 版本基线：
 
@@ -52,7 +52,8 @@ uv run travelweaver bootstrap chinatravel --verify-only
 ## 3. Python API
 
 ```python
-from travelweaver_env import ChinaTravelBackend, JsonlTaskStore, TravelWeaverEnv
+from travelweaver.data import JsonlTaskStore
+from travelweaver.env import ChinaTravelBackend, TravelWeaverEnv
 
 backend = ChinaTravelBackend()
 tasks = JsonlTaskStore.default(split="easy")
@@ -116,6 +117,27 @@ uv run travelweaver run-agent --task-id e20241028160248698752
 ```
 
 `smoke-env` 检查真实查询，`run-agent` 使用只调用公开工具的确定性策略跑通查询、候选管理和计划提交，并输出终局方案。测试套件覆盖全部 13 个工具、稳定 ID、过滤排序、无结果、分页、候选隔离、提交校验、两种终止路径、跨 episode 越权、连续非法动作、动作上限、任务 public/oracle 隔离和数据库清单。
+
+使用官方 DeepSeek API 运行一条真实模型轨迹：
+
+```bash
+uv sync --extra api --dev
+cp .env.example .env
+# 在 .env 中填写 DEEPSEEK_API_KEY
+uv run travelweaver rollout-api --task-id e20241028160248698752
+```
+
+默认模型为 `deepseek-v4-flash`，完整轨迹按 `travelweaver-trajectory-v2` 写入
+`data/trajectories/deepseek-v4-flash.jsonl`。轨迹以标准 OpenAI-compatible
+`messages + tools` 作为可重放对话，同时独立保存已执行 `steps`、审计事件、终止状态
+和 token usage，但不会包含 API key。每个 assistant 回合只执行一个工具；若模型返回
+并行调用，规范化消息只保留第一个，其余调用只进入审计事件，避免出现未响应的
+`tool_call_id`。
+
+代码层由通用 `OpenAICompatibleConfig`、`OpenAICompatibleChatClient` 和
+`ToolCallingAgent` 完成协议处理，`DeepSeekConfig` 与 `DeepSeekToolAgent` 是当前官方
+API 的配置和兼容入口。DeepSeek 的 `thinking` 是可选供应商字段，不属于环境工具
+协议；环境与其他 OpenAI-compatible 模型不依赖它。
 
 ## 6. 许可与训练环境
 

@@ -31,7 +31,9 @@ TravelWeaver 是一个面向长程旅行规划的 Agentic RL 项目。项目计�
 - 使用 ChinaTravel 的固定数据快照训练，不直接依赖实时网站和实时 API。
 - 优先支持 ChinaTravel 已覆盖的 10 个城市。
 - 优先完成单 Agent 的长程工具调用，不加入多 Agent 协作。
-- 优先使用 SFT + GRPO 跑通训练闭环。
+- 当前先稳定环境状态机、typed tools、提交校验和在线 API 轨迹协议；Reward 后补。
+- SFT 数据处理和 veRL/GRPO 集成在环境协议稳定后再实现。
+- 模型与环境统一使用 OpenAI-compatible function calling，不引入 MCP。
 - 暂不以生产可用性、全国城市覆盖和实时预订为目标。
 - Tavily、Firecrawl、实时天气、实时车次和航班可以作为后续在线演示层，不进入第一版 RL 训练环境。
 
@@ -438,5 +440,4 @@ Baseline、SFT、GRPO 使用相同测试任务、环境快照、工具协议和 
 - TravelReward-v1 的最终权重和分段值；
 - 任务难度分布及无解任务比例；
 - 是否直接复用 ChinaTravel 输出 schema，还是设计更精简的 itinerary schema；
-- ChinaTravel 数据以依赖、子模块还是转换后快照的方式接入；
-- 第一版是否加入 MCP/HTTP 服务，还是先使用纯 Python 环境接口。
+- ChinaTravel 数据以依赖、子模块还是转换后快照的方式接入。
