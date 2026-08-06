@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from travelweaver.env.ids import make_place_id, make_transport_id
+from travelweaver.env.ids import make_place_id, make_route_id, make_transport_id
 from travelweaver.errors import BackendQueryError
 
 
@@ -18,6 +18,11 @@ def test_stable_place_ids() -> None:
 def test_stable_transport_id() -> None:
     record = {"TrainID": "G1", "From": "上海", "To": "杭州", "BeginTime": "08:00"}
     assert make_transport_id("train", record) == make_transport_id("train", dict(record))
+
+
+def test_stable_route_id() -> None:
+    route = {"origin_place_id": "one", "destination_place_id": "two", "mode": "walk"}
+    assert make_route_id(route) == make_route_id(dict(route))
 
 
 def test_backend_rejects_unsupported_city_and_cross_city_route(backend) -> None:

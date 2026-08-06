@@ -60,7 +60,9 @@ def test_all_eight_tools_and_pagination(env: TravelWeaverEnv) -> None:
         mode="walk",
         start_time="09:00",
     )
-    assert route.observation.tool_result["route"]["segments"][0]["mode"] == "walk"
+    route_payload = route.observation.tool_result["route"]
+    assert route_payload["segments"][0]["mode"] == "walk"
+    assert route_payload["route_id"] in route.observation.visible_route_ids
     json.dumps(route.to_dict(), ensure_ascii=False)
 
 
@@ -169,6 +171,15 @@ def test_candidate_management_and_plan_submission_close_the_loop(env: TravelWeav
         mode="train",
     ).observation.tool_result["items"][0]
 
+    route = _step(
+        env,
+        "get_route",
+        origin_place_id=attraction["place_id"],
+        destination_place_id=restaurant["place_id"],
+        mode="walk",
+        start_time="12:00",
+    ).observation.tool_result["route"]
+
     for item, purpose in (
         (attraction, "attraction"),
         (restaurant, "meal"),
@@ -204,8 +215,8 @@ def test_candidate_management_and_plan_submission_close_the_loop(env: TravelWeav
                     {
                         "candidate_id": outbound["transport_id"],
                         "type": "train",
-                        "start_time": "06:30",
-                        "end_time": "08:30",
+                        "start_time": "08:00",
+                        "end_time": "09:00",
                     },
                     {
                         "candidate_id": attraction["place_id"],
@@ -218,12 +229,13 @@ def test_candidate_management_and_plan_submission_close_the_loop(env: TravelWeav
                         "type": "lunch",
                         "start_time": "12:30",
                         "end_time": "13:30",
+                        "route_from_previous_id": route["route_id"],
                     },
                     {
                         "candidate_id": returning["transport_id"],
                         "type": "train",
                         "start_time": "18:00",
-                        "end_time": "20:00",
+                        "end_time": "19:00",
                     },
                 ],
             }
@@ -235,6 +247,11 @@ def test_candidate_management_and_plan_submission_close_the_loop(env: TravelWeav
     assert submitted.info["termination_reason"] == "plan_submitted"
     assert submitted.observation.tool_result["status"] == "accepted"
     assert submitted.observation.tool_result["validation"]["candidate_grounding"]
+    assert submitted.observation.tool_result["validation"]["route_grounding"]
+    assert submitted.observation.tool_result["plan_snapshot"]["total_cost"] == 234.0
+    assert submitted.observation.tool_result["evidence_bundle"]["routes"] == {
+        route["route_id"]: route
+    }
 
 
 def test_finish_without_plan_is_terminal(env: TravelWeaverEnv) -> None:

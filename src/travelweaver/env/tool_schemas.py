@@ -62,6 +62,21 @@ ACTIVITY = _object(
         },
         "start_time": DAY_TIME,
         "end_time": DAY_TIME,
+        "route_from_previous_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "若前一个同城活动也是地点，引用 get_route 返回的 route_id。",
+        },
+        "rooms": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "住宿活动明确选择的房间数。",
+        },
+        "room_type": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "住宿活动明确选择的每间房床位数。",
+        },
         "note": {"type": "string", "maxLength": 500},
     },
     ["candidate_id", "type", "start_time", "end_time"],
@@ -199,7 +214,7 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
         "type": "function",
         "function": {
             "name": "get_route",
-            "description": "查询同一城市两个已见地点之间的步行、出租车或地铁路线。",
+            "description": "查询同城已见地点间的路线，返回提交计划时引用的稳定 route_id。",
             "parameters": _object(
                 {
                     "origin_place_id": {"type": "string", "minLength": 1},

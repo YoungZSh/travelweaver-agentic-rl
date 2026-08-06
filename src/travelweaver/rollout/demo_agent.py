@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -74,19 +75,6 @@ class DemoTravelAgent:
         restaurant = restaurant_items[0] if restaurant_items else None
         if restaurant is not None:
             self._save(restaurant, "meal", "午餐候选")
-            route = self._call(
-                "get_route",
-                {
-                    "origin_place_id": attraction_id,
-                    "destination_place_id": restaurant["place_id"],
-                    "mode": "walk",
-                    "start_time": "12:00",
-                },
-                require_valid=False,
-            )
-            if not route.info.get("valid_action"):
-                # Route evidence is helpful but is not required for structural submission.
-                pass
 
         hotel: dict[str, Any] | None = None
         if int(task["days"]) > 1:
@@ -102,6 +90,35 @@ class DemoTravelAgent:
                 return self._finish("没有找到可用的返程火车或航班。")
             self._save(returning, "return_transport", "返程城际交通")
 
+        route_ids: dict[tuple[str, str], str] = {}
+        local_sequence = [attraction]
+        if restaurant is not None:
+            local_sequence.append(restaurant)
+        if hotel is not None:
+            local_sequence.append(hotel)
+        route_start_times = ["12:00", "13:30"]
+        for index, (origin, destination) in enumerate(
+            zip(local_sequence, local_sequence[1:], strict=False)
+        ):
+            route = self._call(
+                "get_route",
+                {
+                    "origin_place_id": origin["place_id"],
+                    "destination_place_id": destination["place_id"],
+                    "mode": "walk",
+                    "start_time": route_start_times[index],
+                },
+                require_valid=False,
+            )
+            route_payload = (route.observation.tool_result or {}).get("route", {})
+            if not route.info.get("valid_action") or not isinstance(
+                route_payload.get("route_id"), str
+            ):
+                return self._finish("没有找到可验证的同城活动衔接路线。")
+            route_ids[(origin["place_id"], destination["place_id"])] = route_payload[
+                "route_id"
+            ]
+
         self._call("list_candidates", {})
         plan = self._build_plan(
             task=task,
@@ -110,6 +127,7 @@ class DemoTravelAgent:
             hotel=hotel,
             outbound=outbound,
             returning=returning,
+            route_ids=route_ids,
         )
         submitted = self._call("submit_plan", {"plan": plan}, require_valid=False)
         if not submitted.info.get("valid_action") or not submitted.terminated:
@@ -186,6 +204,7 @@ class DemoTravelAgent:
         hotel: dict[str, Any] | None,
         outbound: dict[str, Any] | None,
         returning: dict[str, Any] | None,
+        route_ids: dict[tuple[str, str], str],
     ) -> dict[str, Any]:
         days = int(task["days"])
         itinerary: list[dict[str, Any]] = []
@@ -196,8 +215,8 @@ class DemoTravelAgent:
                     {
                         "candidate_id": outbound["transport_id"],
                         "type": outbound["mode"],
-                        "start_time": "06:30",
-                        "end_time": "08:30",
+                        "start_time": outbound["departure_time"],
+                        "end_time": outbound["arrival_time"],
                     }
                 )
             activities.append(
@@ -215,6 +234,9 @@ class DemoTravelAgent:
                         "type": "lunch",
                         "start_time": "12:30",
                         "end_time": "13:30",
+                        "route_from_previous_id": route_ids[
+                            (attraction["place_id"], restaurant["place_id"])
+                        ],
                     }
                 )
             if day_number == days and returning is not None:
@@ -222,17 +244,24 @@ class DemoTravelAgent:
                     {
                         "candidate_id": returning["transport_id"],
                         "type": returning["mode"],
-                        "start_time": "18:00",
-                        "end_time": "20:00",
+                        "start_time": returning["departure_time"],
+                        "end_time": returning["arrival_time"],
                     }
                 )
             elif hotel is not None:
+                previous = restaurant if restaurant is not None else attraction
+                room_type = int(hotel.get("room_type") or 1)
                 activities.append(
                     {
                         "candidate_id": hotel["place_id"],
                         "type": "accommodation",
                         "start_time": "20:00",
                         "end_time": "24:00",
+                        "route_from_previous_id": route_ids[
+                            (previous["place_id"], hotel["place_id"])
+                        ],
+                        "rooms": math.ceil(int(task["people_number"]) / room_type),
+                        "room_type": room_type,
                     }
                 )
             itinerary.append({"day": day_number, "activities": activities})

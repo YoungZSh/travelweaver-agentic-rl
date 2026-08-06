@@ -63,3 +63,11 @@ def make_transport_id(mode: str, record: Mapping[str, Any]) -> str:
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
     prefix = _clean_component(source_id) if source_id else "unknown"
     return f"transport:{_clean_component(mode)}:{prefix}:{digest}"
+
+
+def make_route_id(route: Mapping[str, Any]) -> str:
+    """Build a stable id for one fully resolved route result."""
+
+    canonical = json.dumps(dict(route), ensure_ascii=False, sort_keys=True, default=str)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+    return f"route:{digest}"
