@@ -1,0 +1,3 @@
+[submodule "vendor/ChinaTravel"]
+	path = vendor/ChinaTravel
+	url = https://github.com/LAMDA-NeSy/ChinaTravel.git

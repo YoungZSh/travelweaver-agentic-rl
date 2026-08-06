@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "travelweaver-agentic-rl"
+version = "0.1.0"
+description = "A deterministic query environment for long-horizon travel-planning agents."
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+authors = [{ name = "TravelWeaver contributors" }]
+dependencies = [
+  "gdown>=5.2,<6",
+  "geopy>=2.4,<3",
+  "jsonschema>=4.23,<5",
+  "numpy>=1.26,<3",
+  "pandas>=2.2,<3",
+]
+
+[project.scripts]
+travelweaver = "travelweaver_env.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+  "ruff>=0.9,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/travelweaver_env"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

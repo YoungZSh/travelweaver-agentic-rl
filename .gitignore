@@ -1,0 +1,15 @@
+.DS_Store
+.venv/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+
+# Local downloads and generated runtime artifacts.
+data/downloads/
+data/trajectories/
