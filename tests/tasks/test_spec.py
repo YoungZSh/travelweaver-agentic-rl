@@ -114,6 +114,26 @@ def test_llm_compiler_retries_then_quarantines_unsupported_constraints() -> None
     assert all("Unsupported constraint kind" in error for error in result.errors)
 
 
+def test_llm_compiler_rejects_malformed_supported_constraint_values() -> None:
+    malformed = {
+        "constraints": [
+            {
+                "kind": "total_budget",
+                "operator": "lte",
+                "value": {"amount": "很多"},
+                "scope": "trip",
+                "hardness": "hard",
+                "source_text": "总预算不超过3000元",
+            }
+        ],
+        "unscored_preferences": [],
+    }
+    result = LLMTaskSpecCompiler(_ChatClient(malformed, malformed)).compile(_task())
+
+    assert not result.accepted
+    assert all("invalid value payload" in error for error in result.errors)
+
+
 def test_chinatravel_adapter_maps_all_654_pinned_tasks_without_exec() -> None:
     store = JsonlTaskStore.default(split="benchmark")
     adapter = ChinaTravelOracleAdapter()

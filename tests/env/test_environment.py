@@ -245,6 +245,8 @@ def test_candidate_management_and_plan_submission_close_the_loop(env: TravelWeav
     assert submitted.terminated
     assert not submitted.truncated
     assert submitted.info["termination_reason"] == "plan_submitted"
+    assert submitted.reward == 1.0
+    assert submitted.info["reward_detail"]["all_hard_pass"] is True
     assert submitted.observation.tool_result["status"] == "accepted"
     assert submitted.observation.tool_result["validation"]["candidate_grounding"]
     assert submitted.observation.tool_result["validation"]["route_grounding"]
@@ -259,6 +261,7 @@ def test_finish_without_plan_is_terminal(env: TravelWeaverEnv) -> None:
     finished = _step(env, "finish_without_plan", reason="没有符合预算的候选。")
     assert finished.terminated
     assert finished.info["termination_reason"] == "finished_without_plan"
+    assert finished.reward == -1.0
 
 
 def test_invalid_submission_does_not_terminate(env: TravelWeaverEnv) -> None:

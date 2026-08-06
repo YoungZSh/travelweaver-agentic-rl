@@ -8,6 +8,8 @@ def test_demo_agent_reaches_plan_submitted(env) -> None:
     assert run.success
     assert run.termination_reason == "plan_submitted"
     assert run.final_plan is not None
+    assert run.final_reward == 1.0
+    assert run.reward_detail["all_hard_pass"] is True
     assert run.final_plan["itinerary"][0]["activities"]
     actions = [event["action"]["tool"] for event in run.trajectory if event["event"] == "step"]
     assert "save_candidate" in actions

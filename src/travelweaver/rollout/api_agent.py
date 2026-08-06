@@ -23,7 +23,7 @@ __all__ = [
     "ToolCallingAgent",
 ]
 
-TRAJECTORY_VERSION = "travelweaver-trajectory-v2"
+TRAJECTORY_VERSION = "travelweaver-trajectory-v3"
 
 SYSTEM_PROMPT = """\
 你是 TravelWeaver 旅行规划 Agent。你只能通过提供的工具观察环境和提交答案。
@@ -57,6 +57,9 @@ class ApiAgentRun:
     api_turn_count: int
     final_plan: dict[str, Any] | None
     final_text: str | None
+    final_reward: float
+    reward_detail: dict[str, Any]
+    rft_accepted: bool
     usage: dict[str, int]
     messages: tuple[dict[str, Any], ...]
     tools: tuple[dict[str, Any], ...]
@@ -75,6 +78,9 @@ class ApiAgentRun:
             "api_turn_count": self.api_turn_count,
             "final_plan": self.final_plan,
             "final_text": self.final_text,
+            "final_reward": self.final_reward,
+            "reward_detail": dict(self.reward_detail),
+            "rft_accepted": self.rft_accepted,
             "usage": dict(self.usage),
         }
         if include_trajectory:
@@ -252,6 +258,7 @@ class ToolCallingAgent:
                     api_turn_count=api_turn,
                     termination_reason=terminal_reason,
                     final_plan=plan if isinstance(plan, dict) else None,
+                    terminal_result=result,
                 )
 
         return self._result(
@@ -287,17 +294,33 @@ class ToolCallingAgent:
         termination_reason: str,
         final_plan: dict[str, Any] | None = None,
         final_text: str | None = None,
+        terminal_result: Any | None = None,
     ) -> ApiAgentRun:
+        if terminal_result is None:
+            reward_result = self.env.reward_evaluator.no_plan(termination_reason)
+            final_reward = reward_result.reward
+            reward_detail = reward_result.to_dict()
+        else:
+            final_reward = float(terminal_result.reward)
+            reward_detail = dict(terminal_result.info.get("reward_detail") or {})
+        rft_accepted = bool(
+            termination_reason == "plan_submitted"
+            and reward_detail.get("reward_valid")
+            and reward_detail.get("all_hard_pass")
+        )
         return ApiAgentRun(
             episode_id=str(observation.episode_id),
             task_id=str(observation.task["uid"]),
             model=self.config.model,
-            success=termination_reason == "plan_submitted",
+            success=rft_accepted,
             termination_reason=termination_reason,
             step_count=step_count,
             api_turn_count=api_turn_count,
             final_plan=final_plan,
             final_text=final_text,
+            final_reward=final_reward,
+            reward_detail=reward_detail,
+            rft_accepted=rft_accepted,
             usage=usage,
             messages=tuple(deepcopy(messages)),
             tools=tuple(deepcopy(tools)),

@@ -14,6 +14,8 @@ from jsonschema import Draft202012Validator
 
 from ..data.tasks import JsonlTaskStore
 from ..errors import BackendQueryError, EnvironmentStateError, TravelWeaverError
+from ..reward import RewardResult, TravelReward
+from ..tasks import TaskSpecResolver, TravelTaskSpec
 from .backend import Backend
 from .ids import make_route_id
 from .models import EvidenceBundle, Observation, PlanSnapshot, StepResult
@@ -61,6 +63,8 @@ class TravelWeaverEnv:
         page_size: int = 10,
         max_valid_steps: int = 35,
         max_consecutive_invalid: int = 3,
+        task_spec_resolver: TaskSpecResolver | None = None,
+        reward_evaluator: TravelReward | None = None,
     ) -> None:
         if page_size <= 0 or max_valid_steps <= 0 or max_consecutive_invalid <= 0:
             raise ValueError("Episode limits must be positive integers.")
@@ -69,9 +73,12 @@ class TravelWeaverEnv:
         self.page_size = page_size
         self.max_valid_steps = max_valid_steps
         self.max_consecutive_invalid = max_consecutive_invalid
+        self.task_spec_resolver = task_spec_resolver or TaskSpecResolver()
+        self.reward_evaluator = reward_evaluator or TravelReward()
         self._closed = False
         self._episode_id: str | None = None
         self._task: dict[str, Any] | None = None
+        self._task_spec: TravelTaskSpec | None = None
         self._visible_ids: set[str] = set()
         self._visible_entities: dict[str, dict[str, Any]] = {}
         self._candidates: dict[str, dict[str, Any]] = {}
@@ -88,6 +95,9 @@ class TravelWeaverEnv:
         selected = task_id or self.task_store.choose(seed)
         self._episode_id = uuid.uuid4().hex
         self._task = self.task_store.get_public(selected)
+        self._task_spec = self.task_spec_resolver.resolve(
+            self._task, self.task_store.get_oracle(selected)
+        )
         self._visible_ids.clear()
         self._visible_entities.clear()
         self._candidates.clear()
@@ -114,10 +124,25 @@ class TravelWeaverEnv:
         truncated = not terminated and self._valid_steps >= self.max_valid_steps
         if terminated or truncated:
             self._done = True
+        reward_result: RewardResult | None = None
+        if terminated:
+            if outcome.terminal_reason == "plan_submitted":
+                reward_result = self.reward_evaluator.evaluate(
+                    self._require_task_spec(),
+                    outcome.result["plan_snapshot"],
+                    outcome.result["evidence_bundle"],
+                    termination_reason="plan_submitted",
+                )
+                outcome.result["validation"]["reward_status"] = reward_result.reward_type
+            else:
+                reward_result = self.reward_evaluator.no_plan(str(outcome.terminal_reason))
+        elif truncated:
+            reward_result = self.reward_evaluator.no_plan("step_limit")
         observation = self._observation(tool_result=outcome.result)
+        reward_detail = reward_result.to_dict() if reward_result is not None else None
         return StepResult(
             observation=observation,
-            reward=0.0,
+            reward=reward_result.reward if reward_result is not None else 0.0,
             terminated=terminated,
             truncated=truncated,
             info={
@@ -125,6 +150,9 @@ class TravelWeaverEnv:
                 "termination_reason": outcome.terminal_reason
                 or ("step_limit" if truncated else None),
                 "tools_version": TOOLS_VERSION,
+                "task_spec_version": self._require_task_spec().spec_version,
+                "task_spec_hash": self._require_task_spec().spec_hash,
+                "reward_detail": reward_detail,
             },
         )
 
@@ -136,6 +164,7 @@ class TravelWeaverEnv:
         self._visible_entities.clear()
         self._candidates.clear()
         self._routes.clear()
+        self._task_spec = None
 
     @staticmethod
     def tool_schemas() -> list[dict[str, Any]]:
@@ -537,7 +566,7 @@ class TravelWeaverEnv:
                 "chronology": True,
                 "route_grounding": True,
                 "cost_accounting": total_cost is not None,
-                "reward_status": "not_implemented",
+                "reward_status": "pending_terminal_evaluation",
             },
         }
 
@@ -732,10 +761,13 @@ class TravelWeaverEnv:
         terminated = self._invalid_streak >= self.max_consecutive_invalid
         if terminated:
             self._done = True
+        reward_result = (
+            self.reward_evaluator.no_plan("invalid_action_limit") if terminated else None
+        )
         observation = self._observation(error={"code": "invalid_action", "message": str(error)})
         return StepResult(
             observation=observation,
-            reward=0.0,
+            reward=reward_result.reward if reward_result is not None else 0.0,
             terminated=terminated,
             truncated=False,
             info={
@@ -743,6 +775,9 @@ class TravelWeaverEnv:
                 "consecutive_invalid_actions": self._invalid_streak,
                 "termination_reason": "invalid_action_limit" if terminated else None,
                 "tools_version": TOOLS_VERSION,
+                "task_spec_version": self._require_task_spec().spec_version,
+                "task_spec_hash": self._require_task_spec().spec_hash,
+                "reward_detail": reward_result.to_dict() if reward_result is not None else None,
             },
         )
 
@@ -778,3 +813,8 @@ class TravelWeaverEnv:
             raise EnvironmentStateError("Call reset() before step().")
         if self._done:
             raise EnvironmentStateError("Episode has terminated; call reset() for a new episode.")
+
+    def _require_task_spec(self) -> TravelTaskSpec:
+        if self._task_spec is None:
+            raise EnvironmentStateError("TaskSpec is unavailable before reset or after close.")
+        return self._task_spec

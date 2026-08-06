@@ -9,6 +9,7 @@ from .models import (
     TripSpec,
     supported_constraint_kinds,
 )
+from .resolver import TaskSpecResolver
 
 __all__ = [
     "SPEC_VERSION",
@@ -17,6 +18,7 @@ __all__ = [
     "ConstraintSpec",
     "LLMTaskSpecCompiler",
     "TravelTaskSpec",
+    "TaskSpecResolver",
     "TripSpec",
     "build_base_spec",
     "supported_constraint_kinds",

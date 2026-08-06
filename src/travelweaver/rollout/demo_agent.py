@@ -17,6 +17,8 @@ class AgentRun:
     termination_reason: str | None
     step_count: int
     final_plan: dict[str, Any] | None
+    final_reward: float
+    reward_detail: dict[str, Any]
     trajectory: tuple[dict[str, Any], ...]
 
     def to_dict(self, *, include_trajectory: bool = False) -> dict[str, Any]:
@@ -26,6 +28,8 @@ class AgentRun:
             "termination_reason": self.termination_reason,
             "step_count": self.step_count,
             "final_plan": self.final_plan,
+            "final_reward": self.final_reward,
+            "reward_detail": dict(self.reward_detail),
         }
         if include_trajectory:
             payload["trajectory"] = list(self.trajectory)
@@ -186,12 +190,19 @@ class DemoTravelAgent:
 
     def _result(self, terminal: StepResult, plan: dict[str, Any] | None) -> AgentRun:
         assert self._observation is not None
+        reward_detail = dict(terminal.info.get("reward_detail") or {})
         return AgentRun(
             task_id=str(self._observation.task["uid"]),
-            success=terminal.info.get("termination_reason") == "plan_submitted",
+            success=bool(
+                terminal.info.get("termination_reason") == "plan_submitted"
+                and reward_detail.get("reward_valid")
+                and reward_detail.get("all_hard_pass")
+            ),
             termination_reason=terminal.info.get("termination_reason"),
             step_count=len([event for event in self._trajectory if event["event"] == "step"]),
             final_plan=plan,
+            final_reward=terminal.reward,
+            reward_detail=reward_detail,
             trajectory=tuple(self._trajectory),
         )
 

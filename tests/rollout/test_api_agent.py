@@ -107,7 +107,9 @@ def test_api_agent_executes_model_tool_call_and_records_trajectory(env) -> None:
     assert run.steps[0]["tool_call"]["id"] == "call-1"
     assert len(run.tools) == 13
     persisted = run.to_dict(include_trajectory=True)
-    assert persisted["trajectory_version"] == "travelweaver-trajectory-v2"
+    assert persisted["trajectory_version"] == "travelweaver-trajectory-v3"
+    assert persisted["final_reward"] == -1.0
+    assert persisted["rft_accepted"] is False
     assert {"messages", "tools", "steps", "trajectory"} <= persisted.keys()
     assert "not-a-real-secret" not in repr(config)
 

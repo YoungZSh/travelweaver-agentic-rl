@@ -249,6 +249,11 @@ class LLMTaskSpecCompiler:
         for index, raw in enumerate(raw_constraints, 1):
             if not isinstance(raw, dict):
                 raise TaskSpecError("Each compiled constraint must be an object.")
+            expected_fields = {"kind", "operator", "value", "scope", "hardness", "source_text"}
+            if set(raw) != expected_fields:
+                raise TaskSpecError(
+                    f"Constraint {index} contains missing or unexpected fields."
+                )
             source_text = str(raw.get("source_text") or "")
             source_start = query.find(source_text)
             if source_start < 0:
