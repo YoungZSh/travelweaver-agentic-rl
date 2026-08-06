@@ -2,7 +2,8 @@
 
 > Training Long-Horizon Travel Planning Agents with SFT and GRPO
 
-> 查询环境的已确认实施规范与使用方法见 [TravelWeaverEnv 查询环境 MVP](travelweaver-env-mvp.md)。
+> 查询环境的实施规范见 [TravelWeaverEnv 查询环境 MVP](travelweaver-env-mvp.md)，冻结的
+> 评分边界见 [TravelWeaver Reward 与离线评估协议](reward-and-evaluation.md)。
 
 ## 1. 项目概述
 
@@ -31,7 +32,7 @@ TravelWeaver 是一个面向长程旅行规划的 Agentic RL 项目。项目计�
 - 使用 ChinaTravel 的固定数据快照训练，不直接依赖实时网站和实时 API。
 - 优先支持 ChinaTravel 已覆盖的 10 个城市。
 - 优先完成单 Agent 的长程工具调用，不加入多 Agent 协作。
-- 当前先稳定环境状态机、typed tools、提交校验和在线 API 轨迹协议；Reward 后补。
+- 当前先稳定环境状态机、typed tools、可回放证据和确定性 Reward；训练代码随后接入。
 - SFT 数据处理和 veRL/GRPO 集成在环境协议稳定后再实现。
 - 模型与环境统一使用 OpenAI-compatible function calling，不引入 MCP。
 - 暂不以生产可用性、全国城市覆盖和实时预订为目标。
@@ -280,21 +281,19 @@ TravelWeaver 不应该检查“是否生成了某一条标准答案”，而应�
 
 需要先将它们转换成确定代理条件，例如“每天最多三个景点”“连续步行不超过 2 公里”“每天保留至少 90 分钟休息时间”。无法转换的内容应只进入辅助 LLM 评测，不进入 GRPO 主 Reward。
 
-### 8.3 TravelReward-v1 建议终局类型
+### 8.3 TravelReward-v1 终局公式
 
-| 终局类型 | 建议 Reward | 说明 |
-|---|---:|---|
-| `strict_valid_plan` | `1.00` | 所有硬约束和激活偏好均满足 |
-| `feasible_plan` | `0.55 + 0.45 × P` | 所有硬约束满足，部分软偏好满足 |
-| `partial_feasible_plan` | 最高 `0.25` | 存在硬约束失败，但部分计划有效 |
-| `invalid_plan` | `-0.85` | 结构错误、编造实体或明显不可行 |
-| `graceful_stop` | `-0.15` | 充分探索后确认无解 |
-| `early_abstain` | `-0.35` | 未充分探索便退出 |
-| `max_steps` | `-0.50` | 超过最大步数 |
-| `repeat_loop` | `-0.65` | 重复动作或长期无新证据 |
-| `reward_unverifiable` | `0.00`，无效样本 | 数据缺失或验证器异常，不归因于模型 |
+Reward 核心只依赖统一 `TravelTaskSpec`，而不依赖 ChinaTravel 的任务字段。第一版对
+激活的硬检查和软约束分别等权：`H=passed_hard/active_hard`，
+`S=passed_soft/active_soft`。无软约束时 `S=1`。
 
-其中 `P` 是当前任务激活的软偏好满足率。只有任务明确声明的偏好才参与归一化，未声明维度不进入分母。
+- 基础设施或规格不可验证：`0.0` 且 `reward_valid=false`；
+- 没有可评估提交：`-1.0`；
+- 存在硬失败：`-1+H`，严格小于 `0`；
+- 所有硬检查通过：`0.5+0.5×S`。
+
+完整 TaskSpec、证据和 Judge 协议以
+[Reward 与离线评估协议](reward-and-evaluation.md)为准。
 
 必须区分两种失败：
 
