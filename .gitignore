@@ -14,5 +14,6 @@ dist/
 htmlcov/
 
 # Local downloads and generated runtime artifacts.
+ckpts/
 data/downloads/
 data/trajectories/
