@@ -31,3 +31,7 @@ class ApiRolloutError(TravelWeaverError):
 
 class TaskSpecError(TravelWeaverError):
     """A task cannot be converted to a safe, supported TravelTaskSpec."""
+
+
+class JudgeError(TravelWeaverError):
+    """An offline LLM Judge response is absent or violates its blind contract."""

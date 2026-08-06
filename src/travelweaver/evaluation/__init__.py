@@ -1,4 +1,17 @@
-"""Reproducible evaluation metrics and runners.
+"""Blind offline evaluation utilities; never used as online reward."""
 
-Evaluation implementations are planned for a later milestone.
-"""
+from .judge import (
+    JUDGE_VERSION,
+    JudgeDimension,
+    JudgeResult,
+    OfflineTravelJudge,
+    build_evaluation_report,
+)
+
+__all__ = [
+    "JUDGE_VERSION",
+    "JudgeDimension",
+    "JudgeResult",
+    "OfflineTravelJudge",
+    "build_evaluation_report",
+]
