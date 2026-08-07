@@ -30,7 +30,7 @@ See [the MVP guide](docs/travelweaver-env-mvp.md), the frozen
 - Python: `3.10.19`
 - Environment protocol: `travelweaver-environment-v0.3`
 - Tool protocol: `travelweaver-tools-v2-agent`
-- TaskSpec / Reward: `travelweaver-task-spec-v1` / `travelweaver-reward-v1`
+- TaskSpec / Reward: `travelweaver-task-spec-v2` / `travelweaver-reward-v1`
 - Future RL training stack: `verl==0.8.0` in a separate Linux/CUDA environment
 
 ChinaTravel remains pinned as a Git submodule. Its dataset is published under
@@ -46,6 +46,8 @@ src/travelweaver/
 ├── env/          # deterministic episode state, tools, and ChinaTravel backend
 ├── data/         # pinned task snapshots and database preparation
 ├── tasks/        # source-independent TaskSpec and safe source adapters
+├── llm/          # shared OpenAI-compatible client and provider presets
+├── synthesis/    # witness-first task synthesis and LLM surface polishing
 ├── rollout/      # agent policies and trajectory collection
 ├── reward/       # deterministic constraint verification and strict RFT filter
 ├── evaluation/   # blind offline LLM Judge and separated evaluation reports
@@ -78,6 +80,24 @@ shared OpenAI-compatible function-calling client. Each `travelweaver-trajectory-
 record contains canonical `messages`, `tools`, executed `steps`, terminal Reward details,
 RFT acceptance, and a separate audit event stream. Local dotenv files and generated
 trajectories are ignored by Git.
+
+## Grounded task synthesis
+
+The pilot generator derives typed constraints from a plan that already passes the real
+environment, then uses DeepSeek only to polish the Chinese query surface. It never asks
+the LLM to invent budgets, entities, transport modes, or other scored semantics.
+
+```bash
+uv run travelweaver synthesize-tasks \
+  --count 50 \
+  --seed 20260807 \
+  --output-dir data/generated/pilot-50-v1
+```
+
+The command is resumable and capped at 200 API requests. Public tasks, hidden TaskSpecs,
+Blueprints, surfaces, replayable witnesses, a manifest, quarantine log, and a Markdown
+preview are written below the output directory. `data/generated/` is local-only and
+ignored by Git. See [the synthesis pilot contract](docs/task-synthesis-pilot.md).
 
 TravelWeaver deliberately keeps tool execution in-process for the environment milestone.
 MCP is not part of the current architecture. Deterministic Reward and strict RFT filtering

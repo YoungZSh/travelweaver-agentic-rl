@@ -12,7 +12,7 @@ TravelReward 是确定性的终局 Reward。它只读取 rollout 前冻结的任
 ```text
 ChinaTravel oracle ──安全适配──┐
 自由文本任务 ───────LLM 编译───┼──> TravelTaskSpec ──> TravelReward
-未来自产任务 ───────Spec 优先──┘
+自产 Blueprint ──见证轨迹派生──┘
 ```
 
 ChinaTravel 只是任务来源和回归测试集。Reward 核心不得读取 `hard_logic`、benchmark
@@ -34,10 +34,18 @@ split 或 task ID。无法确定性验证的主观要求只进入离线 LLM Judg
 `source_text`。组合约束仅支持 `all_of`、`any_of` 和否定；不允许嵌入任意代码。未知
 `kind` 在 rollout 前拒绝，绝不静默视为通过。
 
+`travelweaver-task-spec-v2` 中，城际 `transport_mode.value` 增加 `leg`：
+`outbound`、`return` 或 `all`。这使得去程火车/返程飞机等混合组合可以独立
+评分；旧 v1 数据缺省按 `all` 解释。市内交通只允许 `leg=all`。
+
 自由文本通过 OpenAI-compatible function calling 编译为 `TaskSpecDraft`。编译器最多
 尝试两次，随后执行 JSON Schema、字段范围、实体绑定、可支持性和基本可满足性验证。
 未通过验证的任务进入隔离区，不参与 RFT/SFT 或 GRPO。ChinaTravel 的已有约束使用
 安全 AST 适配器迁移；原始字符串只作为输入数据，永不 `exec`。
+
+自产数据不走上述反向 LLM 编译。它先在环境中生成可执行 witness，再从已冻结
+证据派生 `TaskBlueprint`；LLM 仅改写中文表层 `TaskSurface`。最终通过规则校验语义、
+文本 span 和 witness Reward 后才写入训练候选集。
 
 ## 3. Environment evidence contract
 
