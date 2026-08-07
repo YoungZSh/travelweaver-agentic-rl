@@ -9,7 +9,7 @@ from typing import Any
 
 from ..env import TravelWeaverEnv
 from ..errors import ApiRolloutError
-from .model_client import (
+from ..llm import (
     DeepSeekConfig,
     OpenAICompatibleChatClient,
     OpenAICompatibleConfig,
