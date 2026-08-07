@@ -11,7 +11,9 @@ from typing import Any
 
 from ..errors import TaskSpecError
 
-SPEC_VERSION = "travelweaver-task-spec-v1"
+SPEC_VERSION = "travelweaver-task-spec-v2"
+LEGACY_SPEC_VERSION = "travelweaver-task-spec-v1"
+SUPPORTED_SPEC_VERSIONS = frozenset({LEGACY_SPEC_VERSION, SPEC_VERSION})
 
 _CONSTRAINT_KINDS = frozenset(
     {
@@ -114,7 +116,10 @@ def _valid_constraint_value(kind: str, value: Any) -> bool:
             and value.get("basis") in {"per_person_per_activity", "per_person_per_night"}
         )
     if kind == "transport_mode":
-        return _string_groups(value, "modes")
+        return (
+            _string_groups(value, "modes")
+            and value.get("leg", "all") in {"all", "outbound", "return"}
+        )
     if kind in {"entity_category", "entity_attribute"}:
         return _string_groups(value, "values")
     if kind in {"include_entity", "exclude_entity"}:
@@ -183,6 +188,12 @@ class ConstraintSpec:
             raise TaskSpecError("Every constraint must retain non-empty source text.")
         if not _valid_constraint_value(self.kind, self.value):
             raise TaskSpecError(f"Constraint {self.kind} has an invalid value payload.")
+        if (
+            self.kind == "transport_mode"
+            and self.scope == "innercity_route"
+            and self.value.get("leg", "all") != "all"
+        ):
+            raise TaskSpecError("Inner-city transport constraints only support leg=all.")
         if (self.source_start is None) != (self.source_end is None):
             raise TaskSpecError("Constraint source offsets must be both present or both absent.")
         if self.source_start is not None and (
@@ -205,7 +216,7 @@ class TravelTaskSpec:
     spec_version: str = SPEC_VERSION
 
     def __post_init__(self) -> None:
-        if self.spec_version != SPEC_VERSION:
+        if self.spec_version not in SUPPORTED_SPEC_VERSIONS:
             raise TaskSpecError(f"Unsupported TaskSpec version: {self.spec_version}")
         if not self.task_id.strip() or not self.public_query.strip():
             raise TaskSpecError("Task id and public query are required.")

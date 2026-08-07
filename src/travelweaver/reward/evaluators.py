@@ -201,19 +201,35 @@ def _transport_mode(
     plan: Mapping[str, Any],
     evidence: Mapping[str, Any],
 ) -> CheckResult:
-    del spec
     value = constraint.value if isinstance(constraint.value, Mapping) else {}
     required = {str(item) for item in value.get("modes", [])}
+    leg = str(value.get("leg", "all"))
     if constraint.scope == "innercity_route":
         routes = evidence.get("routes")
         if not isinstance(routes, Mapping):
             return _result(constraint, CHECK_UNVERIFIABLE, "Route modes are unavailable.")
         actual = {str(route.get("mode")) for route in routes.values() if isinstance(route, Mapping)}
     else:
-        actual = {
-            str(item.get("activity_type"))
-            for item in _scope_activities(plan, "intercity_transport")
-        }
+        entities = evidence.get("entities")
+        if not isinstance(entities, Mapping):
+            return _result(constraint, CHECK_UNVERIFIABLE, "Transport evidence is unavailable.")
+        destination = spec.trip.destinations[-1]
+        expected_direction = {
+            "outbound": (spec.trip.origin, destination),
+            "return": (destination, spec.trip.origin),
+        }.get(leg)
+        actual = set()
+        for item in _scope_activities(plan, "intercity_transport"):
+            entity = entities.get(item.get("candidate_id"))
+            if not isinstance(entity, Mapping):
+                return _result(
+                    constraint,
+                    CHECK_UNVERIFIABLE,
+                    "Intercity transport direction evidence is incomplete.",
+                )
+            direction = (str(entity.get("origin_city")), str(entity.get("destination_city")))
+            if expected_direction is None or direction == expected_direction:
+                actual.add(str(item.get("activity_type")))
     if constraint.operator == "eq":
         passed = actual == required
     elif constraint.operator in {"include", "contains"}:
@@ -226,7 +242,7 @@ def _transport_mode(
         constraint,
         CHECK_PASS if passed else CHECK_FAIL,
         "Transport mode check completed.",
-        required=sorted(required),
+        required={"leg": leg, "modes": sorted(required)},
         actual=sorted(actual),
     )
 
