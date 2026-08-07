@@ -17,3 +17,4 @@ htmlcov/
 ckpts/
 data/downloads/
 data/trajectories/
+data/generated/

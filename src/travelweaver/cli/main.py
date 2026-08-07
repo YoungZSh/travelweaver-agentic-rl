@@ -21,6 +21,7 @@ from ..rollout import (
     append_trajectory,
     default_trajectory_path,
 )
+from ..synthesis import SynthesisConfig, SynthesisPipeline
 
 
 def _print(payload: Any) -> None:
@@ -103,6 +104,26 @@ def _rollout_api(args: argparse.Namespace) -> int:
     return 0 if run.success else 2
 
 
+def _synthesize_tasks(args: argparse.Namespace) -> int:
+    llm_config = DeepSeekConfig.from_env(args.env_file)
+    output_dir = (
+        Path(args.output_dir)
+        if args.output_dir
+        else project_root() / "data" / "generated" / "pilot-50-v1"
+    )
+    report = SynthesisPipeline(
+        SynthesisConfig(
+            output_dir=output_dir,
+            count=args.count,
+            seed=args.seed,
+            max_api_calls=args.max_api_calls,
+        ),
+        llm_config,
+    ).run()
+    _print(report.to_dict())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="travelweaver", description="TravelWeaver environment and rollout utilities."
@@ -154,6 +175,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose", action="store_true", help="Also print the complete trajectory."
     )
     rollout_api.set_defaults(handler=_rollout_api)
+
+    synthesize = subparsers.add_parser(
+        "synthesize-tasks",
+        help="Build feasible typed tasks and polish their Chinese query surfaces.",
+    )
+    synthesize.add_argument("--count", type=int, default=50)
+    synthesize.add_argument("--seed", type=int, default=20260807)
+    synthesize.add_argument("--env-file", default=str(project_root() / ".env"))
+    synthesize.add_argument("--output-dir")
+    synthesize.add_argument("--max-api-calls", type=int, default=200)
+    synthesize.set_defaults(handler=_synthesize_tasks)
     return parser
 
 
