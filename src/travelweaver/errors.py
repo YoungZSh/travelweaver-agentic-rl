@@ -35,3 +35,7 @@ class TaskSpecError(TravelWeaverError):
 
 class JudgeError(TravelWeaverError):
     """An offline LLM Judge response is absent or violates its blind contract."""
+
+
+class SynthesisError(TravelWeaverError):
+    """A synthetic task cannot be grounded, polished, or validated safely."""
