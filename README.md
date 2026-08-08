@@ -81,6 +81,16 @@ record contains canonical `messages`, `tools`, executed `steps`, terminal Reward
 RFT acceptance, and a separate audit event stream. Local dotenv files and generated
 trajectories are ignored by Git.
 
+For a generated task directory, run one resumable rollout per task with the tested batch
+command. It defaults to 256 concurrent episodes:
+
+```bash
+uv run travelweaver rollout-generated \
+  --input-dir data/generated/chinatravel-blended-200-v1.1-repolished-minimal \
+  --output data/trajectories/chinatravel-blended-v1.1-thinking.jsonl \
+  --concurrency 256
+```
+
 ## Grounded task synthesis
 
 The pilot generator derives typed constraints from a plan that already passes the real
@@ -89,15 +99,44 @@ the LLM to invent budgets, entities, transport modes, or other scored semantics.
 
 ```bash
 uv run travelweaver synthesize-tasks \
-  --count 50 \
+  --count 100 \
   --seed 20260807 \
-  --output-dir data/generated/pilot-50-v1
+  --max-api-calls 300 \
+  --output-dir data/generated/pilot-100-v2.1
 ```
 
-The command is resumable and capped at 200 API requests. Public tasks, hidden TaskSpecs,
-Blueprints, surfaces, replayable witnesses, a manifest, quarantine log, and a Markdown
-preview are written below the output directory. `data/generated/` is local-only and
-ignored by Git. See [the synthesis pilot contract](docs/task-synthesis-pilot.md).
+The command exposes one seed and is resumable. Public tasks, hidden TaskSpecs, explicit
+replayable Scenarios, Blueprints, surfaces, witnesses, diversity metrics, a manifest,
+quarantine log, and a Markdown preview are written below the output directory.
+`data/generated/` is local-only and ignored by Git. See
+[the synthesis contract](docs/task-synthesis-pilot.md).
+
+The frozen mixed-coverage profile is generated with:
+
+```bash
+uv run travelweaver synthesize-tasks \
+  --profile chinatravel_blended_v1 \
+  --count 200 \
+  --seed 20260808 \
+  --max-api-calls 400 \
+  --output-dir data/generated/chinatravel-blended-200-v1
+```
+
+The V1.1 quality trial uses `--profile chinatravel_blended_v1_1` and writes to
+`data/generated/chinatravel-blended-200-v1.1`.
+
+To preserve the accepted Blueprints and witnesses while rerunning only the LLM surface
+rewrites, use the concurrent repolish command. It defaults to 256 simultaneous requests
+and writes every accepted or rejected raw tool response to `polish-audit.jsonl`:
+
+```bash
+uv run travelweaver repolish-tasks \
+  --input-dir data/generated/chinatravel-blended-200-v1.1 \
+  --output-dir data/generated/chinatravel-blended-200-v1.1-repolished \
+  --llm-concurrency 256 \
+  --validation-policy minimal_semantic \
+  --max-api-calls 400
+```
 
 TravelWeaver deliberately keeps tool execution in-process for the environment milestone.
 MCP is not part of the current architecture. Deterministic Reward and strict RFT filtering

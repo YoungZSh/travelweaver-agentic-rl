@@ -92,6 +92,7 @@ class DeepSeekConfig(OpenAICompatibleConfig):
 
     base_url: str = "https://api.deepseek.com"
     model: str = "deepseek-v4-flash"
+    max_tokens: int = 16384
     thinking: str = "disabled"
 
     def __post_init__(self) -> None:
@@ -109,7 +110,7 @@ class DeepSeekConfig(OpenAICompatibleConfig):
         _load_dotenv(env_file)
         try:
             timeout_seconds = float(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "120"))
-            max_tokens = int(os.getenv("DEEPSEEK_MAX_TOKENS", "4096"))
+            max_tokens = int(os.getenv("DEEPSEEK_MAX_TOKENS", "16384"))
             temperature = _optional_float(
                 os.getenv("DEEPSEEK_TEMPERATURE"), "DEEPSEEK_TEMPERATURE"
             )

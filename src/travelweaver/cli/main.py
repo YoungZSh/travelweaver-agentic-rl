@@ -13,15 +13,23 @@ from ..data.bootstrap import install_database, validate_database
 from ..data.tasks import JsonlTaskStore, import_benchmark_tasks, import_task_split
 from ..env import ChinaTravelBackend, TravelWeaverEnv
 from ..errors import TravelWeaverError
+from ..llm import DeepSeekConfig
 from ..paths import project_root
 from ..rollout import (
-    DeepSeekConfig,
-    DeepSeekToolAgent,
+    DEFAULT_ROLLOUT_CONCURRENCY,
     DemoTravelAgent,
+    GeneratedRolloutBatchConfig,
+    ToolCallingAgent,
     append_trajectory,
     default_trajectory_path,
+    run_generated_rollout_batch,
 )
-from ..synthesis import SynthesisConfig, SynthesisPipeline
+from ..synthesis import (
+    RepolishConfig,
+    SurfaceRepolishPipeline,
+    SynthesisConfig,
+    SynthesisPipeline,
+)
 
 
 def _print(payload: Any) -> None:
@@ -88,7 +96,7 @@ def _rollout_api(args: argparse.Namespace) -> int:
     store = JsonlTaskStore.default(split="easy")
     env = TravelWeaverEnv(ChinaTravelBackend(), store)
     try:
-        run = DeepSeekToolAgent(
+        run = ToolCallingAgent(
             env,
             config,
             max_api_turns=args.max_api_turns,
@@ -104,12 +112,38 @@ def _rollout_api(args: argparse.Namespace) -> int:
     return 0 if run.success else 2
 
 
+def _rollout_generated(args: argparse.Namespace) -> int:
+    llm_config = DeepSeekConfig.from_env(args.env_file)
+    output_path = Path(args.output)
+    error_path = (
+        Path(args.errors)
+        if args.errors
+        else output_path.with_name(f"{output_path.stem}-errors.jsonl")
+    )
+    report = run_generated_rollout_batch(
+        GeneratedRolloutBatchConfig(
+            input_dir=Path(args.input_dir),
+            output_path=output_path,
+            error_path=error_path,
+            concurrency=args.concurrency,
+            max_api_turns=args.max_api_turns,
+            seed=args.seed,
+            task_id=args.task_id,
+        ),
+        llm_config,
+        progress=lambda payload: print(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True
+        ),
+    )
+    return 0 if report.errors == 0 else 2
+
+
 def _synthesize_tasks(args: argparse.Namespace) -> int:
     llm_config = DeepSeekConfig.from_env(args.env_file)
     output_dir = (
         Path(args.output_dir)
         if args.output_dir
-        else project_root() / "data" / "generated" / "pilot-50-v1"
+        else project_root() / "data" / "generated" / "pilot-100-v2.1"
     )
     report = SynthesisPipeline(
         SynthesisConfig(
@@ -117,6 +151,30 @@ def _synthesize_tasks(args: argparse.Namespace) -> int:
             count=args.count,
             seed=args.seed,
             max_api_calls=args.max_api_calls,
+            profile=args.profile,
+            validation_policy=args.validation_policy,
+        ),
+        llm_config,
+    ).run()
+    _print(report.to_dict())
+    return 0
+
+
+def _repolish_tasks(args: argparse.Namespace) -> int:
+    llm_config = DeepSeekConfig.from_env(args.env_file)
+    input_dir = Path(args.input_dir)
+    output_dir = (
+        Path(args.output_dir)
+        if args.output_dir
+        else input_dir.with_name(f"{input_dir.name}-repolished")
+    )
+    report = SurfaceRepolishPipeline(
+        RepolishConfig(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            llm_concurrency=args.llm_concurrency,
+            max_api_calls=args.max_api_calls,
+            validation_policy=args.validation_policy,
         ),
         llm_config,
     ).run()
@@ -176,16 +234,62 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rollout_api.set_defaults(handler=_rollout_api)
 
+    rollout_generated = subparsers.add_parser(
+        "rollout-generated",
+        help="Run one resumable model trajectory per task in a generated task directory.",
+    )
+    rollout_generated.add_argument("--input-dir", required=True)
+    rollout_generated.add_argument("--output", required=True)
+    rollout_generated.add_argument("--errors")
+    rollout_generated.add_argument("--task-id")
+    rollout_generated.add_argument("--seed", type=int, default=20260808)
+    rollout_generated.add_argument("--env-file", default=str(project_root() / ".env"))
+    rollout_generated.add_argument("--max-api-turns", type=int, default=40)
+    rollout_generated.add_argument(
+        "--concurrency", type=int, default=DEFAULT_ROLLOUT_CONCURRENCY
+    )
+    rollout_generated.set_defaults(handler=_rollout_generated)
+
     synthesize = subparsers.add_parser(
         "synthesize-tasks",
         help="Build feasible typed tasks and polish their Chinese query surfaces.",
     )
-    synthesize.add_argument("--count", type=int, default=50)
+    synthesize.add_argument("--count", type=int, default=100)
     synthesize.add_argument("--seed", type=int, default=20260807)
     synthesize.add_argument("--env-file", default=str(project_root() / ".env"))
     synthesize.add_argument("--output-dir")
-    synthesize.add_argument("--max-api-calls", type=int, default=200)
+    synthesize.add_argument("--max-api-calls", type=int, default=300)
+    synthesize.add_argument(
+        "--validation-policy",
+        choices=["strict", "minimal_semantic"],
+        default="minimal_semantic",
+    )
+    synthesize.add_argument(
+        "--profile",
+        choices=[
+            "pilot_v2_1",
+            "chinatravel_blended_v1",
+            "chinatravel_blended_v1_1",
+        ],
+        default="pilot_v2_1",
+    )
     synthesize.set_defaults(handler=_synthesize_tasks)
+
+    repolish = subparsers.add_parser(
+        "repolish-tasks",
+        help="Concurrently rewrite query surfaces while reusing existing grounded records.",
+    )
+    repolish.add_argument("--input-dir", required=True)
+    repolish.add_argument("--output-dir")
+    repolish.add_argument("--env-file", default=str(project_root() / ".env"))
+    repolish.add_argument("--max-api-calls", type=int, default=400)
+    repolish.add_argument("--llm-concurrency", type=int, default=256)
+    repolish.add_argument(
+        "--validation-policy",
+        choices=["strict", "minimal_semantic"],
+        default="minimal_semantic",
+    )
+    repolish.set_defaults(handler=_repolish_tasks)
     return parser
 
 
