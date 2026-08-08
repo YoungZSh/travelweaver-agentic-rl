@@ -111,7 +111,8 @@ quarantine log, and a Markdown preview are written below the output directory.
 `data/generated/` is local-only and ignored by Git. See
 [the synthesis contract](docs/task-synthesis-pilot.md).
 
-The frozen mixed-coverage profile is generated with:
+The mixed-coverage profile uses the accepted 200-task recipe as a deterministic ratio
+baseline. It also supports larger `--count` values with seed-derived remainder allocation:
 
 ```bash
 uv run travelweaver synthesize-tasks \
@@ -124,6 +125,17 @@ uv run travelweaver synthesize-tasks \
 
 The V1.1 quality trial uses `--profile chinatravel_blended_v1_1` and writes to
 `data/generated/chinatravel-blended-200-v1.1`.
+
+For example, one 500-task production batch can use:
+
+```bash
+uv run travelweaver synthesize-tasks \
+  --profile chinatravel_blended_v1_1 \
+  --count 500 \
+  --seed 20260811 \
+  --max-api-calls 1000 \
+  --output-dir data/generated/chinatravel-blended-500-v1.1-b01
+```
 
 To preserve the accepted Blueprints and witnesses while rerunning only the LLM surface
 rewrites, use the concurrent repolish command. It defaults to 256 simultaneous requests

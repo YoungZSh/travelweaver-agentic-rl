@@ -79,27 +79,32 @@ Scenario 是环境状态，不是用户约束，因此不会在 query 或公开�
 不超过 30 km，地铁总路程不超过 40 km 且步行接驳不超过 2 km。预算和时间约束根据
 easy/medium/hard tightness 使用不同余量，但具体阈值始终由已通过的 witness 反推。
 
-## ChinaTravel 混合覆盖 200 题
+## ChinaTravel 混合覆盖 profile
 
 完整的初始设计与验收配额见
 [ChinaTravel 混合覆盖 200 题合成计划](chinatravel-blended-200-v1-plan.md)。
 自然表面、Human 和 Preference 的定向修正版见
 [V1.1 试验计划](chinatravel-blended-200-v1.1-plan.md)。
 
-`--profile chinatravel_blended_v1` 是固定 200 题的合成配置：Easy-like 50、
-Medium-like 70、Human-like 50、Preference-like 20、Generalization 10。场景配额固定为
-正常 180、景点关闭 5、酒店无房 4、交通取消 5、价格上涨 6。天数、人数、城市和约束
-家族使用 `0.65 × ChinaTravel 固定先验 + 0.35 × 均匀先验`，所有结构随机性仍只来自
-一个 `--seed`。
+`--profile chinatravel_blended_v1` 和 `chinatravel_blended_v1_1` 以已验收的 200 题
+配比为基准：Easy-like 25%、Medium-like 35%、Human-like 25%、Preference-like 10%、
+Generalization 5%。场景基准配比为正常 90%、景点关闭 2.5%、酒店无房 2%、交通取消
+2.5%、价格上涨 3%。任意 `--count` 都通过 Hamilton 最大余数法确定性地换算为整数
+配额；余数并列时由 `--seed` 决定。原来的 `count=200, seed=20260808` 槽位保持逐条
+不变。天数、人数、城市和约束家族使用
+`0.65 × ChinaTravel 固定先验 + 0.35 × 均匀先验`，所有结构随机性仍只来自一个
+`--seed`。
 
-Human-like 中 35 条保留方括号元数据，15 条为纯自然对话，并只使用 Blueprint 分配的
+在 200 题基准中，Human-like 有 35 条保留方括号元数据、15 条为纯自然对话；更大批次
+按相同比例缩放，并只使用 Blueprint 分配的
 独自、情侣、朋友或亲子背景。它显式启用 `human_conservative` 校验：实体、数字、单位、
 时间和交通方式仍逐字保留；上下限方向不可模糊；但确定句可写成“往返坐高铁”“想去
 西湖”“酒店订2间房”等真人表达。偏好必须返回独立 mention，最终进入
 `unscored_preferences`。其余四类继续使用 `strict` 校验。
 
-Preference-like 每题只有一个主要偏好。14 条覆盖官方六类偏好且每类至少两条，另 6 条
-来自可审计扩展池。合成器生成至少两个通过同一组硬约束的 witness 候选，按偏好对应的
+Preference-like 每题只有一个主要偏好。官方偏好和可审计扩展偏好按 70%/30% 缩放，
+组内尽量均衡；在 200 题基准中对应 14 条官方偏好和 6 条扩展偏好。合成器生成至少两个
+通过同一组硬约束的 witness 候选，按偏好对应的
 确定性指标选优，并把候选指标、选择结果和逐候选硬 Reward 写入
 `preference-audit.jsonl`；偏好本身不进入训练 Reward。
 

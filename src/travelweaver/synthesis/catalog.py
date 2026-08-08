@@ -70,6 +70,9 @@ _BLENDED_SCENARIO_QUOTAS = {
     "transport_cancellation": 5,
     "price_change": 6,
 }
+_HUMAN_METADATA_QUOTAS = {True: 35, False: 15}
+_HUMAN_PREFERENCE_COUNT_QUOTAS = {0: 10, 1: 20, 2: 15, 3: 5}
+_PREFERENCE_SOURCE_QUOTAS = {"official": 14, "extended": 6}
 _OFFICIAL_PREFERENCES = (
     "more_attractions",
     "less_innercity_time",
@@ -271,12 +274,20 @@ def build_pilot_slots(
 
 
 def _build_blended_slots(count: int, seed: int, profile: str) -> tuple[PilotSlot, ...]:
-    if count != 200:
-        raise ValueError(f"{profile} is a frozen 200-task profile.")
-    task_types = _exact_values(_BLENDED_TYPE_QUOTAS, seed, "blended-task-types")
+    type_quotas = blended_task_type_quotas(count, seed)
+    task_types = _exact_values(type_quotas, seed, "blended-task-types")
+    constraint_quotas = {
+        task_type: _scaled_quotas(
+            type_quotas[task_type],
+            quotas,
+            seed,
+            f"blended-constraint-counts-{task_type}",
+        )
+        for task_type, quotas in _BLENDED_CONSTRAINT_QUOTAS.items()
+    }
     constraint_counts = _values_by_type(
         task_types,
-        _BLENDED_CONSTRAINT_QUOTAS,
+        constraint_quotas,
         seed,
         "blended-constraint-counts",
     )
@@ -308,7 +319,9 @@ def _build_blended_slots(count: int, seed: int, profile: str) -> tuple[PilotSlot
     strategies = _quota_values(
         count, _STRATEGY_WEIGHTS, seed=seed, scope="blended-strategies"
     )
-    scenarios = _exact_values(_BLENDED_SCENARIO_QUOTAS, seed, "blended-scenarios")
+    scenarios = _exact_values(
+        blended_scenario_quotas(count, seed), seed, "blended-scenarios"
+    )
     _move_hotel_scenarios_to_multiday(scenarios, days)
     tightnesses = _blended_tightnesses(task_types, seed)
     styles = _blended_styles(task_types, seed, profile)
@@ -411,8 +424,30 @@ def _build_blended_slots(count: int, seed: int, profile: str) -> tuple[PilotSlot
             )
         )
     _validate_slots(slots)
-    _validate_blended_distribution(slots)
+    _validate_blended_distribution(slots, seed)
     return tuple(slots)
+
+
+def blended_task_type_quotas(count: int, seed: int) -> dict[str, int]:
+    """Scale the accepted 200-task type mix to any positive batch size."""
+
+    return _scaled_quotas(
+        count,
+        _BLENDED_TYPE_QUOTAS,
+        seed,
+        "blended-task-types",
+    )
+
+
+def blended_scenario_quotas(count: int, seed: int) -> dict[str, int]:
+    """Scale the accepted 200-task scenario mix to any positive batch size."""
+
+    return _scaled_quotas(
+        count,
+        _BLENDED_SCENARIO_QUOTAS,
+        seed,
+        "blended-scenarios",
+    )
 
 
 def _mixed_prior(weights: Mapping[_T, float]) -> dict[_T, float]:
@@ -428,6 +463,30 @@ def _exact_values(quotas: Mapping[_T, int], seed: int, scope: str) -> list[_T]:
     values = [value for value, amount in quotas.items() for _ in range(amount)]
     deterministic_rng(seed, scope).shuffle(values)
     return values
+
+
+def _scaled_quotas(
+    count: int,
+    baseline: Mapping[_T, int],
+    seed: int,
+    scope: str,
+) -> dict[_T, int]:
+    if count < 0:
+        raise ValueError("Quota count cannot be negative.")
+    if count == 0:
+        return {value: 0 for value in baseline}
+    baseline_count = sum(baseline.values())
+    if count == baseline_count:
+        return dict(baseline)
+    allocated = Counter(
+        _quota_values(
+            count,
+            {value: float(amount) for value, amount in baseline.items()},
+            seed=seed,
+            scope=f"{scope}-quota-allocation",
+        )
+    )
+    return {value: allocated[value] for value in baseline}
 
 
 def _values_by_type(
@@ -552,7 +611,16 @@ def _blended_styles(
 
 
 def _human_metadata_flags(task_types: Sequence[str], seed: int) -> list[bool]:
-    human_values = _exact_values({True: 35, False: 15}, seed, "human-metadata")
+    human_values = _exact_values(
+        _scaled_quotas(
+            task_types.count("human_like"),
+            _HUMAN_METADATA_QUOTAS,
+            seed,
+            "human-metadata",
+        ),
+        seed,
+        "human-metadata",
+    )
     offset = 0
     result = [False] * len(task_types)
     for index, task_type in enumerate(task_types):
@@ -563,7 +631,16 @@ def _human_metadata_flags(task_types: Sequence[str], seed: int) -> list[bool]:
 
 
 def _human_preference_counts(task_types: Sequence[str], seed: int) -> list[int]:
-    values = _exact_values({0: 10, 1: 20, 2: 15, 3: 5}, seed, "human-preference-counts")
+    values = _exact_values(
+        _scaled_quotas(
+            task_types.count("human_like"),
+            _HUMAN_PREFERENCE_COUNT_QUOTAS,
+            seed,
+            "human-preference-counts",
+        ),
+        seed,
+        "human-preference-counts",
+    )
     offset = 0
     result = [0] * len(task_types)
     for index, task_type in enumerate(task_types):
@@ -574,11 +651,25 @@ def _human_preference_counts(task_types: Sequence[str], seed: int) -> list[int]:
 
 
 def _preference_like_kinds(task_types: Sequence[str], seed: int) -> list[tuple[str, ...]]:
-    official = [kind for kind in _OFFICIAL_PREFERENCES for _ in range(2)]
-    extras = list(_OFFICIAL_PREFERENCES)
-    deterministic_rng(seed, "official-preference-balance").shuffle(extras)
-    official.extend(extras[:2])
-    values = [*official, *_EXTENDED_PREFERENCES]
+    source_quotas = _scaled_quotas(
+        task_types.count("preference_like"),
+        _PREFERENCE_SOURCE_QUOTAS,
+        seed,
+        "preference-source",
+    )
+    official = _balanced_repetitions(
+        _OFFICIAL_PREFERENCES,
+        source_quotas["official"],
+        seed,
+        "official-preference-balance",
+    )
+    extended = _balanced_repetitions(
+        _EXTENDED_PREFERENCES,
+        source_quotas["extended"],
+        seed,
+        "extended-preference-balance",
+    )
+    values = [*official, *extended]
     deterministic_rng(seed, "preference-like-kinds").shuffle(values)
     result: list[tuple[str, ...]] = [()] * len(task_types)
     offset = 0
@@ -586,6 +677,20 @@ def _preference_like_kinds(task_types: Sequence[str], seed: int) -> list[tuple[s
         if task_type == "preference_like":
             result[index] = (values[offset],)
             offset += 1
+    return result
+
+
+def _balanced_repetitions(
+    values: Sequence[_T],
+    count: int,
+    seed: int,
+    scope: str,
+) -> list[_T]:
+    repetitions, remainder = divmod(count, len(values))
+    result = [value for value in values for _ in range(repetitions)]
+    extras = list(values)
+    deterministic_rng(seed, scope).shuffle(extras)
+    result.extend(extras[:remainder])
     return result
 
 
@@ -726,26 +831,40 @@ def _validation_profile(task_type: str, seed: int, index: int, profile: str) -> 
     )
 
 
-def _validate_blended_distribution(slots: Sequence[PilotSlot]) -> None:
-    if Counter(slot.task_type for slot in slots) != Counter(_BLENDED_TYPE_QUOTAS):
+def _validate_blended_distribution(slots: Sequence[PilotSlot], seed: int) -> None:
+    type_quotas = blended_task_type_quotas(len(slots), seed)
+    if Counter(slot.task_type for slot in slots) != Counter(type_quotas):
         raise RuntimeError("Blended task-type quotas drifted.")
-    if Counter(slot.scenario_profile for slot in slots) != Counter(_BLENDED_SCENARIO_QUOTAS):
+    scenario_quotas = blended_scenario_quotas(len(slots), seed)
+    if Counter(slot.scenario_profile for slot in slots) != Counter(scenario_quotas):
         raise RuntimeError("Blended scenario quotas drifted.")
     for task_type, quotas in _BLENDED_CONSTRAINT_QUOTAS.items():
+        expected = _scaled_quotas(
+            type_quotas[task_type],
+            quotas,
+            seed,
+            f"blended-constraint-counts-{task_type}",
+        )
         actual = Counter(
             slot.constraint_count for slot in slots if slot.task_type == task_type
         )
-        if actual != Counter(quotas):
+        if actual != Counter(expected):
             raise RuntimeError(f"Blended constraint quotas drifted for {task_type}.")
     humans = [slot for slot in slots if slot.task_type == "human_like"]
-    if sum(slot.metadata_prefix is not None for slot in humans) != 35:
+    metadata_quotas = _scaled_quotas(
+        len(humans), _HUMAN_METADATA_QUOTAS, seed, "human-metadata"
+    )
+    if sum(slot.metadata_prefix is not None for slot in humans) != metadata_quotas[True]:
         raise RuntimeError("Human metadata quota drifted.")
-    if Counter(len(slot.preference_kinds) for slot in humans) != {
-        0: 10,
-        1: 20,
-        2: 15,
-        3: 5,
-    }:
+    preference_quotas = _scaled_quotas(
+        len(humans),
+        _HUMAN_PREFERENCE_COUNT_QUOTAS,
+        seed,
+        "human-preference-counts",
+    )
+    if Counter(len(slot.preference_kinds) for slot in humans) != Counter(
+        preference_quotas
+    ):
         raise RuntimeError("Human preference quotas drifted.")
 
 

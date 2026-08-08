@@ -14,6 +14,12 @@ from typing import Any
 
 from ..errors import SynthesisError
 from ..paths import project_root
+from .catalog import (
+    BLENDED_PROFILE,
+    BLENDED_V1_1_PROFILE,
+    blended_scenario_quotas,
+    blended_task_type_quotas,
+)
 from .models import ARTIFACT_VERSION, PROMPT_VERSION, PilotSlot
 
 
@@ -435,20 +441,8 @@ def _alignment(
     distributions: dict[str, Any],
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    expected_types = {
-        "easy_like": 50,
-        "medium_like": 70,
-        "human_like": 50,
-        "preference_like": 20,
-        "generalization": 10,
-    }
-    expected_scenarios = {
-        "normal": 180,
-        "poi_closure": 5,
-        "hotel_unavailable": 4,
-        "transport_cancellation": 5,
-        "price_change": 6,
-    }
+    requested_count = int(config["count"])
+    seed = int(config["seed"])
     queries = [str(row["surface"]["public_query"]) for row in records]
     benchmark_queries = _benchmark_queries()
     benchmark_reuse = sorted(set(queries) & benchmark_queries)
@@ -460,12 +454,27 @@ def _alignment(
     )
     actual_types = dict(distributions["task_types"])
     actual_scenarios = dict(distributions["scenario_profiles"])
-    is_blended = config.get("profile") in {
-        "chinatravel_blended_v1",
-        "chinatravel_blended_v1_1",
-    }
+    is_blended = config.get("profile") in {BLENDED_PROFILE, BLENDED_V1_1_PROFILE}
+    expected_types = (
+        {
+            key: value
+            for key, value in blended_task_type_quotas(requested_count, seed).items()
+            if value
+        }
+        if is_blended
+        else None
+    )
+    expected_scenarios = (
+        {
+            key: value
+            for key, value in blended_scenario_quotas(requested_count, seed).items()
+            if value
+        }
+        if is_blended
+        else None
+    )
     checks = {
-        "requested_count": len(records) == int(config["count"]),
+        "requested_count": len(records) == requested_count,
         "hard_reward_100_percent": hard_passes == len(records),
         "unique_queries": len(set(queries)) == len(queries),
         "no_benchmark_exact_reuse": not benchmark_reuse,
@@ -477,12 +486,14 @@ def _alignment(
         ),
     }
     if is_blended:
+        assert expected_types is not None
+        assert expected_scenarios is not None
         checks["task_type_quotas"] = actual_types == expected_types
         checks["scenario_quotas"] = actual_scenarios == expected_scenarios
         checks["preference_audit_count"] = sum(
             row.get("preference_audit") is not None for row in records
-        ) == 20
-    if config.get("profile") == "chinatravel_blended_v1_1":
+        ) == expected_types.get("preference_like", 0)
+    if config.get("profile") == BLENDED_V1_1_PROFILE:
         audits = [
             row["preference_audit"]
             for row in records
@@ -505,8 +516,13 @@ def _alignment(
     return {
         "profile": config.get("profile", "pilot_v2_1"),
         "expected": {
-            "task_types": expected_types if is_blended else None,
-            "scenario_profiles": expected_scenarios if is_blended else None,
+            "task_types": expected_types,
+            "scenario_profiles": expected_scenarios,
+            "preference_audit_count": (
+                expected_types.get("preference_like", 0)
+                if expected_types is not None
+                else None
+            ),
         },
         "actual": {
             "task_types": actual_types,

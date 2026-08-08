@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import Counter
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +11,7 @@ import pytest
 from travelweaver.env import InMemoryBackend, ScenarioBackend, ScenarioEffect, ScenarioSpec
 from travelweaver.errors import SynthesisError
 from travelweaver.llm import DeepSeekConfig
+from travelweaver.synthesis.artifacts import _alignment
 from travelweaver.synthesis.catalog import build_pilot_slots
 from travelweaver.synthesis.polisher import TaskPolisher, validate_surface
 from travelweaver.synthesis.render import render_canonical
@@ -137,7 +140,7 @@ def test_catalog_uses_one_seed_reproducibly_for_arbitrary_counts() -> None:
         assert all(len(slot.recipe) == slot.constraint_count for slot in slots)
 
 
-def test_chinatravel_blended_profile_has_frozen_200_task_quotas() -> None:
+def test_chinatravel_blended_profile_preserves_200_task_baseline() -> None:
     slots = build_pilot_slots(200, 20260808, "chinatravel_blended_v1")
 
     assert Counter(slot.task_type for slot in slots) == {
@@ -177,8 +180,136 @@ def test_chinatravel_blended_profile_has_frozen_200_task_quotas() -> None:
     assert all(preference_counts[kind] >= 2 for kind in official)
     assert sum(preference_counts[kind] for kind in official) == 14
     assert len(preference_counts.keys() - official) == 6
-    with pytest.raises(ValueError, match="frozen 200-task"):
-        build_pilot_slots(199, 20260808, "chinatravel_blended_v1")
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected_digest"),
+    [
+        (
+            "chinatravel_blended_v1",
+            "11892b9b0db71e6cd9e61c2f954d27d19aa98c1aee5819579c5b82222bf91f72",
+        ),
+        (
+            "chinatravel_blended_v1_1",
+            "27ec824929fa3cf900907d8f2b79a54350bb9be17d2d353e4ccb6019880ad785",
+        ),
+    ],
+)
+def test_chinatravel_blended_200_slots_do_not_drift(
+    profile: str, expected_digest: str
+) -> None:
+    slots = build_pilot_slots(200, 20260808, profile)
+    payload = json.dumps(
+        [asdict(slot) for slot in slots],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert hashlib.sha256(payload.encode()).hexdigest() == expected_digest
+
+
+@pytest.mark.parametrize("count", [1, 37, 199, 500])
+@pytest.mark.parametrize(
+    "profile", ["chinatravel_blended_v1", "chinatravel_blended_v1_1"]
+)
+def test_chinatravel_blended_profiles_scale_reproducibly(
+    count: int, profile: str
+) -> None:
+    slots = build_pilot_slots(count, 20260811, profile)
+
+    assert len(slots) == count
+    assert slots == build_pilot_slots(count, 20260811, profile)
+    assert slots != build_pilot_slots(count, 20260812, profile)
+
+
+def test_chinatravel_blended_v1_1_scales_to_500_task_quotas() -> None:
+    slots = build_pilot_slots(500, 20260811, "chinatravel_blended_v1_1")
+
+    assert Counter(slot.task_type for slot in slots) == {
+        "easy_like": 125,
+        "medium_like": 175,
+        "human_like": 125,
+        "preference_like": 50,
+        "generalization": 25,
+    }
+    assert Counter(slot.scenario_profile for slot in slots) == {
+        "normal": 450,
+        "poi_closure": 12,
+        "hotel_unavailable": 10,
+        "transport_cancellation": 13,
+        "price_change": 15,
+    }
+    humans = [slot for slot in slots if slot.task_type == "human_like"]
+    assert Counter(slot.metadata_prefix is not None for slot in humans) == {
+        True: 87,
+        False: 38,
+    }
+    assert Counter(len(slot.preference_kinds) for slot in humans) == {
+        0: 25,
+        1: 50,
+        2: 37,
+        3: 13,
+    }
+    preferences = [
+        slot.preference_kinds[0]
+        for slot in slots
+        if slot.task_type == "preference_like"
+    ]
+    official = {
+        "more_attractions",
+        "less_innercity_time",
+        "shorter_meal_transfer",
+        "higher_dining_share",
+        "lower_lodging_share",
+        "near_poi",
+    }
+    assert sum(kind in official for kind in preferences) == 35
+    assert max(Counter(preferences).values()) - min(Counter(preferences).values()) <= 4
+
+
+def test_scaled_alignment_uses_the_same_500_task_targets() -> None:
+    slots = build_pilot_slots(500, 20260811, "chinatravel_blended_v1_1")
+    records = []
+    for index, slot in enumerate(slots):
+        preference_audit = None
+        if slot.task_type == "preference_like":
+            preference_audit = {
+                "candidates": [
+                    {"metric_value": 0, "all_hard_pass": True, "hard_reward": 1.0},
+                    {"metric_value": 1, "all_hard_pass": True, "hard_reward": 1.0},
+                ]
+            }
+        records.append(
+            {
+                "surface": {"public_query": f"合成任务{index}"},
+                "witness": {"reward_detail": {"all_hard_pass": True, "reward": 1.0}},
+                "preference_audit": preference_audit,
+            }
+        )
+    distributions = {
+        "task_types": dict(Counter(slot.task_type for slot in slots)),
+        "scenario_profiles": dict(Counter(slot.scenario_profile for slot in slots)),
+        "surface_quality": {
+            "human_template_term_rate": 0.0,
+            "human_max_opening_share": 0.01,
+            "human_metadata_persona_repetitions": 0,
+        },
+    }
+
+    alignment = _alignment(
+        records,
+        distributions,
+        {
+            "count": 500,
+            "seed": 20260811,
+            "profile": "chinatravel_blended_v1_1",
+            "validation_policy": "minimal_semantic",
+        },
+    )
+
+    assert alignment["expected"]["task_types"]["preference_like"] == 50
+    assert alignment["expected"]["preference_audit_count"] == 50
+    assert all(alignment["checks"].values())
 
 
 def test_chinatravel_blended_v1_1_keeps_benchmark_core_and_tail_split() -> None:
