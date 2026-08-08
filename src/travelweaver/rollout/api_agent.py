@@ -10,15 +10,12 @@ from typing import Any
 from ..env import TravelWeaverEnv
 from ..errors import ApiRolloutError
 from ..llm import (
-    DeepSeekConfig,
     OpenAICompatibleChatClient,
     OpenAICompatibleConfig,
 )
 
 __all__ = [
     "ApiAgentRun",
-    "DeepSeekConfig",
-    "DeepSeekToolAgent",
     "OpenAICompatibleConfig",
     "ToolCallingAgent",
 ]
@@ -344,7 +341,3 @@ class ToolCallingAgent:
         for key, value in usage.items():
             if isinstance(value, int) and not isinstance(value, bool):
                 total[key] = total.get(key, 0) + value
-
-
-class DeepSeekToolAgent(ToolCallingAgent):
-    """Backward-compatible name for the DeepSeek rollout entry point."""

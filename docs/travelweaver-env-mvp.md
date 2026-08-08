@@ -165,8 +165,8 @@ uv run travelweaver rollout-api --task-id e20241028160248698752
 `tool_call_id`。
 
 代码层由通用 `OpenAICompatibleConfig`、`OpenAICompatibleChatClient` 和
-`ToolCallingAgent` 完成协议处理，`DeepSeekConfig` 与 `DeepSeekToolAgent` 是当前官方
-API 的配置和兼容入口。DeepSeek 的 `thinking` 是可选供应商字段，不属于环境工具
+`ToolCallingAgent` 完成协议处理，`DeepSeekConfig` 是当前官方 API 的配置入口。
+DeepSeek 的 `thinking` 是可选供应商字段，不属于环境工具
 协议；环境与其他 OpenAI-compatible 模型不依赖它。
 
 离线主观评价使用 `OfflineTravelJudge`：它只能看到公开 query、压缩后的工具摘要、

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from travelweaver.data.tasks import JsonlTaskStore, import_easy_tasks
+from travelweaver.data.tasks import JsonlTaskStore, import_task_split
 from travelweaver.errors import DataUnavailableError, TaskNotFoundError
 
 FIELDNAMES = [
@@ -49,7 +49,7 @@ def test_import_separates_public_and_oracle(tmp_path: Path) -> None:
     source = tmp_path / "easy.csv"
     output = tmp_path / "tasks"
     _write_csv(source)
-    report = import_easy_tasks(output, source_csv=source)
+    report = import_task_split(output, split="easy", source_csv=source)
     assert report["count"] == 1
 
     public = json.loads((output / "easy.public.jsonl").read_text(encoding="utf-8"))
@@ -73,7 +73,7 @@ def test_hard_logic_is_never_executed(tmp_path: Path) -> None:
     expression = f"__import__('pathlib').Path({str(marker)!r}).write_text('bad')"
     _write_csv(source, hard_logic=expression)
     with pytest.raises(DataUnavailableError):
-        import_easy_tasks(tmp_path / "tasks", source_csv=source)
+        import_task_split(tmp_path / "tasks", split="easy", source_csv=source)
     assert not marker.exists()
 
 

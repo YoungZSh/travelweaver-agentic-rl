@@ -3,13 +3,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from travelweaver.rollout import (
-    DeepSeekConfig,
-    DeepSeekToolAgent,
-    OpenAICompatibleConfig,
-    ToolCallingAgent,
-    append_trajectory,
-)
+from travelweaver.llm import DeepSeekConfig, OpenAICompatibleConfig
+from travelweaver.rollout import ToolCallingAgent, append_trajectory
 
 
 class _Payload:
@@ -85,7 +80,7 @@ def test_api_agent_executes_model_tool_call_and_records_trajectory(env) -> None:
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     config = DeepSeekConfig(api_key="not-a-real-secret")
 
-    run = DeepSeekToolAgent(env, config, client=client).run("task-hangzhou")
+    run = ToolCallingAgent(env, config, client=client).run("task-hangzhou")
 
     assert not run.success
     assert run.termination_reason == "finished_without_plan"
@@ -161,7 +156,7 @@ def test_api_agent_executes_only_first_tool_call_per_turn(env) -> None:
     )
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
 
-    run = DeepSeekToolAgent(
+    run = ToolCallingAgent(
         env,
         DeepSeekConfig(api_key="not-a-real-secret"),
         client=client,

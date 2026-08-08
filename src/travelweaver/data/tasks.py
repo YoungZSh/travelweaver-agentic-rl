@@ -203,16 +203,6 @@ def import_task_split(
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
-
-
-def import_easy_tasks(
-    output_dir: str | Path, *, source_csv: str | Path | None = None
-) -> dict[str, Any]:
-    """Backward-compatible Easy split importer."""
-
-    return import_task_split(output_dir, split="easy", source_csv=source_csv)
-
-
 def import_benchmark_tasks(output_dir: str | Path) -> dict[str, Any]:
     """Import and combine all 654 ChinaTravel tasks with executable oracle data."""
 
