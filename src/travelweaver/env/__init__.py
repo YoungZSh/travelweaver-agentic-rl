@@ -8,6 +8,7 @@ from .environment import (
     TravelWeaverEnv,
 )
 from .models import EvidenceBundle, Observation, PlanSnapshot, StepResult
+from .scenario import SCENARIO_VERSION, ScenarioBackend, ScenarioEffect, ScenarioSpec
 
 __all__ = [
     "ChinaTravelBackend",
@@ -17,6 +18,10 @@ __all__ = [
     "OBSERVATION_VERSION",
     "Observation",
     "PlanSnapshot",
+    "SCENARIO_VERSION",
+    "ScenarioBackend",
+    "ScenarioEffect",
+    "ScenarioSpec",
     "StepResult",
     "TOOLS_VERSION",
     "TravelWeaverEnv",

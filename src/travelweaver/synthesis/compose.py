@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ..errors import SynthesisError
 from ..reward import TravelReward
-from ..tasks import BlueprintConstraint, ConstraintSpec, TaskBlueprint, TravelTaskSpec, TripSpec
+from ..tasks import (
+    BlueprintConstraint,
+    BlueprintPreference,
+    ConstraintSpec,
+    TaskBlueprint,
+    TravelTaskSpec,
+    TripSpec,
+)
 from .models import GENERATOR_VERSION, WORLD_SNAPSHOT_VERSION, PilotSlot, WitnessResult
 
 
@@ -17,9 +24,12 @@ def compose_blueprint(
     witness: WitnessResult,
     *,
     generation_seed: int,
+    world_snapshot_version: str = WORLD_SNAPSHOT_VERSION,
+    constraint_witnesses: Sequence[WitnessResult] = (),
 ) -> TaskBlueprint:
+    cohort = tuple(constraint_witnesses) or (witness,)
     constraints = tuple(
-        _constraint(index, key, slot, witness)
+        _constraint(index, key, slot, witness, cohort)
         for index, key in enumerate(slot.recipe, 1)
     )
     blueprint = TaskBlueprint(
@@ -30,12 +40,56 @@ def compose_blueprint(
             travelers=slot.travelers,
         ),
         constraints=constraints,
-        world_snapshot_version=WORLD_SNAPSHOT_VERSION,
+        world_snapshot_version=world_snapshot_version,
         generator_version=GENERATOR_VERSION,
         generation_seed=generation_seed,
+        preferences=_preferences(slot, witness),
+        persona_context=slot.persona_context,
+        metadata_prefix=slot.metadata_prefix,
     )
     _verify_constraints(blueprint, witness)
     return blueprint
+
+
+_PREFERENCE_DIRECTIONS = {
+    "more_attractions": "maximize",
+    "less_innercity_time": "minimize",
+    "shorter_meal_transfer": "minimize",
+    "higher_dining_share": "maximize",
+    "lower_lodging_share": "minimize",
+    "near_poi": "minimize",
+    "less_walking": "minimize",
+    "lower_total_cost": "minimize",
+    "relaxed_itinerary": "minimize",
+    "higher_attraction_share": "maximize",
+    "lower_intercity_share": "minimize",
+    "shorter_total_travel_time": "minimize",
+}
+
+
+def _preferences(
+    slot: PilotSlot, witness: WitnessResult
+) -> tuple[BlueprintPreference, ...]:
+    preferences: list[BlueprintPreference] = []
+    for index, kind in enumerate(slot.preference_kinds, 1):
+        value: Any = None
+        if kind == "near_poi":
+            anchor = witness.selected.get("preference_anchor")
+            if not isinstance(anchor, Mapping):
+                attractions = witness.selected.get("attractions", [])
+                anchor = attractions[0] if attractions else None
+            if not isinstance(anchor, Mapping):
+                raise SynthesisError("near_poi preference needs an attraction anchor.")
+            value = {"poi_name": _required_text(anchor, "name")}
+        preferences.append(
+            BlueprintPreference(
+                id=f"p{index:03d}",
+                kind=kind,
+                direction=_PREFERENCE_DIRECTIONS[kind],
+                value=value,
+            )
+        )
+    return tuple(preferences)
 
 
 def _constraint(
@@ -43,11 +97,16 @@ def _constraint(
     key: str,
     slot: PilotSlot,
     witness: WitnessResult,
+    cohort: Sequence[WitnessResult],
 ) -> BlueprintConstraint:
     constraint_id = f"c{index:03d}"
     selected = witness.selected
     if key == "total_budget":
-        amount = _upper_bound(witness.evidence_bundle["total_cost"], quantum=100)
+        amount = _upper_bound(
+            max(float(item.evidence_bundle["total_cost"]) for item in cohort),
+            quantum=100,
+            factor=_budget_factor(slot.tightness),
+        )
         return _build(constraint_id, "total_budget", "lte", {"amount": amount}, "trip")
     if key in {"all_intercity_mode", "outbound_mode", "return_mode"}:
         leg, mode = {
@@ -73,10 +132,19 @@ def _constraint(
     if key in {"outbound_time", "return_time"}:
         leg = "outbound" if key == "outbound_time" else "return"
         field = "end_time" if leg == "outbound" else "start_time"
-        transport = selected[leg]
-        actual = str(transport["arrival_time" if leg == "outbound" else "departure_time"])
         operator = "lte" if leg == "outbound" else "gte"
-        boundary = _natural_boundary(actual, operator)
+        field_name = "arrival_time" if leg == "outbound" else "departure_time"
+        actual_values = [str(item.selected[leg][field_name]) for item in cohort]
+        actual = (
+            max(actual_values, key=_clock_value)
+            if operator == "lte"
+            else min(actual_values, key=_clock_value)
+        )
+        boundary = _natural_boundary(
+            actual,
+            operator,
+            slack_minutes=_time_slack(slot.tightness),
+        )
         return _build(
             constraint_id,
             "time_window",
@@ -121,7 +189,11 @@ def _constraint(
         )
     if key == "restaurant_budget":
         restaurant = _required_entity(selected, "restaurant")
-        amount = _upper_bound(restaurant["price"], quantum=10)
+        amount = _upper_bound(
+            restaurant["price"],
+            quantum=10,
+            factor=_budget_factor(slot.tightness),
+        )
         return _build(
             constraint_id,
             "category_budget",
@@ -153,7 +225,14 @@ def _constraint(
             constraint_id,
             "category_budget",
             "lte",
-            {"amount": _upper_bound(actual, quantum=10), "basis": "per_person_per_night"},
+            {
+                "amount": _upper_bound(
+                    actual,
+                    quantum=10,
+                    factor=_budget_factor(slot.tightness),
+                ),
+                "basis": "per_person_per_night",
+            },
             "accommodation",
         )
     if key == "room_type":
@@ -266,17 +345,30 @@ def _category_actual(witness: WitnessResult, activity_type: str) -> float:
     return sum(amounts) / travelers / nights
 
 
-def _upper_bound(value: Any, *, quantum: int) -> int:
+def _upper_bound(value: Any, *, quantum: int, factor: float) -> int:
     number = float(value)
-    return max(quantum, math.ceil(number * 1.1 / quantum) * quantum)
+    return max(quantum, math.ceil(number * factor / quantum) * quantum)
 
 
-def _natural_boundary(value: str, operator: str) -> str:
+def _natural_boundary(value: str, operator: str, *, slack_minutes: int) -> str:
     hours, minutes = (int(part) for part in value.split(":", 1))
     actual = hours * 60 + minutes
     if operator == "lte":
-        boundary = math.ceil(actual / 30) * 30
-        boundary = min(23 * 60 + 59, boundary)
+        boundary = min(23 * 60 + 59, actual + slack_minutes)
     else:
-        boundary = actual // 30 * 30
+        boundary = max(0, actual - slack_minutes)
+    boundary = min(23 * 60 + 59, round(boundary / 5) * 5)
     return f"{boundary // 60:02d}:{boundary % 60:02d}"
+
+
+def _clock_value(value: str) -> int:
+    hours, minutes = (int(part) for part in value.split(":", 1))
+    return hours * 60 + minutes
+
+
+def _budget_factor(tightness: str) -> float:
+    return {"easy": 1.25, "medium": 1.12, "hard": 1.03}[tightness]
+
+
+def _time_slack(tightness: str) -> int:
+    return {"easy": 60, "medium": 30, "hard": 15}[tightness]

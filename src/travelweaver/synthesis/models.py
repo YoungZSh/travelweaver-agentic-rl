@@ -5,15 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-GENERATOR_VERSION = "travelweaver-synthesis-v1"
-PROMPT_VERSION = "travelweaver-zh-polisher-v1"
-ARTIFACT_VERSION = "travelweaver-synthesis-artifacts-v1"
+GENERATOR_VERSION = "travelweaver-synthesis-v3"
+PROMPT_VERSION = "travelweaver-zh-polisher-v3"
+ARTIFACT_VERSION = "travelweaver-synthesis-artifacts-v5"
 WORLD_SNAPSHOT_VERSION = "chinatravel-pinned-v1"
 
 
 @dataclass(frozen=True)
 class PilotSlot:
     index: int
+    origin: str
     destination: str
     days: int
     travelers: int
@@ -21,6 +22,19 @@ class PilotSlot:
     return_mode: str
     constraint_count: int
     recipe: tuple[str, ...]
+    attractions_per_day: int
+    include_meal: bool
+    route_mode: str
+    transport_strategy: str
+    tightness: str
+    scenario_profile: str
+    surface_style: str
+    synthesis_profile: str = "pilot_v2_1"
+    task_type: str = "pilot"
+    validation_profile: str = "strict"
+    persona_context: str | None = None
+    metadata_prefix: str | None = None
+    preference_kinds: tuple[str, ...] = ()
 
     @property
     def mixed_transport(self) -> bool:
@@ -31,6 +45,7 @@ class PilotSlot:
 class CanonicalTask:
     query: str
     clauses: dict[str, str]
+    preference_clauses: dict[str, str]
     protected_literals: tuple[str, ...]
 
 
