@@ -688,7 +688,10 @@ def test_minimal_semantic_policy_repairs_mentions_and_allows_shared_clauses() ->
 
 @pytest.mark.parametrize(
     ("validation_profile", "expected"),
-    (("strict", "市内地点之间必须步行"), ("benchmark_natural", "市内地点之间都步行")),
+    (
+        ("strict", "至少安排两个市内地点，地点之间必须步行"),
+        ("benchmark_natural", "至少安排两个市内地点，地点之间都步行"),
+    ),
 )
 def test_walking_constraint_uses_natural_verb(
     validation_profile: str,
@@ -731,6 +734,124 @@ def test_walking_constraint_uses_natural_verb(
     assert expected in canonical.query
     assert "坐步行" not in canonical.query
     assert "使用步行" not in canonical.query
+
+
+def test_restaurant_budget_requires_nonempty_meal_scope_after_polishing() -> None:
+    blueprint = TaskBlueprint(
+        trip=TripSpec(origin="上海", destinations=("杭州",), days=2, travelers=2),
+        constraints=(
+            BlueprintConstraint(
+                "c001",
+                "category_budget",
+                "lte",
+                {"amount": 100, "basis": "per_person_per_activity"},
+                "restaurant",
+            ),
+        ),
+        world_snapshot_version="snapshot-v1",
+        generator_version="generator-v1",
+        generation_seed=5,
+    )
+    canonical = render_canonical(blueprint, validation_profile="benchmark_natural")
+    assert "至少安排一顿用餐，餐厅人均每餐不超过100元" in canonical.query
+    validate_surface(
+        blueprint,
+        canonical,
+        {
+            "query": canonical.query,
+            "mentions": [{"constraint_id": "c001", "text": canonical.clauses["c001"]}],
+            "preference_mentions": [],
+        },
+        model="canonical-nonempty-meal-test",
+        validation_profile="benchmark_natural",
+    )
+
+    natural_query = canonical.query.replace("至少安排一顿用餐", "最少吃一顿饭")
+    natural_payload = {
+        "query": natural_query,
+        "mentions": [
+            {
+                "constraint_id": "c001",
+                "text": "最少吃一顿饭，餐厅人均每餐不超过100元",
+            }
+        ],
+        "preference_mentions": [],
+    }
+    validate_surface(
+        blueprint,
+        canonical,
+        natural_payload,
+        model="nonempty-meal-test",
+        validation_profile="benchmark_natural",
+        validation_policy="minimal_semantic",
+    )
+
+    missing = {
+        "query": canonical.query.replace("至少安排一顿用餐，", ""),
+        "mentions": [{"constraint_id": "c001", "text": "餐厅人均每餐不超过100元"}],
+        "preference_mentions": [],
+    }
+    with pytest.raises(SynthesisError, match="does not require a meal"):
+        validate_surface(
+            blueprint,
+            canonical,
+            missing,
+            model="empty-meal-scope-test",
+            validation_profile="benchmark_natural",
+            validation_policy="minimal_semantic",
+        )
+
+
+def test_innercity_transport_requires_two_places_after_polishing() -> None:
+    blueprint = TaskBlueprint(
+        trip=TripSpec(origin="上海", destinations=("杭州",), days=2, travelers=2),
+        constraints=(
+            BlueprintConstraint(
+                "c001",
+                "transport_mode",
+                "eq",
+                {"modes": ["metro"], "leg": "all"},
+                "innercity_route",
+            ),
+        ),
+        world_snapshot_version="snapshot-v1",
+        generator_version="generator-v1",
+        generation_seed=5,
+    )
+    canonical = render_canonical(blueprint, validation_profile="benchmark_natural")
+    assert "至少安排两个市内地点，地点之间统一坐地铁" in canonical.query
+
+    natural_query = canonical.query.replace("至少安排两个市内地点", "市内选择两处地点")
+    natural_payload = {
+        "query": natural_query,
+        "mentions": [
+            {"constraint_id": "c001", "text": "市内选择两处地点，地点之间统一坐地铁"}
+        ],
+        "preference_mentions": [],
+    }
+    validate_surface(
+        blueprint,
+        canonical,
+        natural_payload,
+        model="two-innercity-places-test",
+        validation_profile="benchmark_natural",
+        validation_policy="minimal_semantic",
+    )
+
+    missing = {
+        "query": canonical.query.replace("至少安排两个市内地点，", ""),
+        "mentions": [{"constraint_id": "c001", "text": "地点之间统一坐地铁"}],
+        "preference_mentions": [],
+    }
+    with pytest.raises(SynthesisError, match="does not require two places"):
+        validate_surface(
+            blueprint,
+            canonical,
+            missing,
+            model="empty-innercity-scope-test",
+            validation_profile="benchmark_natural",
+            validation_policy="minimal_semantic",
+        )
 
 
 def test_surface_validator_allows_city_substring_in_protected_entity_name() -> None:

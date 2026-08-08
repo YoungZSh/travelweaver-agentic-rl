@@ -267,15 +267,15 @@ def _constraint_clause(
         if scope == "innercity_route":
             if mode_text == "步行":
                 clause = (
-                    "市内地点之间都步行"
+                    "至少安排两个市内地点，地点之间都步行"
                     if validation_profile != "strict"
-                    else "市内地点之间必须步行"
+                    else "至少安排两个市内地点，地点之间必须步行"
                 )
             else:
                 clause = (
-                    f"市内地点之间统一坐{mode_text}"
+                    f"至少安排两个市内地点，地点之间统一坐{mode_text}"
                     if validation_profile != "strict"
-                    else f"市内地点之间必须统一使用{mode_text}"
+                    else f"至少安排两个市内地点，地点之间必须统一使用{mode_text}"
                 )
             return clause, {mode_text}
         prefix = {"outbound": "去程", "return": "返程", "all": "往返城际交通"}[leg]
@@ -321,7 +321,7 @@ def _constraint_clause(
     if kind == "category_budget":
         amount = _format_number(value["amount"])
         if scope == "restaurant":
-            return f"餐厅人均每餐不超过{amount}元", {f"{amount}元"}
+            return f"至少安排一顿用餐，餐厅人均每餐不超过{amount}元", {f"{amount}元"}
         return f"住宿人均每晚不超过{amount}元", {f"{amount}元"}
     if kind == "room_type":
         room_type = str(value["room_type"])

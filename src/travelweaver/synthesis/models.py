@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 GENERATOR_VERSION = "travelweaver-synthesis-v3"
-PROMPT_VERSION = "travelweaver-zh-polisher-v3"
+PROMPT_VERSION = "travelweaver-zh-polisher-v4"
 ARTIFACT_VERSION = "travelweaver-synthesis-artifacts-v5"
 WORLD_SNAPSHOT_VERSION = "chinatravel-pinned-v1"
 

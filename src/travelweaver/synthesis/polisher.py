@@ -22,6 +22,16 @@ _ENTITY_LIKE = re.compile(
     r"[\u4e00-\u9fff]{2,18}(?:公园|博物馆|酒店|餐厅|景区|古镇|广场|寺|宫|塔|山|湖)"
 )
 _VALIDATION_POLICIES = {"strict", "minimal_semantic"}
+_MEAL_REQUIREMENT = re.compile(
+    r"(?:(?:至少|最少|起码|不少于)\s*(?:要|需|需要|得)?\s*"
+    r"(?:安排|吃|享用|包含|有)?|(?:要|需|需要|得|必须)?\s*"
+    r"(?:安排|吃|享用|包含|有))\s*(?:一|1)\s*顿(?:饭|餐|用餐)?"
+)
+_MULTIPLE_INNERCITY_PLACES = re.compile(
+    r"(?:至少|最少|起码|不少于)?\s*(?:安排|选择|去|逛|游览|走访|打卡|包含|有)?"
+    r"[^。；！？\n]{0,6}(?:两|二|2)\s*(?:个|处|站)?\s*"
+    r"(?:市内|本地)?(?:地点|地方|去处|景点|站点|游览点|目的地|点位)"
+)
 _TOOLS = [
     {
         "type": "function",
@@ -77,6 +87,8 @@ _SYSTEM_PROMPT = """你是中文旅行任务改写器。你的唯一职责是让
 8. preference_mentions 必须逐一覆盖已分配偏好；偏好可用受控同义表达，但方向不能改变。
 9. validation_profile=benchmark_natural 时使用 benchmark 风格的自然确定表达，不要为了表示
    硬约束而机械添加“必须、硬性要求”等词。
+10. 餐厅每餐预算约束必须明确要求至少安排一顿用餐；市内交通方式约束必须明确要求至少
+    安排两个市内地点。两项前提都可以自然改写，但不得省略。
 """
 _STYLE_DIRECTIONS = {
     "direct": "直接清楚地提出规划请求。",
@@ -463,6 +475,7 @@ def validate_surface(
                 text,
                 validation_profile=validation_profile,
             )
+        _validate_non_vacuous_scope(constraint, query)
         value = constraint.value if isinstance(constraint.value, dict) else {}
         leg = value.get("leg")
         if leg in {"outbound", "return"}:
@@ -600,10 +613,14 @@ def _validate_polarity(
         marker in text for marker in ("左右", "大概", "差不多", "尽量")
     ):
         raise SynthesisError(f"Hard boundary became ambiguous: {text}")
+    polarity_text = _strip_scope_prerequisite(kind, text)
     if operator == "lte":
-        if not any(marker in text for marker in ("不超过", "以内", "至多", "之前", "前", "不高于")):
+        if not any(
+            marker in polarity_text
+            for marker in ("不超过", "以内", "至多", "之前", "前", "不高于")
+        ):
             raise SynthesisError(f"Upper-bound mention lost its polarity: {text}")
-        if any(marker in text for marker in ("至少", "不少于")):
+        if any(marker in polarity_text for marker in ("至少", "不少于")):
             raise SynthesisError(f"Upper-bound mention gained lower-bound wording: {text}")
     elif operator == "gte":
         if not any(marker in text for marker in ("至少", "不少于", "之后", "后", "不早于")):
@@ -656,9 +673,11 @@ def _validate_minimal_constraint(constraint: Any, text: str, query: str) -> None
         if any(marker in context for marker in optional_markers):
             raise SynthesisError(f"Hard constraint became optional in context: {context}")
     operator = str(constraint.operator)
+    kind = str(constraint.kind)
+    polarity_text = _strip_scope_prerequisite(kind, text)
     if operator == "lte":
         if not any(
-            marker in text
+            marker in polarity_text
             for marker in (
                 "不超过",
                 "不超",
@@ -674,7 +693,9 @@ def _validate_minimal_constraint(constraint: Any, text: str, query: str) -> None
             )
         ):
             raise SynthesisError(f"Upper-bound mention lost its polarity: {text}")
-        if any(marker in text for marker in ("至少", "不少于", "之后", "不低于")):
+        if any(
+            marker in polarity_text for marker in ("至少", "不少于", "之后", "不低于")
+        ):
             raise SynthesisError(f"Upper-bound mention reversed direction: {text}")
     elif operator == "gte":
         if not any(
@@ -686,7 +707,6 @@ def _validate_minimal_constraint(constraint: Any, text: str, query: str) -> None
             raise SynthesisError(f"Lower-bound mention reversed direction: {text}")
 
     value = constraint.value if isinstance(constraint.value, dict) else {}
-    kind = str(constraint.kind)
     if kind in {"total_budget", "category_budget"}:
         _require_number(text, value.get("amount"), constraint.id)
     elif kind == "time_window":
@@ -714,6 +734,27 @@ def _validate_minimal_constraint(constraint: Any, text: str, query: str) -> None
         _require_count(text, value.get("count"), ("间房", "间客房"), constraint.id)
     elif kind == "activity_count":
         _require_count(text, value.get("count"), ("个景点", "处景点"), constraint.id)
+
+
+def _strip_scope_prerequisite(kind: str, text: str) -> str:
+    if kind == "category_budget":
+        return _MEAL_REQUIREMENT.sub("", text)
+    return text
+
+
+def _validate_non_vacuous_scope(constraint: Any, query: str) -> None:
+    kind = str(constraint.kind)
+    scope = str(constraint.scope)
+    if kind == "category_budget" and scope == "restaurant":
+        if _MEAL_REQUIREMENT.search(query) is None:
+            raise SynthesisError(
+                f"Restaurant budget constraint {constraint.id} does not require a meal."
+            )
+    if kind == "transport_mode" and scope == "innercity_route":
+        if _MULTIPLE_INNERCITY_PLACES.search(query) is None:
+            raise SynthesisError(
+                f"Inner-city route constraint {constraint.id} does not require two places."
+            )
 
 
 def _require_number(text: str, value: Any, constraint_id: str) -> None:
