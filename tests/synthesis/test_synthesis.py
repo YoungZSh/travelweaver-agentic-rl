@@ -13,6 +13,7 @@ from travelweaver.errors import SynthesisError
 from travelweaver.llm import DeepSeekConfig
 from travelweaver.synthesis.artifacts import _alignment
 from travelweaver.synthesis.catalog import build_pilot_slots
+from travelweaver.synthesis.pipeline import SynthesisPipeline, _preference_metric
 from travelweaver.synthesis.polisher import TaskPolisher, validate_surface
 from travelweaver.synthesis.render import render_canonical
 from travelweaver.tasks import (
@@ -310,6 +311,57 @@ def test_scaled_alignment_uses_the_same_500_task_targets() -> None:
     assert alignment["expected"]["task_types"]["preference_like"] == 50
     assert alignment["expected"]["preference_audit_count"] == 50
     assert all(alignment["checks"].values())
+
+
+def test_innercity_preference_candidates_add_a_routable_meal(monkeypatch) -> None:
+    slot = build_pilot_slots(500, 20260811, "chinatravel_blended_v1_1")[68]
+    captured_include_meal: list[bool] = []
+
+    class FakeBackend:
+        @staticmethod
+        def _records(entity_type: str, city: str) -> list[dict[str, object]]:
+            del entity_type, city
+            return []
+
+    class FakeWitnessBuilder:
+        def __init__(self, backend, *, seed: int) -> None:
+            del backend, seed
+
+        def build(self, candidate_slot, *, origin: str, uid: str):
+            del origin, uid
+            captured_include_meal.append(candidate_slot.include_meal)
+            duration = {"taxi": 10, "metro": 20, "walk": 30}[candidate_slot.route_mode]
+            return SimpleNamespace(
+                evidence_bundle={
+                    "routes": {
+                        "meal": {
+                            "segments": [
+                                {"start_time": "12:00", "end_time": f"12:{duration:02d}"}
+                            ]
+                        }
+                    },
+                    "cost_items": [],
+                    "total_cost": 0.0,
+                },
+                route_mode=candidate_slot.route_mode,
+                selected={"attractions": [{}]},
+            )
+
+    monkeypatch.setattr(
+        "travelweaver.synthesis.pipeline.WitnessBuilder", FakeWitnessBuilder
+    )
+    pipeline = object.__new__(SynthesisPipeline)
+
+    candidates = pipeline._preference_witnesses(
+        FakeBackend(),
+        slot,
+        origin="成都",
+        uid="preference-regression",
+        generation_seed=7,
+    )
+
+    assert all(captured_include_meal)
+    assert len({_preference_metric(row, "less_innercity_time") for row in candidates}) >= 2
 
 
 def test_chinatravel_blended_v1_1_keeps_benchmark_core_and_tail_split() -> None:

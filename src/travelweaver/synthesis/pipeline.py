@@ -374,6 +374,10 @@ class SynthesisPipeline:
             candidate_slot = replace(
                 slot,
                 attractions_per_day=attractions_per_day,
+                include_meal=(
+                    slot.include_meal
+                    or preference_kind in {"less_innercity_time", "less_walking"}
+                ),
                 route_mode=route_modes[candidate_index % len(route_modes)],
             )
             candidate_seed = deterministic_rng(
