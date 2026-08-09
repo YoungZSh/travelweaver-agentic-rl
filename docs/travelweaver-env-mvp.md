@@ -23,7 +23,8 @@ veRL/GRPO 训练循环暂不实现，项目不引入 MCP。
 - 环境、Observation、工具协议分别为 `travelweaver-environment-v0.3`、
   `travelweaver-observation-v3`、`travelweaver-tools-v2-agent`；
 - TaskSpec、Reward 和轨迹协议分别为 `travelweaver-task-spec-v1`、
-  `travelweaver-reward-v1`、`travelweaver-trajectory-v3`。
+  `travelweaver-reward-v1`、`travelweaver-trajectory-v5`；模型可见工具返回协议为
+  `travelweaver-model-tool-response-v1`。
 
 ## 2. 安装与数据准备
 
@@ -157,12 +158,17 @@ cp .env.example .env
 uv run travelweaver rollout-api --task-id e20241028160248698752
 ```
 
-默认模型为 `deepseek-v4-flash`，完整轨迹按 `travelweaver-trajectory-v3` 写入
+默认模型为 `deepseek-v4-flash`，完整轨迹按 `travelweaver-trajectory-v5` 写入
 `data/trajectories/deepseek-v4-flash.jsonl`。轨迹以标准 OpenAI-compatible
 `messages + tools` 作为可重放对话，同时独立保存已执行 `steps`、审计事件、终止状态
 和 token usage，但不会包含 API key。每个 assistant 回合只执行一个工具；若模型返回
 并行调用，规范化消息只保留第一个，其余调用只进入审计事件，避免出现未响应的
 `tool_call_id`。
+
+模型可见的中间 tool message 默认使用 `--tool-response-mode delta`：只包含本轮
+`tool_result`、可选 `error`、`valid_action` 和 `remaining_steps`，不会重复初始 task、全部
+candidates 或累计 visible ID。完整 `StepResult` 始终保存在 `steps[].result`，确定性回放、
+Reward 和审计不依赖精简消息。`--tool-response-mode snapshot` 保留 v3 的旧模型上下文行为。
 
 代码层由通用 `OpenAICompatibleConfig`、`OpenAICompatibleChatClient` 和
 `ToolCallingAgent` 完成协议处理，`DeepSeekConfig` 是当前官方 API 的配置入口。

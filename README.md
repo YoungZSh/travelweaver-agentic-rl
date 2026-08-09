@@ -31,7 +31,9 @@ See [the MVP guide](docs/travelweaver-env-mvp.md), the frozen
 - Environment protocol: `travelweaver-environment-v0.3`
 - Tool protocol: `travelweaver-tools-v2-agent`
 - TaskSpec / Reward: `travelweaver-task-spec-v2` / `travelweaver-reward-v1`
-- Future RL training stack: `verl==0.8.0` in a separate Linux/CUDA environment
+- Trajectory / model response: `travelweaver-trajectory-v5` /
+  `travelweaver-model-tool-response-v1`
+- RL training stack: pinned `verl==0.9.0.dev0` in the separate `training/` Linux/CUDA environment
 
 ChinaTravel remains pinned as a Git submodule. Its dataset is published under
 CC BY-NC-SA 4.0; review upstream terms before redistributing data or using it
@@ -49,14 +51,25 @@ src/travelweaver/
 ├── llm/          # shared OpenAI-compatible client and provider presets
 ├── synthesis/    # witness-first task synthesis and LLM surface polishing
 ├── rollout/      # agent policies and trajectory collection
+├── sft/          # deterministic action replay and neutral SFT reconstruction
 ├── reward/       # deterministic constraint verification and strict RFT filter
 ├── evaluation/   # blind offline LLM Judge and separated evaluation reports
 └── cli/          # command-line entry points
 ```
 
-The lightweight environment remains independent of the future Linux/CUDA SFT and GRPO
+The lightweight environment remains independent of the Linux/CUDA SFT and GRPO
 training stack. Public imports use component namespaces such as
 `from travelweaver.env import TravelWeaverEnv`.
+
+The isolated [training project](training/README.md) pins the CUDA 12.8-compatible veRL,
+vLLM, and PyTorch stack. Create or update its separate virtual environment with
+`uv sync --project training --dev`; training code, configuration, and launchers belong
+under `training/`.
+
+Accepted rollouts can be deterministically rebuilt into action-only SFT data with
+`travelweaver rebuild-sft`. The root command replays valid actions and writes an audited neutral
+JSONL; the isolated training adapter renders it with Qwen3.5's official chat template. See
+[the SFT reconstruction design](docs/sft-trajectory-reconstruction-v1.md).
 
 ## DeepSeek API rollout
 
@@ -76,10 +89,15 @@ uv run travelweaver rollout-api --task-id e20241028160248698752
 The command loads `.env`, calls the official OpenAI-compatible DeepSeek API, and appends
 the full replayable record to `data/trajectories/deepseek-v4-flash.jsonl`. The rollout
 runner itself is provider-neutral: DeepSeek is currently a configuration preset over the
-shared OpenAI-compatible function-calling client. Each `travelweaver-trajectory-v3`
+shared OpenAI-compatible function-calling client. Each `travelweaver-trajectory-v5`
 record contains canonical `messages`, `tools`, executed `steps`, terminal Reward details,
 RFT acceptance, and a separate audit event stream. Local dotenv files and generated
 trajectories are ignored by Git.
+
+Model-visible tool messages default to the versioned `delta` response mode, so each turn
+adds only the new tool result, an optional error, and the remaining-step count. Full
+environment snapshots remain in `steps[].result` for replay and audit. Pass
+`--tool-response-mode snapshot` only when reproducing the legacy model context.
 
 For a generated task directory, run one resumable rollout per task with the tested batch
 command. It defaults to 256 concurrent episodes:
