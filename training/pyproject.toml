@@ -1,0 +1,44 @@
+[project]
+name = "travelweaver-training"
+version = "0.1.0"
+description = "Isolated SFT and GRPO training stack for TravelWeaver."
+requires-python = ">=3.10,<3.11"
+dependencies = [
+  "flash-attn==2.8.3",
+  "flash-linear-attention[conv1d]==0.5.1",
+  "hf-transfer",
+  "liger-kernel",
+  "mathruler",
+  "qwen-vl-utils",
+  "torch==2.10.0",
+  "transformers==5.5.3",
+  "verl[vllm]",
+  "vllm==0.19.1",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<9",
+  "ruff>=0.9,<1",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+verl = { git = "https://github.com/verl-project/verl.git", rev = "4a2cba76f7f605d2b9f56e640faaeaa71c2c7f71" }
+
+[tool.uv.extra-build-dependencies]
+flash-attn = [{ requirement = "torch", match-runtime = true }]
+causal-conv1d = [{ requirement = "torch", match-runtime = true }]
+
+[tool.uv.extra-build-variables]
+flash-attn = { CUDA_HOME = "/usr/local/cuda-12.6", FLASH_ATTENTION_FORCE_BUILD = "TRUE", MAX_JOBS = "16", TORCH_CUDA_ARCH_LIST = "8.0" }
+causal-conv1d = { CAUSAL_CONV1D_FORCE_BUILD = "TRUE", CUDA_HOME = "/usr/local/cuda-12.6", MAX_JOBS = "16" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

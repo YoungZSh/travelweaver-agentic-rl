@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "${PROJECT_ROOT}"
+
+TRAIN_FILE="${TRAIN_FILE:-data/sft/chinatravel-qwen3.5-4b-action-633-sft-v2-natural/all.parquet}"
+MODEL_PATH="${MODEL_PATH:-ckpts/Qwen3.5-4B}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+NUM_GPUS=2
+SP_SIZE="${SP_SIZE:-2}"
+
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
+MAX_LENGTH="${MAX_LENGTH:-32768}"
+MAX_TOKEN_LEN_PER_GPU="${MAX_TOKEN_LEN_PER_GPU:-16384}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-3}"
+LR="${LR:-1e-5}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
+SEED="${SEED:-20260809}"
+FUSED_KERNEL_BACKEND="${FUSED_KERNEL_BACKEND:-triton}"
+
+PROJECT_NAME="${PROJECT_NAME:-travelweaver-sft}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3.5-4b-multiturn-action-633-sft-v2-natural}"
+RUN_DIR="${RUN_DIR:-training/outputs/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RUN_DIR}/checkpoints}"
+LOG_DIR="${LOG_DIR:-${RUN_DIR}/logs}"
+SAVE_FREQ="${SAVE_FREQ:-10}"
+MAX_CKPT_TO_KEEP="${MAX_CKPT_TO_KEEP:-1}"
+RESUME_MODE="${RESUME_MODE:-auto}"
+DRY_RUN="${DRY_RUN:-0}"
+SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-0}"
+
+if [[ "${1:-}" == "--dry-run" ]]; then
+    DRY_RUN=1
+    shift
+fi
+
+if [[ ! -x training/.venv/bin/torchrun ]]; then
+    echo "Missing training/.venv; run: uv sync --project training --dev" >&2
+    exit 1
+fi
+if [[ ! -f "${TRAIN_FILE}" ]]; then
+    echo "SFT Parquet does not exist: ${TRAIN_FILE}" >&2
+    exit 1
+fi
+if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
+    echo "Qwen checkpoint does not exist: ${MODEL_PATH}" >&2
+    exit 1
+fi
+if [[ "${CUDA_VISIBLE_DEVICES}" != "0,1" ]]; then
+    echo "This launcher is restricted to CUDA_VISIBLE_DEVICES=0,1." >&2
+    exit 1
+fi
+if [[ "${FUSED_KERNEL_BACKEND}" != "triton" && "${FUSED_KERNEL_BACKEND}" != "torch" ]]; then
+    echo "FUSED_KERNEL_BACKEND must be triton or torch." >&2
+    exit 1
+fi
+if (( NUM_GPUS < 1 || SP_SIZE < 1 || NUM_GPUS % SP_SIZE != 0 )); then
+    echo "NUM_GPUS=${NUM_GPUS} must be positive and divisible by SP_SIZE=${SP_SIZE}." >&2
+    exit 1
+fi
+if [[ ! "${SAVE_FREQ}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SAVE_FREQ=${SAVE_FREQ} must be a positive integer." >&2
+    exit 1
+fi
+if [[ ! "${MAX_CKPT_TO_KEEP}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MAX_CKPT_TO_KEEP=${MAX_CKPT_TO_KEEP} must be a positive integer." >&2
+    exit 1
+fi
+
+DP_SIZE=$((NUM_GPUS / SP_SIZE))
+if (( TRAIN_BATCH_SIZE % DP_SIZE != 0 )); then
+    echo "TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE} must be divisible by DP_SIZE=${DP_SIZE}." >&2
+    exit 1
+fi
+
+TRAIN_FILE="$(realpath "${TRAIN_FILE}")"
+MODEL_PATH="$(realpath "${MODEL_PATH}")"
+RUN_DIR="$(realpath -m "${RUN_DIR}")"
+CHECKPOINT_DIR="$(realpath -m "${CHECKPOINT_DIR}")"
+LOG_DIR="$(realpath -m "${LOG_DIR}")"
+DATASET_CLASS="${PROJECT_ROOT}/training/src/travelweaver_sft_dataset.py"
+
+export CUDA_VISIBLE_DEVICES
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+
+if [[ "${SKIP_PREFLIGHT}" != "1" ]]; then
+    training/.venv/bin/python - \
+        "${TRAIN_FILE}" "${MODEL_PATH}" "${MAX_LENGTH}" "${MAX_TOKEN_LEN_PER_GPU}" \
+        "${SP_SIZE}" "${NUM_GPUS}" "${TRAIN_BATCH_SIZE}" <<'PY'
+import hashlib
+import inspect
+import json
+import sys
+from pathlib import Path
+
+import pandas as pd
+from torch.optim import AdamW
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+from transformers import AutoConfig
+from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
+
+train_file = Path(sys.argv[1])
+model_path = Path(sys.argv[2])
+max_length, token_budget, sp_size, num_gpus, train_batch_size = map(int, sys.argv[3:])
+
+required = {
+    "sample_id",
+    "task_id",
+    "messages_json",
+    "tools_json",
+    "enable_thinking",
+}
+frame = pd.read_parquet(train_file, columns=list(required))
+missing = required - set(frame.columns)
+if missing:
+    raise SystemExit(f"SFT Parquet is missing columns: {sorted(missing)}")
+if frame.empty:
+    raise SystemExit("SFT Parquet is empty.")
+if frame["sample_id"].duplicated().any():
+    raise SystemExit("SFT Parquet contains duplicate sample_id values.")
+if bool(frame["enable_thinking"].any()):
+    raise SystemExit("All Qwen3.5 SFT rows must set enable_thinking=false.")
+
+manifest_path = train_file.parent / "manifest.json"
+sequence_max = None
+if manifest_path.exists():
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    adapter = manifest.get("qwen_adapter", {})
+    expected_digest = adapter.get("parquet_sha256")
+    if expected_digest:
+        digest = hashlib.sha256(train_file.read_bytes()).hexdigest()
+        if digest != expected_digest:
+            raise SystemExit("SFT Parquet SHA-256 does not match its manifest.")
+    sequence_max = adapter.get("sequence_tokens", {}).get("max")
+    if sequence_max is not None and int(sequence_max) > max_length:
+        raise SystemExit(
+            f"Dataset max sequence {sequence_max} exceeds MAX_LENGTH={max_length}."
+        )
+    if sequence_max is not None and int(sequence_max) > token_budget * sp_size:
+        raise SystemExit(
+            f"Dataset max sequence {sequence_max} exceeds the SP token budget "
+            f"{token_budget * sp_size}."
+        )
+
+config = AutoConfig.from_pretrained(model_path, local_files_only=True)
+if config.model_type != "qwen3_5":
+    raise SystemExit(f"Expected qwen3_5 checkpoint, found {config.model_type!r}.")
+text_config = getattr(config, "text_config", config)
+attention_heads = int(text_config.num_attention_heads)
+if attention_heads % sp_size != 0:
+    raise SystemExit(
+        f"Qwen attention heads ({attention_heads}) must be divisible by SP_SIZE={sp_size}."
+    )
+if sp_size > 1 and "cp_context" not in inspect.signature(chunk_gated_delta_rule).parameters:
+    raise SystemExit("Installed FLA does not support Qwen3.5 Ulysses sequence parallelism.")
+if "fused" not in inspect.signature(AdamW).parameters:
+    raise SystemExit("Installed PyTorch AdamW does not expose the fused CUDA implementation.")
+if not callable(linear_cross_entropy):
+    raise SystemExit("veRL's fused linear cross-entropy kernel is unavailable.")
+
+dp_size = num_gpus // sp_size
+print(
+    json.dumps(
+        {
+            "event": "sft_preflight_ok",
+            "samples": len(frame),
+            "sequence_max": sequence_max,
+            "num_gpus": num_gpus,
+            "sp_size": sp_size,
+            "dp_size": dp_size,
+            "global_batch_size": train_batch_size,
+            "samples_per_dp_step": train_batch_size // dp_size,
+            "max_length": max_length,
+            "token_budget_per_gpu": token_budget,
+            "fused_adamw": True,
+            "fused_linear_cross_entropy": True,
+            "tf32": True,
+        },
+        sort_keys=True,
+    ),
+    flush=True,
+)
+PY
+fi
+
+OVERRIDES=(
+    "data.train_files=${TRAIN_FILE}"
+    "data.val_files=null"
+    "data.train_batch_size=${TRAIN_BATCH_SIZE}"
+    "data.micro_batch_size_per_gpu=1"
+    "data.max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU}"
+    "data.use_dynamic_bsz=true"
+    "data.messages_key=messages_json"
+    "data.tools_key=tools_json"
+    "data.enable_thinking_key=enable_thinking"
+    "data.enable_thinking_default=false"
+    "data.pad_mode=no_padding"
+    "data.max_length=${MAX_LENGTH}"
+    "data.truncation=error"
+    "+data.apply_chat_template_kwargs.enable_thinking=false"
+    "data.custom_cls.path=${DATASET_CLASS}"
+    "data.custom_cls.name=TravelWeaverMultiTurnSFTDataset"
+    "data.ignore_input_ids_mismatch=false"
+    "data.num_workers=4"
+    "model.path=${MODEL_PATH}"
+    "model.use_remove_padding=true"
+    "model.enable_gradient_checkpointing=true"
+    "model.lora_rank=0"
+    "model.use_liger=true"
+    "model.use_fused_kernels=true"
+    "model.fused_kernel_options.impl_backend=${FUSED_KERNEL_BACKEND}"
+    "engine=fsdp"
+    "engine.strategy=fsdp2"
+    "engine.fsdp_size=-1"
+    "engine.ulysses_sequence_parallel_size=${SP_SIZE}"
+    "engine.reshard_after_forward=true"
+    "engine.param_offload=false"
+    "engine.optimizer_offload=false"
+    "engine.use_torch_compile=false"
+    "optim=fsdp"
+    "optim.lr=${LR}"
+    "optim.lr_warmup_steps_ratio=${WARMUP_RATIO}"
+    "optim.weight_decay=0.1"
+    "optim.betas=[0.9,0.95]"
+    "optim.override_optimizer_config={fused:true}"
+    "optim.clip_grad=1.0"
+    "optim.lr_scheduler_type=cosine"
+    "optim.min_lr_ratio=0.1"
+    "trainer.project_name=${PROJECT_NAME}"
+    "trainer.experiment_name=${EXPERIMENT_NAME}"
+    "trainer.default_local_dir=${CHECKPOINT_DIR}"
+    "trainer.total_epochs=${TOTAL_EPOCHS}"
+    "trainer.total_training_steps=null"
+    "trainer.save_freq=${SAVE_FREQ}"
+    "trainer.test_freq=-1"
+    "trainer.logger=[console]"
+    "trainer.seed=${SEED}"
+    "trainer.resume_mode=${RESUME_MODE}"
+    "trainer.max_ckpt_to_keep=${MAX_CKPT_TO_KEEP}"
+    "trainer.nnodes=1"
+    "trainer.n_gpus_per_node=${NUM_GPUS}"
+    "checkpoint.save_contents=[model,optimizer,extra,hf_model]"
+)
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+    training/.venv/bin/python training/scripts/run_verl_sft.py \
+        --cfg job --resolve "${OVERRIDES[@]}" "$@"
+    exit 0
+fi
+
+mkdir -p "${CHECKPOINT_DIR}" "${LOG_DIR}"
+RUN_LOG="${LOG_DIR}/${EXPERIMENT_NAME}-$(date +%Y%m%d-%H%M%S).log"
+
+echo "Starting TravelWeaver multi-turn SFT; log: ${RUN_LOG}"
+training/.venv/bin/torchrun --standalone --nnodes=1 --nproc-per-node="${NUM_GPUS}" \
+    training/scripts/run_verl_sft.py "${OVERRIDES[@]}" "$@" 2>&1 | tee "${RUN_LOG}"
+
+# The last step is always checkpointed by veRL, even when it is not divisible by SAVE_FREQ.
+# Publish a stable path to the final Hugging Face export after successful training.
+TRACKER_FILE="${CHECKPOINT_DIR}/latest_checkpointed_iteration.txt"
+if [[ -f "${TRACKER_FILE}" ]]; then
+    read -r FINAL_STEP < "${TRACKER_FILE}"
+    FINAL_HF_DIR="${CHECKPOINT_DIR}/global_step_${FINAL_STEP}/huggingface"
+    if [[ -d "${FINAL_HF_DIR}" ]]; then
+        ln -sfnT "checkpoints/global_step_${FINAL_STEP}/huggingface" "${RUN_DIR}/final-model"
+        echo "Final Hugging Face model: ${RUN_DIR}/final-model"
+    fi
+fi
