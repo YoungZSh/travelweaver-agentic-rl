@@ -18,3 +18,13 @@ ckpts/
 data/downloads/
 data/trajectories/
 data/generated/
+data/sft/
+
+# Hydra defaults when a launcher runs from the repository root.
+/outputs/
+/multirun/
+
+# Training-only runtime artifacts.
+training/checkpoints/
+training/logs/
+training/outputs/
