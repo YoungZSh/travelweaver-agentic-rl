@@ -6,8 +6,13 @@ from pathlib import Path
 from typing import Any
 
 from travelweaver.env import InMemoryBackend, ScenarioSpec
-from travelweaver.llm import DeepSeekConfig
-from travelweaver.rollout import GeneratedRolloutBatchConfig, run_generated_rollout_batch
+from travelweaver.llm import DeepSeekConfig, OpenAICompatibleConfig
+from travelweaver.rollout import (
+    BenchmarkRolloutBatchConfig,
+    GeneratedRolloutBatchConfig,
+    run_benchmark_rollout_batch,
+    run_generated_rollout_batch,
+)
 
 
 @dataclass(frozen=True)
@@ -91,6 +96,7 @@ def test_generated_batch_is_resumable_and_persists_model_configuration(tmp_path)
     assert {row["task_id"] for row in records} == set(task_ids)
     assert all(row["batch_metadata"]["thinking"] == "enabled" for row in records)
     assert all(row["batch_metadata"]["max_tokens"] == 16384 for row in records)
+    assert all(row["batch_metadata"]["tool_response_mode"] == "delta" for row in records)
 
     called.clear()
     resumed = run_generated_rollout_batch(
@@ -100,6 +106,60 @@ def test_generated_batch_is_resumable_and_persists_model_configuration(tmp_path)
         episode_runner=run_episode,
     )
 
+    assert resumed.skipped == 2
+    assert resumed.attempted == 0
+    assert called == []
+
+
+def test_benchmark_batch_is_resumable_and_records_official_split(
+    tmp_path, monkeypatch, task_store, backend
+) -> None:
+    output_path = tmp_path / "benchmark.jsonl"
+    error_path = tmp_path / "benchmark-errors.jsonl"
+    monkeypatch.setattr(
+        "travelweaver.rollout.batch.JsonlTaskStore.default",
+        lambda *, split: task_store,
+    )
+    config = BenchmarkRolloutBatchConfig(
+        output_path=output_path,
+        error_path=error_path,
+        split="benchmark",
+        concurrency=2,
+    )
+    llm_config = OpenAICompatibleConfig(
+        api_key="local",
+        base_url="http://127.0.0.1:8000/v1",
+        model="qwen3.5-4b",
+        max_tokens=2048,
+    )
+    called: list[str] = []
+
+    def run_episode(_env, task_id: str) -> _FakeRun:
+        called.append(task_id)
+        return _FakeRun(task_id)
+
+    report = run_benchmark_rollout_batch(
+        config,
+        llm_config,
+        base_backend=backend,
+        episode_runner=run_episode,
+    )
+
+    assert report.total_tasks == 2
+    assert report.attempted == 2
+    assert report.accepted == 2
+    records = [json.loads(line) for line in output_path.read_text().splitlines()]
+    assert all(row["batch_metadata"]["split"] == "benchmark" for row in records)
+    assert all(row["batch_metadata"]["task_source"] == "LAMDA-NeSy/ChinaTravel" for row in records)
+    assert all(row["batch_metadata"]["tool_response_mode"] == "delta" for row in records)
+
+    called.clear()
+    resumed = run_benchmark_rollout_batch(
+        config,
+        llm_config,
+        base_backend=backend,
+        episode_runner=run_episode,
+    )
     assert resumed.skipped == 2
     assert resumed.attempted == 0
     assert called == []

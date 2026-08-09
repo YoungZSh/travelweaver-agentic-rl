@@ -3,8 +3,15 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
+from travelweaver.cli.main import build_parser
 from travelweaver.llm import DeepSeekConfig, OpenAICompatibleConfig
-from travelweaver.rollout import ToolCallingAgent, append_trajectory
+from travelweaver.rollout import (
+    MODEL_TOOL_RESPONSE_VERSION,
+    ToolCallingAgent,
+    append_trajectory,
+)
 
 
 class _Payload:
@@ -88,6 +95,15 @@ def test_api_agent_executes_model_tool_call_and_records_trajectory(env) -> None:
     assert run.usage["total_tokens"] == 110
     assert len(completions.requests[0]["tools"]) == 13
     assert completions.requests[0]["tool_choice"] == "auto"
+    assert completions.requests[0]["messages"][1] == {
+        "role": "user",
+        "content": "从上海去杭州玩一天。",
+    }
+    system_prompt = completions.requests[0]["messages"][0]["content"]
+    assert "最多执行 35 个有效工具动作" in system_prompt
+    assert "按任务复杂度尽量减少无效搜索" in system_prompt
+    assert "每天第一个本地活动不得填写 route_from_previous_id" in system_prompt
+    assert "15 个动作内完成" not in system_prompt
     assert completions.requests[0]["extra_body"] == {
         "thinking": {"type": "disabled"}
     }
@@ -99,10 +115,20 @@ def test_api_agent_executes_model_tool_call_and_records_trajectory(env) -> None:
         "tool",
     ]
     assert run.messages[-1]["name"] == "finish_without_plan"
+    terminal_payload = json.loads(run.messages[-1]["content"])
+    assert terminal_payload["response_version"] == MODEL_TOOL_RESPONSE_VERSION
+    assert terminal_payload["terminated"] is True
+    assert "reward" not in terminal_payload
+    assert "observation" not in terminal_payload
     assert run.steps[0]["tool_call"]["id"] == "call-1"
+    assert run.steps[0]["model_tool_response"] == terminal_payload
+    assert "observation" in run.steps[0]["result"]
     assert len(run.tools) == 13
     persisted = run.to_dict(include_trajectory=True)
-    assert persisted["trajectory_version"] == "travelweaver-trajectory-v3"
+    assert persisted["trajectory_version"] == "travelweaver-trajectory-v5"
+    assert persisted["user_content_format"] == "travelweaver-natural-query-v1"
+    assert persisted["tool_response_mode"] == "delta"
+    assert persisted["model_tool_response_version"] == MODEL_TOOL_RESPONSE_VERSION
     assert persisted["final_reward"] == -1.0
     assert persisted["rft_accepted"] is False
     assert {"messages", "tools", "steps", "trajectory"} <= persisted.keys()
@@ -186,6 +212,150 @@ def test_api_agent_executes_only_first_tool_call_per_turn(env) -> None:
         message.get("tool_call_id") == "call-skipped"
         for message in second_request_messages
     )
+    tool_message = next(
+        message for message in second_request_messages if message["role"] == "tool"
+    )
+    delta = json.loads(tool_message["content"])
+    assert delta["response_version"] == MODEL_TOOL_RESPONSE_VERSION
+    assert delta["valid_action"] is True
+    assert delta["tool_result"]["tool"] == "search_attractions"
+    assert "observation" not in delta
+    assert "candidates" not in delta
+    assert "visible_entity_ids" not in delta
+    assert "task" not in delta
+
+
+def test_snapshot_tool_response_mode_reproduces_legacy_full_step(env) -> None:
+    search = SimpleNamespace(
+        id="call-search",
+        function=SimpleNamespace(
+            name="search_attractions",
+            arguments=json.dumps({"city": "杭州"}, ensure_ascii=False),
+        ),
+    )
+    finish = SimpleNamespace(
+        id="call-finish",
+        function=SimpleNamespace(
+            name="finish_without_plan",
+            arguments=json.dumps({"reason": "测试结束"}, ensure_ascii=False),
+        ),
+    )
+
+    def response(response_id, message):
+        return SimpleNamespace(
+            id=response_id,
+            choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
+            usage=_Payload({"total_tokens": 10}),
+        )
+
+    completions = _SequenceCompletions(
+        [
+            response("response-1", _Message(search)),
+            response("response-2", _Message(finish)),
+        ]
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    run = ToolCallingAgent(
+        env,
+        DeepSeekConfig(api_key="not-a-real-secret"),
+        client=client,
+        tool_response_mode="snapshot",
+    ).run("task-hangzhou")
+
+    tool_message = next(
+        message
+        for message in completions.requests[1]["messages"]
+        if message["role"] == "tool"
+    )
+    expected = json.loads(json.dumps(run.steps[0]["result"], ensure_ascii=False))
+    assert json.loads(tool_message["content"]) == expected
+    assert run.steps[0]["model_tool_response"] == run.steps[0]["result"]
+    assert run.tool_response_mode == "snapshot"
+
+
+def test_delta_tool_response_preserves_invalid_action_recovery_signal(env) -> None:
+    invalid = SimpleNamespace(
+        id="call-invalid",
+        function=SimpleNamespace(
+            name="search_attractions",
+            arguments="{}",
+        ),
+    )
+    finish = SimpleNamespace(
+        id="call-finish",
+        function=SimpleNamespace(
+            name="finish_without_plan",
+            arguments=json.dumps({"reason": "收到错误后结束"}, ensure_ascii=False),
+        ),
+    )
+
+    def response(response_id, message):
+        return SimpleNamespace(
+            id=response_id,
+            choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
+            usage=_Payload({"total_tokens": 10}),
+        )
+
+    completions = _SequenceCompletions(
+        [
+            response("response-1", _Message(invalid)),
+            response("response-2", _Message(finish)),
+        ]
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    ToolCallingAgent(
+        env,
+        DeepSeekConfig(api_key="not-a-real-secret"),
+        client=client,
+    ).run("task-hangzhou")
+
+    tool_message = next(
+        message
+        for message in completions.requests[1]["messages"]
+        if message["role"] == "tool"
+    )
+    delta = json.loads(tool_message["content"])
+    assert delta["valid_action"] is False
+    assert delta["consecutive_invalid_actions"] == 1
+    assert delta["error"]["code"] == "invalid_action"
+    assert delta["tool_result"] is None
+    assert "observation" not in delta
+
+
+def test_api_agent_rejects_unknown_tool_response_mode(env) -> None:
+    with pytest.raises(ValueError, match="Unknown tool response mode"):
+        ToolCallingAgent(
+            env,
+            DeepSeekConfig(api_key="not-a-real-secret"),
+            client=SimpleNamespace(),
+            tool_response_mode="legacy",
+        )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["rollout-api"],
+        ["rollout-generated", "--input-dir", "generated", "--output", "runs.jsonl"],
+        ["rollout-benchmark", "--output", "runs.jsonl"],
+        [
+            "rebuild-sft",
+            "--source",
+            "generated",
+            "runs.jsonl",
+            "--output-dir",
+            "sft",
+        ],
+    ],
+)
+def test_rollout_cli_defaults_to_delta_tool_responses(arguments) -> None:
+    parser = build_parser()
+
+    assert parser.parse_args(arguments).tool_response_mode == "delta"
+    snapshot = parser.parse_args([*arguments, "--tool-response-mode", "snapshot"])
+    assert snapshot.tool_response_mode == "snapshot"
 
 
 def test_generic_agent_does_not_send_provider_specific_thinking_fields(env) -> None:

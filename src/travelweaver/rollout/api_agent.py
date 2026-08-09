@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -13,32 +14,58 @@ from ..llm import (
     OpenAICompatibleChatClient,
     OpenAICompatibleConfig,
 )
+from .tool_response import (
+    DEFAULT_TOOL_RESPONSE_MODE,
+    MODEL_TOOL_RESPONSE_VERSION,
+    ToolResponseMode,
+    serialize_model_tool_response,
+    validate_tool_response_mode,
+)
 
 __all__ = [
     "ApiAgentRun",
     "OpenAICompatibleConfig",
     "ToolCallingAgent",
+    "render_task_user_content",
 ]
 
-TRAJECTORY_VERSION = "travelweaver-trajectory-v3"
+TRAJECTORY_VERSION = "travelweaver-trajectory-v5"
+SUPPORTED_TRAJECTORY_VERSIONS = frozenset(
+    {"travelweaver-trajectory-v3", "travelweaver-trajectory-v4", TRAJECTORY_VERSION}
+)
+USER_CONTENT_FORMAT = "travelweaver-natural-query-v1"
 
 SYSTEM_PROMPT = """\
 你是 TravelWeaver 旅行规划 Agent。你只能通过提供的工具观察环境和提交答案。
 
 规则：
-1. 每轮只调用一个工具，不要凭空编造地点 ID、交通 ID 或价格。
-2. 先查询证据，再用 save_candidate 保存最终计划会引用的实体。
+1. 每轮只调用一个工具，不得编造地点 ID、交通 ID、路线 ID、价格或时间。
+2. 先查询证据。只有确定候选可能进入最终计划时，才使用 save_candidate 保存；
+   不要批量保存暂不使用的结果。
 3. 起点和目的地不同时，计划必须包含去程和返程城际交通。
-4. 多日计划需要住宿；住宿必须填写 rooms 和 room_type。
-5. 找到可行方案后必须调用 submit_plan。确认无解时调用 finish_without_plan。
-6. 不要输出普通文本作为最终答案；episode 必须由一个终止工具结束。
-7. 总动作上限是 35，目标是在 15 个动作内完成。优先选择首个满足条件的结果，不要穷举景点。
-8. 每次搜索后立即保存选中的候选。API 即使允许多个 tool call，本环境每轮也只执行第一个。
-9. 相邻同城地点活动之间先调用 get_route，并把返回的 route_id 写入后一个活动的
-   route_from_previous_id；城际交通的起止时间必须与候选证据一致。
-10. 单日异地任务只需：首个可行去程、首个可行景点、首个可行返程，然后立即 submit_plan；
-    餐厅不是必需项，不要搜索。每类最多搜索一次。多日任务才额外查询并保存住宿。
+4. 多日行程应在第 1 天至倒数第 2 天各安排一次当晚住宿，最后一天不要重复安排住宿。
+   住宿必须填写 rooms 和 room_type。
+5. 每个完整的中间旅行日应安排至少一个景点或用餐活动，避免出现只有住宿的空白日期。
+6. 每天第一个本地活动不得填写 route_from_previous_id。只有同一天相邻的两个本地活动之间
+   才调用 get_route；路线出发时间不得早于前一个活动结束时间，且必须在后一个活动开始前到达。
+7. 城际交通的起止时间必须与候选证据完全一致。
+8. 先满足全部硬约束。存在多个可行方案时，再根据题面偏好比较少量候选；无需穷举。
+9. 最多执行 35 个有效工具动作。按任务复杂度尽量减少无效搜索、无用保存和未使用路线。
+10. 找到可行方案后调用 submit_plan；确认无解时调用 finish_without_plan。
+    不要输出普通文本作为最终答案。
+11. 对没有额外景点、餐饮或指定地点要求的单日异地任务，选择首个可行的去程、景点和返程后即可提交；
+    若题面有额外要求，必须继续查询并落实。
+12. API 即使允许多个 tool call，本环境每轮也只执行第一个。
 """
+
+
+def render_task_user_content(task: Mapping[str, Any]) -> str:
+    """Return the natural-language utterance supplied at the human task boundary."""
+
+    query = task.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("Travel task query must be a non-empty natural-language string.")
+    return query.strip()
 
 
 @dataclass(frozen=True)
@@ -58,6 +85,8 @@ class ApiAgentRun:
     reward_detail: dict[str, Any]
     rft_accepted: bool
     usage: dict[str, int]
+    user_content_format: str
+    tool_response_mode: ToolResponseMode
     messages: tuple[dict[str, Any], ...]
     tools: tuple[dict[str, Any], ...]
     steps: tuple[dict[str, Any], ...]
@@ -79,6 +108,9 @@ class ApiAgentRun:
             "reward_detail": dict(self.reward_detail),
             "rft_accepted": self.rft_accepted,
             "usage": dict(self.usage),
+            "user_content_format": self.user_content_format,
+            "tool_response_mode": self.tool_response_mode,
+            "model_tool_response_version": MODEL_TOOL_RESPONSE_VERSION,
         }
         if include_trajectory:
             payload["messages"] = list(self.messages)
@@ -99,6 +131,7 @@ class ToolCallingAgent:
         client: Any | None = None,
         chat_client: Any | None = None,
         max_api_turns: int = 40,
+        tool_response_mode: str = DEFAULT_TOOL_RESPONSE_MODE,
     ) -> None:
         if max_api_turns <= 0:
             raise ValueError("max_api_turns must be positive.")
@@ -107,25 +140,17 @@ class ToolCallingAgent:
         self.env = env
         self.config = config
         self.max_api_turns = max_api_turns
+        self.tool_response_mode = validate_tool_response_mode(tool_response_mode)
         self.chat_client = chat_client or OpenAICompatibleChatClient(config, client=client)
 
     def run(self, task_id: str | None = None, *, seed: int | None = 0) -> ApiAgentRun:
         observation = self.env.reset(task_id=task_id, seed=seed)
         tools = self.env.tool_schemas()
         initial_observation = observation.to_dict()
+        user_content = render_task_user_content(initial_observation["task"])
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "instruction": "请根据当前任务规划行程，并用终止工具结束 episode。",
-                        "observation": initial_observation,
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
-            },
+            {"role": "user", "content": user_content},
         ]
         steps: list[dict[str, Any]] = []
         trajectory: list[dict[str, Any]] = [
@@ -134,6 +159,9 @@ class ToolCallingAgent:
                 "system_prompt": SYSTEM_PROMPT,
                 "observation": initial_observation,
                 "tools": tools,
+                "user_content_format": USER_CONTENT_FORMAT,
+                "tool_response_mode": self.tool_response_mode,
+                "model_tool_response_version": MODEL_TOOL_RESPONSE_VERSION,
             }
         ]
         usage_total: dict[str, int] = {}
@@ -215,12 +243,17 @@ class ToolCallingAgent:
             step_count += 1
             observation = result.observation
             result_payload = result.to_dict()
+            model_tool_response = serialize_model_tool_response(
+                result,
+                mode=self.tool_response_mode,
+            )
             step = {
                 "index": step_count - 1,
                 "api_turn": api_turn,
                 "tool_call": deepcopy(tool_call),
                 "action": action,
                 "result": result_payload,
+                "model_tool_response": deepcopy(model_tool_response),
             }
             steps.append(step)
             trajectory.append({"event": "step", **deepcopy(step)})
@@ -230,7 +263,7 @@ class ToolCallingAgent:
                     "tool_call_id": tool_call_id,
                     "name": tool_name,
                     "content": json.dumps(
-                        result_payload,
+                        model_tool_response,
                         ensure_ascii=False,
                         separators=(",", ":"),
                     ),
@@ -319,6 +352,8 @@ class ToolCallingAgent:
             reward_detail=reward_detail,
             rft_accepted=rft_accepted,
             usage=usage,
+            user_content_format=USER_CONTENT_FORMAT,
+            tool_response_mode=self.tool_response_mode,
             messages=tuple(deepcopy(messages)),
             tools=tuple(deepcopy(tools)),
             steps=tuple(deepcopy(steps)),

@@ -12,11 +12,44 @@ from typing import Any
 from ..data.tasks import JsonlTaskStore
 from ..env import ChinaTravelBackend, ScenarioBackend, ScenarioSpec, TravelWeaverEnv
 from ..errors import DataUnavailableError
-from ..llm import DeepSeekConfig, OpenAICompatibleChatClient
+from ..llm import DeepSeekConfig, OpenAICompatibleChatClient, OpenAICompatibleConfig
 from .api_agent import ApiAgentRun, ToolCallingAgent
+from .tool_response import DEFAULT_TOOL_RESPONSE_MODE, validate_tool_response_mode
 from .trajectory import append_trajectory
 
 DEFAULT_ROLLOUT_CONCURRENCY = 256
+
+
+@dataclass(frozen=True)
+class BenchmarkRolloutBatchConfig:
+    output_path: Path
+    error_path: Path
+    split: str = "benchmark"
+    concurrency: int = 16
+    max_api_turns: int = 40
+    seed: int = 20260808
+    task_id: str | None = None
+    tool_response_mode: str = DEFAULT_TOOL_RESPONSE_MODE
+
+    def __post_init__(self) -> None:
+        if self.concurrency <= 0 or self.max_api_turns <= 0:
+            raise ValueError("Rollout concurrency and API-turn limit must be positive.")
+        validate_tool_response_mode(self.tool_response_mode)
+
+
+@dataclass(frozen=True)
+class BenchmarkRolloutBatchReport:
+    split: str
+    total_tasks: int
+    skipped: int
+    attempted: int
+    accepted: int
+    errors: int
+    output_path: str
+    error_path: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -28,10 +61,12 @@ class GeneratedRolloutBatchConfig:
     max_api_turns: int = 40
     seed: int = 20260808
     task_id: str | None = None
+    tool_response_mode: str = DEFAULT_TOOL_RESPONSE_MODE
 
     def __post_init__(self) -> None:
         if self.concurrency <= 0 or self.max_api_turns <= 0:
             raise ValueError("Rollout concurrency and API-turn limit must be positive.")
+        validate_tool_response_mode(self.tool_response_mode)
 
 
 @dataclass(frozen=True)
@@ -50,6 +85,127 @@ class GeneratedRolloutBatchReport:
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 EpisodeRunner = Callable[[TravelWeaverEnv, str], ApiAgentRun]
+
+
+def run_benchmark_rollout_batch(
+    config: BenchmarkRolloutBatchConfig,
+    llm_config: OpenAICompatibleConfig,
+    *,
+    base_backend: Any | None = None,
+    chat_client: Any | None = None,
+    episode_runner: EpisodeRunner | None = None,
+    progress: ProgressCallback | None = None,
+) -> BenchmarkRolloutBatchReport:
+    """Run a resumable model rollout over one pinned official benchmark split."""
+
+    store = JsonlTaskStore.default(split=config.split)
+    attempted_ids = _record_ids(config.output_path) | _record_ids(config.error_path)
+    if config.task_id is not None:
+        store.get_public(config.task_id)
+        pending = [] if config.task_id in attempted_ids else [config.task_id]
+    else:
+        pending = [task_id for task_id in store.task_ids if task_id not in attempted_ids]
+
+    _emit(
+        progress,
+        {
+            "event": "batch_start",
+            "model": llm_config.model,
+            "split": config.split,
+            "total": len(store.task_ids),
+            "already_attempted": len(attempted_ids),
+            "pending": len(pending),
+            "concurrency": config.concurrency,
+        },
+    )
+
+    backend = base_backend if base_backend is not None else ChinaTravelBackend()
+    if episode_runner is None:
+        client = chat_client or OpenAICompatibleChatClient(llm_config)
+
+        def episode_runner(env: TravelWeaverEnv, task_id: str) -> ApiAgentRun:
+            return ToolCallingAgent(
+                env,
+                llm_config,
+                chat_client=client,
+                max_api_turns=config.max_api_turns,
+                tool_response_mode=config.tool_response_mode,
+            ).run(task_id=task_id, seed=config.seed)
+
+    def run_one(task_id: str) -> dict[str, Any]:
+        env = TravelWeaverEnv(backend, store)
+        try:
+            run = episode_runner(env, task_id)
+            payload = run.to_dict(include_trajectory=True)
+            public_task = store.get_public(task_id)
+            payload["batch_metadata"] = {
+                "split": config.split,
+                "tag": public_task.get("tag"),
+                "max_tokens": llm_config.max_tokens,
+                "max_api_turns": config.max_api_turns,
+                "seed": config.seed,
+                "task_source": "LAMDA-NeSy/ChinaTravel",
+                "rollout_index": 0,
+                "tool_response_mode": config.tool_response_mode,
+            }
+            return payload
+        finally:
+            env.close()
+
+    accepted = 0
+    errors = 0
+    finished = 0
+    with ThreadPoolExecutor(max_workers=config.concurrency) as executor:
+        futures = {executor.submit(run_one, task_id): task_id for task_id in pending}
+        for future in as_completed(futures):
+            task_id = futures[future]
+            finished += 1
+            try:
+                payload = future.result()
+            except Exception as error:  # noqa: BLE001 - persist every benchmark attempt.
+                errors += 1
+                append_trajectory(
+                    config.error_path,
+                    {
+                        "task_id": task_id,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    },
+                )
+                status = "error"
+                reward = None
+                steps = None
+            else:
+                append_trajectory(config.output_path, payload)
+                accepted += int(bool(payload["success"]))
+                status = "success" if payload["success"] else "failed"
+                reward = payload["final_reward"]
+                steps = payload["step_count"]
+            _emit(
+                progress,
+                {
+                    "event": "task_complete",
+                    "task_id": task_id,
+                    "status": status,
+                    "reward": reward,
+                    "steps": steps,
+                    "batch_finished": finished,
+                    "batch_pending": len(pending) - finished,
+                },
+            )
+
+    report = BenchmarkRolloutBatchReport(
+        split=config.split,
+        total_tasks=len(store.task_ids),
+        skipped=len(store.task_ids) - len(pending),
+        attempted=len(pending),
+        accepted=accepted,
+        errors=errors,
+        output_path=str(config.output_path.resolve()),
+        error_path=str(config.error_path.resolve()),
+    )
+    _emit(progress, {"event": "batch_complete", **report.to_dict()})
+    return report
 
 
 def run_generated_rollout_batch(
@@ -96,6 +252,7 @@ def run_generated_rollout_batch(
                 llm_config,
                 chat_client=client,
                 max_api_turns=config.max_api_turns,
+                tool_response_mode=config.tool_response_mode,
             ).run(task_id=task_id, seed=config.seed)
 
     def run_one(task_id: str) -> dict[str, Any]:
@@ -117,6 +274,7 @@ def run_generated_rollout_batch(
                 "scenario_profile": scenario.profile,
                 "task_type": store.get_public(task_id).get("task_type"),
                 "rollout_index": 0,
+                "tool_response_mode": config.tool_response_mode,
             }
             return payload
         finally:

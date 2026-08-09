@@ -13,17 +13,22 @@ from ..data.bootstrap import install_database, validate_database
 from ..data.tasks import JsonlTaskStore, import_benchmark_tasks, import_task_split
 from ..env import ChinaTravelBackend, TravelWeaverEnv
 from ..errors import TravelWeaverError
-from ..llm import DeepSeekConfig
+from ..llm import DeepSeekConfig, OpenAICompatibleConfig
 from ..paths import project_root
 from ..rollout import (
     DEFAULT_ROLLOUT_CONCURRENCY,
+    DEFAULT_TOOL_RESPONSE_MODE,
+    TOOL_RESPONSE_MODES,
+    BenchmarkRolloutBatchConfig,
     DemoTravelAgent,
     GeneratedRolloutBatchConfig,
     ToolCallingAgent,
     append_trajectory,
     default_trajectory_path,
+    run_benchmark_rollout_batch,
     run_generated_rollout_batch,
 )
+from ..sft import SFTRebuildConfig, SFTSource, rebuild_sft_dataset
 from ..synthesis import (
     RepolishConfig,
     SurfaceRepolishPipeline,
@@ -100,6 +105,7 @@ def _rollout_api(args: argparse.Namespace) -> int:
             env,
             config,
             max_api_turns=args.max_api_turns,
+            tool_response_mode=args.tool_response_mode,
         ).run(task_id=args.task_id, seed=args.seed)
     finally:
         env.close()
@@ -129,6 +135,34 @@ def _rollout_generated(args: argparse.Namespace) -> int:
             max_api_turns=args.max_api_turns,
             seed=args.seed,
             task_id=args.task_id,
+            tool_response_mode=args.tool_response_mode,
+        ),
+        llm_config,
+        progress=lambda payload: print(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True
+        ),
+    )
+    return 0 if report.errors == 0 else 2
+
+
+def _rollout_benchmark(args: argparse.Namespace) -> int:
+    llm_config = OpenAICompatibleConfig.from_env(args.env_file)
+    output_path = Path(args.output)
+    error_path = (
+        Path(args.errors)
+        if args.errors
+        else output_path.with_name(f"{output_path.stem}-errors.jsonl")
+    )
+    report = run_benchmark_rollout_batch(
+        BenchmarkRolloutBatchConfig(
+            split=args.split,
+            output_path=output_path,
+            error_path=error_path,
+            concurrency=args.concurrency,
+            max_api_turns=args.max_api_turns,
+            seed=args.seed,
+            task_id=args.task_id,
+            tool_response_mode=args.tool_response_mode,
         ),
         llm_config,
         progress=lambda payload: print(
@@ -182,6 +216,22 @@ def _repolish_tasks(args: argparse.Namespace) -> int:
     return 0
 
 
+def _rebuild_sft(args: argparse.Namespace) -> int:
+    report = rebuild_sft_dataset(
+        SFTRebuildConfig(
+            sources=tuple(
+                SFTSource(task_dir=Path(task_dir), rollout_path=Path(rollout_path))
+                for task_dir, rollout_path in args.source
+            ),
+            output_dir=Path(args.output_dir),
+            repair_surface_semantics=args.repair_surface_semantics,
+            tool_response_mode=args.tool_response_mode,
+        )
+    )
+    _print(report.to_dict())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="travelweaver", description="TravelWeaver environment and rollout utilities."
@@ -230,6 +280,12 @@ def build_parser() -> argparse.ArgumentParser:
     rollout_api.add_argument("--output", help="Append the complete run to this JSONL file.")
     rollout_api.add_argument("--max-api-turns", type=int, default=40)
     rollout_api.add_argument(
+        "--tool-response-mode",
+        choices=TOOL_RESPONSE_MODES,
+        default=DEFAULT_TOOL_RESPONSE_MODE,
+        help="Send per-step deltas by default; use snapshot to reproduce the legacy payload.",
+    )
+    rollout_api.add_argument(
         "--verbose", action="store_true", help="Also print the complete trajectory."
     )
     rollout_api.set_defaults(handler=_rollout_api)
@@ -246,9 +302,35 @@ def build_parser() -> argparse.ArgumentParser:
     rollout_generated.add_argument("--env-file", default=str(project_root() / ".env"))
     rollout_generated.add_argument("--max-api-turns", type=int, default=40)
     rollout_generated.add_argument(
+        "--tool-response-mode",
+        choices=TOOL_RESPONSE_MODES,
+        default=DEFAULT_TOOL_RESPONSE_MODE,
+    )
+    rollout_generated.add_argument(
         "--concurrency", type=int, default=DEFAULT_ROLLOUT_CONCURRENCY
     )
     rollout_generated.set_defaults(handler=_rollout_generated)
+
+    rollout_benchmark = subparsers.add_parser(
+        "rollout-benchmark",
+        help="Run resumable local/API rollouts over a pinned official ChinaTravel split.",
+    )
+    rollout_benchmark.add_argument(
+        "--split", choices=["easy", "medium", "human", "benchmark"], default="benchmark"
+    )
+    rollout_benchmark.add_argument("--output", required=True)
+    rollout_benchmark.add_argument("--errors")
+    rollout_benchmark.add_argument("--task-id")
+    rollout_benchmark.add_argument("--seed", type=int, default=20260808)
+    rollout_benchmark.add_argument("--env-file", default=str(project_root() / ".env"))
+    rollout_benchmark.add_argument("--max-api-turns", type=int, default=40)
+    rollout_benchmark.add_argument(
+        "--tool-response-mode",
+        choices=TOOL_RESPONSE_MODES,
+        default=DEFAULT_TOOL_RESPONSE_MODE,
+    )
+    rollout_benchmark.add_argument("--concurrency", type=int, default=16)
+    rollout_benchmark.set_defaults(handler=_rollout_benchmark)
 
     synthesize = subparsers.add_parser(
         "synthesize-tasks",
@@ -290,6 +372,27 @@ def build_parser() -> argparse.ArgumentParser:
         default="minimal_semantic",
     )
     repolish.set_defaults(handler=_repolish_tasks)
+
+    rebuild_sft = subparsers.add_parser(
+        "rebuild-sft",
+        help="Replay accepted rollout actions into action-only SFT conversations.",
+    )
+    rebuild_sft.add_argument(
+        "--source",
+        nargs=2,
+        action="append",
+        required=True,
+        metavar=("TASK_DIR", "ROLLOUT_JSONL"),
+        help="Repeatable generated-task directory and matching rollout JSONL pair.",
+    )
+    rebuild_sft.add_argument("--output-dir", required=True)
+    rebuild_sft.add_argument("--repair-surface-semantics", action="store_true")
+    rebuild_sft.add_argument(
+        "--tool-response-mode",
+        choices=TOOL_RESPONSE_MODES,
+        default=DEFAULT_TOOL_RESPONSE_MODE,
+    )
+    rebuild_sft.set_defaults(handler=_rebuild_sft)
     return parser
 
 

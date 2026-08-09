@@ -122,6 +122,22 @@ def test_step_limit_truncates(backend, task_store) -> None:
     assert final.info["termination_reason"] == "step_limit"
 
 
+def test_default_step_limit_truncates_after_35_valid_actions(backend, task_store) -> None:
+    env = TravelWeaverEnv(backend, task_store)
+    reset = env.reset("task-hangzhou")
+    assert reset.remaining_steps == 35
+
+    for expected_remaining in range(34, 0, -1):
+        step = _step(env, "search_attractions", city="杭州")
+        assert not step.truncated
+        assert step.observation.remaining_steps == expected_remaining
+
+    final = _step(env, "search_attractions", city="杭州")
+    assert final.truncated
+    assert final.observation.remaining_steps == 0
+    assert final.info["termination_reason"] == "step_limit"
+
+
 def test_cursor_and_visible_state_are_episode_local(backend, task_store) -> None:
     first = TravelWeaverEnv(backend, task_store)
     second = TravelWeaverEnv(backend, task_store)

@@ -39,3 +39,7 @@ class JudgeError(TravelWeaverError):
 
 class SynthesisError(TravelWeaverError):
     """A synthetic task cannot be grounded, polished, or validated safely."""
+
+
+class SFTRebuildError(TravelWeaverError):
+    """A rollout cannot be rebuilt into a safe, replay-verified SFT sample."""
