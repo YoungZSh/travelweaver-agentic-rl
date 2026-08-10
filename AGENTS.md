@@ -90,11 +90,12 @@ uv run --project training ruff check training
 - TaskSpec：`travelweaver-task-spec-v2`
 - Blueprint / Surface：`travelweaver-task-blueprint-v2` / `travelweaver-task-surface-v3`
 - Reward：`travelweaver-reward-v1`
-- Trajectory：`travelweaver-trajectory-v5`
+- Trajectory：`travelweaver-trajectory-v6`
 - Model tool response：`travelweaver-model-tool-response-v1`（默认 `delta`，兼容 `snapshot`）
 - Scenario：`travelweaver-scenario-v1`
 - Synthesis / artifacts：`travelweaver-synthesis-v3` /
   `travelweaver-synthesis-artifacts-v5`
+- SFT：`travelweaver-sft-v4`
 - Polisher prompt：`travelweaver-zh-polisher-v4`
 
 不要在不升级版本和补兼容测试的情况下静默改变字段含义。读取旧快照时保持显式兼容或明确
@@ -152,6 +153,8 @@ uv run travelweaver synthesize-tasks \
 - API 配置只从 `.env`/环境变量进入适配层，不得写入代码、日志或提交。
 - 当前 rollout 基线为 `deepseek-v4-flash`、thinking enabled、`max_tokens=16384`、请求超时
   `600s`、每题一次 rollout。
+- 环境默认允许 50 个有效工具动作，批量和单题 API rollout 默认允许 60 个
+  API turn；连续 3 个 invalid action 仍终止 episode。
 - Surface polisher 始终使用 thinking disabled；供应商特有 thinking 参数只能留在 LLM 配置
   适配层。
 - 所有支持并发的 DeepSeek 批处理默认使用 256 并发；当前 `repolish-tasks` 的
@@ -159,6 +162,8 @@ uv run travelweaver synthesize-tasks \
   使用相同默认值，除非用户明确修改。
 - 批量 rollout 必须可恢复：按 `task_id` 跳过已有结果，将 API 错误单独写入 errors JSONL，
   不因单题错误丢失整批结果。
+- 小批量抽查使用 `--limit N`；候选集合必须先按 seed 确定并保持题型与 Scenario 的比例，再根据
+  已有输出恢复，不能让重复执行滑动到下一批任务。
 - 模型可见工具返回默认使用 `--tool-response-mode delta`，只发送本轮结果、错误和剩余步数；
   完整 StepResult 仍写入轨迹用于回放和审计。`snapshot` 只用于复现旧实验。
 - 只有用户明确要求时才能调用付费外部 API。普通单元测试使用 fake client 或 mock。
@@ -168,19 +173,32 @@ uv run travelweaver rollout-generated \
   --input-dir data/generated/<batch-name> \
   --output data/trajectories/<rollout-name>.jsonl \
   --concurrency 256 \
-  --max-api-turns 40
+  --max-api-turns 60
 ```
 
 ## SFT 数据转换约定
 
-SFT 转换使用版本化、可审计的 `travelweaver-sft-v2`，不直接把原始 JSONL 临时拼成训练输入。
+SFT 转换使用版本化、可审计的 `travelweaver-sft-v4`，不直接把原始 JSONL 临时拼成训练输入。
 
 - 只接纳正常 `plan_submitted`、`reward_valid=true`、全部硬约束通过且 `rft_accepted=true`
   的轨迹。
-- 最终 Reward 为 1.0 的恢复型轨迹可以用于 SFT。清洗时从 reset 开始跳过 invalid action，
-  重放有效 action 并重生成 observation；不得直接从原 messages 中删行后继续使用旧 observation。
-- 当前采用 action-only SFT：删除全部 `reasoning_content`。system、user 和 tool observation 只作
+- 最终 Reward 为 1.0 的恢复型轨迹可以用于 SFT。action-only 清洗从 reset 开始跳过 invalid
+  action，重放有效 action 并重生成 observation；不得直接从原 messages 中删行后继续使用旧
+  observation。
+- 默认采用 action-only SFT：删除全部 `reasoning_content`。system、user 和 tool observation 只作
   上下文，不计算 loss；仅正确 assistant tool call 是监督目标。
+- ReAct SFT 必须显式使用 `supervision_mode=react`，只接纳来源为 thinking disabled、Reward=1、
+  全程零 invalid action 且 assistant message 与 action 严格对齐的轨迹。保留可见
+  `assistant.content` 并参与 loss，但仍禁止供应商私有 `reasoning_content`。
+- ReAct Recovery 按 `docs/react-sft-recovery-v1.md` 实现：保留 invalid assistant/tool-error 回合
+  作为上下文，对整个 invalid assistant message 设零 loss，监督后续可见反思和正确工具调用。
+  转换时按原顺序重放全部 action 并重新生成 observation，不能删掉错误后继续使用旧上下文。
+  V4 使用显式 `assistant_loss_mask`，不能根据错误文本隐式推断监督范围。
+- 模型侧工具 schema 和 arguments 必须按 schema 递归使用 required-first 顺序；模型 JSON 禁止
+  `sort_keys=True`。canonical hash 可以独立排序，但不能改变模型实际看到的字段顺序。
+- rollout 遇到 malformed 或非 object arguments 时，将模型历史规范为 `{}` 并作为 invalid action
+  继续，把原始坏字符串只写入 trajectory audit，不能让下一轮 OpenAI-compatible 请求因历史坏
+  JSON 返回 400。
 - 首条 user content 使用真人题面的纯自然语言 `query`，不包装 JSON observation，不暴露
   episode ID、协议版本、合成类型或 Blueprint/Surface ID。工具 observation 仍使用版本化 JSON。
 - SFT 中间 tool message 默认复用 `travelweaver-model-tool-response-v1` 的 `delta` 序列化，

@@ -31,7 +31,7 @@ See [the MVP guide](docs/travelweaver-env-mvp.md), the frozen
 - Environment protocol: `travelweaver-environment-v0.3`
 - Tool protocol: `travelweaver-tools-v2-agent`
 - TaskSpec / Reward: `travelweaver-task-spec-v2` / `travelweaver-reward-v1`
-- Trajectory / model response: `travelweaver-trajectory-v5` /
+- Trajectory / model response: `travelweaver-trajectory-v6` /
   `travelweaver-model-tool-response-v1`
 - RL training stack: pinned `verl==0.9.0.dev0` in the separate `training/` Linux/CUDA environment
 
@@ -66,10 +66,13 @@ vLLM, and PyTorch stack. Create or update its separate virtual environment with
 `uv sync --project training --dev`; training code, configuration, and launchers belong
 under `training/`.
 
-Accepted rollouts can be deterministically rebuilt into action-only SFT data with
+Accepted rollouts can be deterministically rebuilt into action-only or clean ReAct SFT data with
 `travelweaver rebuild-sft`. The root command replays valid actions and writes an audited neutral
-JSONL; the isolated training adapter renders it with Qwen3.5's official chat template. See
-[the SFT reconstruction design](docs/sft-trajectory-reconstruction-v1.md).
+JSONL; `--supervision-mode react` preserves visible assistant text only for zero-invalid,
+thinking-disabled source trajectories. The isolated training adapter renders either mode with
+Qwen3.5's official chat template. See
+[the SFT reconstruction design](docs/sft-trajectory-reconstruction-v1.md) and the implemented
+[ReAct recovery format](docs/react-sft-recovery-v1.md).
 
 ## DeepSeek API rollout
 
@@ -89,10 +92,15 @@ uv run travelweaver rollout-api --task-id e20241028160248698752
 The command loads `.env`, calls the official OpenAI-compatible DeepSeek API, and appends
 the full replayable record to `data/trajectories/deepseek-v4-flash.jsonl`. The rollout
 runner itself is provider-neutral: DeepSeek is currently a configuration preset over the
-shared OpenAI-compatible function-calling client. Each `travelweaver-trajectory-v5`
+shared OpenAI-compatible function-calling client. Each `travelweaver-trajectory-v6`
 record contains canonical `messages`, `tools`, executed `steps`, terminal Reward details,
 RFT acceptance, and a separate audit event stream. Local dotenv files and generated
 trajectories are ignored by Git.
+
+Trajectory v6 canonicalizes malformed or non-object function arguments to `{}` in model history
+while retaining the raw model output in the audit stream. The environment still returns an invalid
+tool response, allowing the next model turn to recover without resending malformed JSON to an
+OpenAI-compatible endpoint.
 
 Model-visible tool messages default to the versioned `delta` response mode, so each turn
 adds only the new tool result, an optional error, and the remaining-step count. Full
@@ -108,6 +116,10 @@ uv run travelweaver rollout-generated \
   --output data/trajectories/chinatravel-blended-v1.1-thinking.jsonl \
   --concurrency 256
 ```
+
+For a smaller audit run, pass `--limit N`. The command fixes a seed-derived cohort before
+checking resume state and proportionally preserves task types and Scenario profiles, so rerunning
+the same output with the same seed resumes the same tasks instead of selecting the next `N` rows.
 
 ## Grounded task synthesis
 

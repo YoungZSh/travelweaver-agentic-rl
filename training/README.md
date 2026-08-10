@@ -97,11 +97,13 @@ environment.
 SGLang, Apex, TransformerEngine, and Megatron-LM are intentionally excluded. This project
 uses only FSDP for training and vLLM for rollout generation.
 
-## Qwen3.5 action-only SFT data
+## Qwen3.5 action-only and ReAct SFT data
 
-The root environment first produces replay-verified `travelweaver-sft-v2` JSONL. The leading user
-message is the original natural-language task query, while machine-generated tool observations
-remain versioned JSON. Intermediate
+The root environment produces replay-verified `travelweaver-sft-v4` JSONL with an explicit
+`supervision_mode`. Action-only samples supervise tool calls, while clean ReAct samples also
+supervise visible `assistant.content` from thinking-disabled rollouts. Supplier-private
+`reasoning_content` is rejected in both modes. The leading user message is the original
+natural-language task query, while machine-generated tool observations remain versioned JSON. Intermediate
 tool messages use the versioned `delta` response by default, while full environment snapshots stay
 in the source trajectory for replay and audit. Convert the neutral data to
 veRL Parquet without loading model weights:
@@ -118,13 +120,30 @@ are not widened into nullable Arrow structs. Configure veRL with
 `training/configs/qwen3_5_4b_sft_data.yaml` and the custom dataset class in
 `training/src/travelweaver_sft_dataset.py`. It decodes those columns and then delegates tokenization,
 masking, and full-conversation consistency checks to veRL's `MultiTurnSFTDataset`.
+The adapter remains compatible with existing v2 action-only and v3 action-only/clean ReAct
+artifacts. Newly rebuilt datasets use v4 so supervision semantics cannot be inferred from message
+text.
+
+Recovery ReAct is specified in
+[`docs/react-sft-recovery-v1.md`](../docs/react-sft-recovery-v1.md). V4 retains invalid assistant
+turns and tool errors as causal context, supplies an explicit per-assistant-turn loss mask, and
+supervises only subsequent reflection and valid actions. The adapter reads the separate
+`assistant_loss_mask_json` Parquet column; it does not infer masks from error text or add private
+fields to messages passed through Qwen's official chat template.
 
 The default two-GPU full-parameter run is restricted to GPU 0/1. It uses FSDP2, two-way Ulysses
 sequence parallelism, dynamic token batches, and a 32,768-token sequence limit. The per-GPU token
 budget is 16,384, so the current 22,079-token maximum sample fits across SP=2 without packing an
-unnecessarily large micro-batch. Its preflight checks the Parquet manifest and hash, model family,
-maximum sequence length, parallelism divisibility, fused AdamW support, veRL's fused linear
-cross-entropy kernel, and installed FLA support:
+unnecessarily large micro-batch.
+
+This 32,768-token launcher default is lower than Qwen3.5-4B's 262,144-token model limit. The
+79-sample clean/recovery ReAct pilot reaches 46,843 tokens (median 28,216 and p90 40,990). Before
+training ReAct data, either raise the training limit and token budgets or isolate over-limit
+samples; do not truncate early evidence or error-recovery context.
+
+The launcher preflight checks the Parquet manifest and hash, model family, maximum sequence length,
+parallelism divisibility, fused AdamW support, veRL's fused linear cross-entropy kernel, and
+installed FLA support:
 
 ```bash
 bash training/scripts/run_qwen3_5_4b_multiturn_sft.sh --dry-run
@@ -139,6 +158,11 @@ vocabulary and long TravelWeaver trajectories. Gradient checkpointing, remove-pa
 precision, and reshard-after-forward remain enabled; parameter and optimizer CPU offload stay off
 to avoid PCIe stalls on the two A800s.
 
+The launcher streams metrics to the `travelweaver-sft` Weights & Biases project under the default
+run name `qwen3.5-4b-multiturn-sft-v2-natural-633-a800x2-seed20260809`. Its local W&B sync files
+live under the experiment output directory, and a persisted W&B run ID allows checkpoint-based
+launcher restarts to resume the same dashboard run.
+
 The launcher saves every 10 optimizer steps and also saves the final step. It retains only the
 newest checkpoint after each save completes. Each checkpoint contains resumable model/optimizer
 state and a Hugging Face export. Logs live alongside checkpoints under the experiment output
@@ -150,7 +174,9 @@ TRAIN_BATCH_SIZE=8 MAX_TOKEN_LEN_PER_GPU=12288 \
   bash training/scripts/run_qwen3_5_4b_multiturn_sft.sh
 ```
 
-Checkpoint policy can likewise be overridden with `SAVE_FREQ`, `MAX_CKPT_TO_KEEP`, and `RUN_DIR`.
+Checkpoint and tracking settings can likewise be overridden with `SAVE_FREQ`,
+`MAX_CKPT_TO_KEEP`, `RUN_DIR`, `PROJECT_NAME`, `EXPERIMENT_NAME`, and standard `WANDB_*`
+environment variables.
 
 Do not launch until every selected GPU is actually free; the script deliberately does not stop GPU
 holders or other users' processes. Additional veRL Hydra overrides may be appended after the script
