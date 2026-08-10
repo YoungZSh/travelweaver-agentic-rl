@@ -27,6 +27,7 @@ TOOLS_VERSION = "travelweaver-tools-v2-agent"
 PLAN_SNAPSHOT_VERSION = "travelweaver-plan-snapshot-v1"
 EVIDENCE_BUNDLE_VERSION = "travelweaver-evidence-v1"
 QUANTITY_RULES_VERSION = "travelweaver-quantity-rules-v1"
+DEFAULT_MAX_VALID_STEPS = 50
 
 _SEARCH_TOOLS = {
     "search_attractions",
@@ -61,7 +62,7 @@ class TravelWeaverEnv:
         task_store: JsonlTaskStore,
         *,
         page_size: int = 10,
-        max_valid_steps: int = 35,
+        max_valid_steps: int = DEFAULT_MAX_VALID_STEPS,
         max_consecutive_invalid: int = 3,
         task_spec_resolver: TaskSpecResolver | None = None,
         reward_evaluator: TravelReward | None = None,

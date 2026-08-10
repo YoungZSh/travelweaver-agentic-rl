@@ -15,8 +15,16 @@ import pandas as pd
 from omegaconf import OmegaConf
 from transformers import AutoProcessor
 
-FORMAT_VERSION = "travelweaver-sft-v2"
-SUPPORTED_FORMAT_VERSIONS = frozenset({"travelweaver-sft-v1", FORMAT_VERSION})
+FORMAT_VERSION = "travelweaver-sft-v4"
+SUPPORTED_FORMAT_VERSIONS = frozenset(
+    {
+        "travelweaver-sft-v1",
+        "travelweaver-sft-v2",
+        "travelweaver-sft-v3",
+        FORMAT_VERSION,
+    }
+)
+SUPERVISION_MODES = frozenset({"action_only", "react", "react_recovery"})
 MODEL_TOOL_RESPONSE_VERSION = "travelweaver-model-tool-response-v1"
 USER_CONTENT_FORMAT = "travelweaver-natural-query-v1"
 MODEL_CONTEXT_LIMIT = 262_144
@@ -66,13 +74,19 @@ def _validate_row(row: Any, line_number: int) -> None:
         raise ValueError(f"SFT row {line_number} has no supported tool response mode.")
     if row.get("model_tool_response_version") != MODEL_TOOL_RESPONSE_VERSION:
         raise ValueError(f"SFT row {line_number} has an unsupported tool response version.")
+    format_version = row.get("format_version")
+    supervision_mode = row.get("supervision_mode")
+    if format_version in {"travelweaver-sft-v1", "travelweaver-sft-v2"}:
+        supervision_mode = "action_only"
+    if supervision_mode not in SUPERVISION_MODES:
+        raise ValueError(f"SFT row {line_number} has no supported supervision mode.")
     if not all(isinstance(message, dict) for message in messages):
         raise ValueError(f"SFT row {line_number} contains a non-object message.")
     if len(messages) < 3 or messages[0].get("role") != "system":
         raise ValueError(f"SFT row {line_number} has no leading system message.")
     if messages[1].get("role") != "user" or messages[-1].get("role") != "assistant":
         raise ValueError(f"SFT row {line_number} has invalid conversation boundaries.")
-    if row.get("format_version") == FORMAT_VERSION:
+    if format_version in {"travelweaver-sft-v2", FORMAT_VERSION}:
         if row.get("user_content_format") != USER_CONTENT_FORMAT:
             raise ValueError(f"SFT row {line_number} has an unsupported user content format.")
         user_content = messages[1].get("content")
@@ -84,19 +98,51 @@ def _validate_row(row: Any, line_number: int) -> None:
             parsed_user_content = None
         if isinstance(parsed_user_content, (dict, list)):
             raise ValueError(f"SFT row {line_number} wraps the human user query in JSON.")
+    assistant_count = sum(message.get("role") == "assistant" for message in messages)
+    assistant_loss_mask = row.get("assistant_loss_mask")
+    if format_version == FORMAT_VERSION:
+        if (
+            not isinstance(assistant_loss_mask, list)
+            or len(assistant_loss_mask) != assistant_count
+            or any(not isinstance(value, bool) for value in assistant_loss_mask)
+        ):
+            raise ValueError(f"SFT row {line_number} has an invalid assistant loss mask.")
+        if not assistant_loss_mask or assistant_loss_mask[-1] is not True:
+            raise ValueError(f"SFT row {line_number} masks its terminal assistant turn.")
+        if supervision_mode in {"action_only", "react"} and not all(assistant_loss_mask):
+            raise ValueError(f"SFT row {line_number} masks a clean assistant turn.")
+        _validate_required_first_tools(tools, line_number)
+    visible_assistant_turns = 0
+    assistant_turn_index = 0
     for index, message in enumerate(messages):
         if not isinstance(message, dict) or "reasoning_content" in message:
             raise ValueError(f"SFT row {line_number} message {index} contains reasoning.")
         role = message.get("role")
         if role == "assistant":
-            if message.get("content") != "":
-                raise ValueError(f"SFT row {line_number} assistant content is not empty.")
+            content = message.get("content")
+            if not isinstance(content, str):
+                raise ValueError(f"SFT row {line_number} assistant content is not text.")
+            if supervision_mode == "action_only" and content != "":
+                raise ValueError(f"SFT row {line_number} action-only content is not empty.")
+            visible_assistant_turns += int(bool(content.strip()))
             calls = message.get("tool_calls")
             if not isinstance(calls, list) or len(calls) != 1:
                 raise ValueError(f"SFT row {line_number} assistant must call one tool.")
             function = calls[0].get("function") if isinstance(calls[0], dict) else None
             if not isinstance(function, dict) or not isinstance(function.get("arguments"), dict):
                 raise ValueError(f"SFT row {line_number} has string or missing arguments.")
+            if format_version == FORMAT_VERSION:
+                assert isinstance(assistant_loss_mask, list)
+                _validate_required_first_arguments(
+                    function,
+                    tools,
+                    line_number,
+                    allow_unknown=(
+                        supervision_mode == "react_recovery"
+                        and assistant_loss_mask[assistant_turn_index] is False
+                    ),
+                )
+            assistant_turn_index += 1
         elif role == "tool":
             try:
                 payload = json.loads(message["content"])
@@ -121,12 +167,24 @@ def _validate_row(row: Any, line_number: int) -> None:
                 if detail is not None or payload.get("reward") not in {0}:
                     raise ValueError(f"SFT row {line_number} leaks terminal Reward data.")
     expected_roles = ["system", "user"]
-    assistant_count = sum(message.get("role") == "assistant" for message in messages)
     for _index in range(assistant_count - 1):
         expected_roles.extend(["assistant", "tool"])
     expected_roles.append("assistant")
     if [message.get("role") for message in messages] != expected_roles:
         raise ValueError(f"SFT row {line_number} does not alternate assistant/tool turns.")
+    if supervision_mode in {"react", "react_recovery"} and visible_assistant_turns == 0:
+        raise ValueError(f"SFT row {line_number} ReAct sample has no visible assistant text.")
+    if format_version == FORMAT_VERSION:
+        assert isinstance(assistant_loss_mask, list)
+        for turn_index, message_index in enumerate(range(2, len(messages), 2)):
+            has_tool_response = message_index + 1 < len(messages)
+            if not has_tool_response:
+                continue
+            payload = json.loads(messages[message_index + 1]["content"])
+            if bool(payload.get("valid_action")) != bool(assistant_loss_mask[turn_index]):
+                raise ValueError(
+                    f"SFT row {line_number} loss mask disagrees with tool validity."
+                )
 
 
 def _parquet_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -137,6 +195,17 @@ def _parquet_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "tool_response_mode": row["tool_response_mode"],
             "model_tool_response_version": row["model_tool_response_version"],
             "user_content_format": row.get("user_content_format"),
+            "supervision_mode": row.get("supervision_mode", "action_only"),
+            "assistant_loss_mask_json": _compact_json(
+                row.get(
+                    "assistant_loss_mask",
+                    [
+                        True
+                        for message in row["messages"]
+                        if message.get("role") == "assistant"
+                    ],
+                )
+            ),
             "messages_json": _compact_json(row["messages"]),
             "tools_json": _compact_json(row["tools"]),
             "enable_thinking": False,
@@ -182,6 +251,11 @@ def _audit_parquet(
     }
     tool_call_token_id = int(processor.tokenizer.convert_tokens_to_ids("<tool_call>"))
     supervised_tool_call_tokens = 0
+    masked_assistant_turns = 0
+    supervision_counts = {
+        str(key): int(value)
+        for key, value in dataset.dataframe["supervision_mode"].value_counts().items()
+    }
     for index in range(len(dataset)):
         item = dataset[index]
         lengths.append(int(item["input_ids"].numel()))
@@ -194,6 +268,8 @@ def _audit_parquet(
         supervised_tool_call_tokens += int(
             ((input_ids == tool_call_token_id) & (loss_mask != 0)).sum().item()
         )
+        row_mask = json.loads(dataset.dataframe.iloc[index]["assistant_loss_mask_json"])
+        masked_assistant_turns += sum(not value for value in row_mask)
         if len(previews) < 10:
             row = dataset.dataframe.iloc[index].to_dict()
             messages = json.loads(row["messages_json"])
@@ -209,11 +285,13 @@ def _audit_parquet(
     return (
         {
             "samples": len(dataset),
+            "supervision_modes": dict(sorted(supervision_counts.items())),
             "sequence_tokens": _distribution(lengths),
             "assistant_loss_tokens": _distribution(loss_lengths),
             "assistant_loss_ratio": round(sum(loss_lengths) / sum(lengths), 6),
             "thinking_scaffold_masked": True,
             "supervised_tool_call_open_tokens": supervised_tool_call_tokens,
+            "masked_assistant_turns": masked_assistant_turns,
             "input_ids_mismatch_ignored": False,
             "model_context_limit": MODEL_CONTEXT_LIMIT,
         },
@@ -253,7 +331,8 @@ def _update_manifest(path: Path, report: dict[str, Any], parquet_path: Path) -> 
         "parquet_path": str(parquet_path.resolve()),
         "parquet_sha256": _sha256(parquet_path),
         "messages_column": "messages_json",
-        "tools_column": "tools_json",
+            "tools_column": "tools_json",
+            "assistant_loss_mask_column": "assistant_loss_mask_json",
         "enable_thinking": False,
         "apply_chat_template_enable_thinking": False,
         **report,
@@ -286,7 +365,80 @@ def prepare(input_path: Path, output_path: Path, model_path: Path) -> dict[str, 
 
 
 def _compact_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
+
+
+def _validate_required_first_tools(tools: list[dict[str, Any]], line_number: int) -> None:
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        parameters = function.get("parameters") if isinstance(function, dict) else None
+        if not isinstance(parameters, dict):
+            raise ValueError(f"SFT row {line_number} contains an invalid tool schema.")
+        _validate_schema_property_order(parameters, line_number)
+
+
+def _validate_schema_property_order(schema: dict[str, Any], line_number: int) -> None:
+    properties = schema.get("properties")
+    required = schema.get("required")
+    if isinstance(properties, dict):
+        required_keys = (
+            [key for key in required if isinstance(key, str) and key in properties]
+            if isinstance(required, list)
+            else []
+        )
+        actual = list(properties)
+        if actual[: len(required_keys)] != required_keys:
+            raise ValueError(f"SFT row {line_number} tool schema is not required-first.")
+        for property_schema in properties.values():
+            if isinstance(property_schema, dict):
+                _validate_schema_property_order(property_schema, line_number)
+    items = schema.get("items")
+    if isinstance(items, dict):
+        _validate_schema_property_order(items, line_number)
+
+
+def _validate_required_first_arguments(
+    function: dict[str, Any],
+    tools: list[dict[str, Any]],
+    line_number: int,
+    *,
+    allow_unknown: bool = False,
+) -> None:
+    name = function.get("name")
+    arguments = function.get("arguments")
+    for tool in tools:
+        tool_function = tool.get("function") if isinstance(tool, dict) else None
+        if isinstance(tool_function, dict) and tool_function.get("name") == name:
+            schema = tool_function.get("parameters")
+            if not isinstance(schema, dict) or not isinstance(arguments, dict):
+                break
+            _validate_value_order(arguments, schema, line_number)
+            return
+    if allow_unknown:
+        return
+    raise ValueError(f"SFT row {line_number} calls an unknown tool {name!r}.")
+
+
+def _validate_value_order(value: Any, schema: dict[str, Any], line_number: int) -> None:
+    if isinstance(value, list):
+        items = schema.get("items")
+        if isinstance(items, dict):
+            for item in value:
+                _validate_value_order(item, items, line_number)
+        return
+    if not isinstance(value, dict):
+        return
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return
+    expected = [key for key in properties if key in value]
+    known_actual = [key for key in value if key in properties]
+    if known_actual != expected:
+        raise ValueError(f"SFT row {line_number} tool arguments are not schema-ordered.")
+    for key in expected:
+        property_schema = properties[key]
+        if isinstance(property_schema, dict):
+            _validate_value_order(value[key], property_schema, line_number)
 
 
 def _sha256(path: Path) -> str:

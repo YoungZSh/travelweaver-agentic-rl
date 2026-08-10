@@ -19,6 +19,19 @@ def _decode(value: Any, *, field: str) -> Any:
         raise ValueError(f"TravelWeaver Parquet column {field!r} contains invalid JSON.") from error
 
 
+def _apply_turn_supervision(
+    result: tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]],
+    *,
+    trainable: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Zero one assistant segment's loss without removing it from causal context."""
+
+    if trainable:
+        return result
+    input_ids, loss_mask, attention_mask, values = result
+    return input_ids, torch.zeros_like(loss_mask), attention_mask, values
+
+
 class TravelWeaverMultiTurnSFTDataset(MultiTurnSFTDataset):
     """Decode JSON columns before using veRL's standard multi-turn masking logic."""
 
@@ -29,6 +42,30 @@ class TravelWeaverMultiTurnSFTDataset(MultiTurnSFTDataset):
         ]
         if self.tools is not None:
             self.tools = [_decode(value, field=self.tools_key) for value in self.tools]
+        if "assistant_loss_mask_json" in self.dataframe.columns:
+            self.assistant_loss_masks = [
+                _decode(value, field="assistant_loss_mask_json")
+                for value in self.dataframe["assistant_loss_mask_json"].tolist()
+            ]
+        else:
+            self.assistant_loss_masks = None
+
+    def __getitem__(self, item: int) -> dict[str, Any]:
+        if self.assistant_loss_masks is None:
+            return super().__getitem__(item)
+        mask = self.assistant_loss_masks[item]
+        if not isinstance(mask, list) or any(not isinstance(value, bool) for value in mask):
+            raise ValueError("TravelWeaver assistant loss mask must be a boolean list.")
+        self._active_assistant_loss_mask = mask
+        self._active_assistant_index = 0
+        try:
+            result = super().__getitem__(item)
+            if self._active_assistant_index != len(mask):
+                raise ValueError("TravelWeaver assistant loss mask length does not match messages.")
+            return result
+        finally:
+            del self._active_assistant_loss_mask
+            del self._active_assistant_index
 
     def _build_messages(self, example: dict[str, Any]) -> list[dict[str, Any]]:
         parsed = dict(example)
@@ -70,10 +107,22 @@ class TravelWeaverMultiTurnSFTDataset(MultiTurnSFTDataset):
         if index == 1 and full_message[0]["role"] == "system":
             empty = torch.empty(0, dtype=torch.long)
             return empty, empty.clone(), empty.clone(), {}
-        return super()._process_single_message(
+        result = super()._process_single_message(
             index=index,
             message=message,
             full_message=full_message,
             tools=tools,
             enable_thinking=enable_thinking,
+        )
+        if message["role"] != "assistant" or not hasattr(
+            self, "_active_assistant_loss_mask"
+        ):
+            return result
+        assistant_index = self._active_assistant_index
+        if assistant_index >= len(self._active_assistant_loss_mask):
+            raise ValueError("TravelWeaver assistant loss mask is shorter than messages.")
+        self._active_assistant_index += 1
+        return _apply_turn_supervision(
+            result,
+            trainable=self._active_assistant_loss_mask[assistant_index],
         )

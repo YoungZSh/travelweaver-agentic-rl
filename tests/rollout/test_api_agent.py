@@ -100,7 +100,7 @@ def test_api_agent_executes_model_tool_call_and_records_trajectory(env) -> None:
         "content": "从上海去杭州玩一天。",
     }
     system_prompt = completions.requests[0]["messages"][0]["content"]
-    assert "最多执行 35 个有效工具动作" in system_prompt
+    assert "最多执行 50 个有效工具动作" in system_prompt
     assert "按任务复杂度尽量减少无效搜索" in system_prompt
     assert "每天第一个本地活动不得填写 route_from_previous_id" in system_prompt
     assert "15 个动作内完成" not in system_prompt
@@ -125,7 +125,7 @@ def test_api_agent_executes_model_tool_call_and_records_trajectory(env) -> None:
     assert "observation" in run.steps[0]["result"]
     assert len(run.tools) == 13
     persisted = run.to_dict(include_trajectory=True)
-    assert persisted["trajectory_version"] == "travelweaver-trajectory-v5"
+    assert persisted["trajectory_version"] == "travelweaver-trajectory-v6"
     assert persisted["user_content_format"] == "travelweaver-natural-query-v1"
     assert persisted["tool_response_mode"] == "delta"
     assert persisted["model_tool_response_version"] == MODEL_TOOL_RESPONSE_VERSION
@@ -324,6 +324,70 @@ def test_delta_tool_response_preserves_invalid_action_recovery_signal(env) -> No
     assert "observation" not in delta
 
 
+def test_malformed_arguments_are_canonicalized_for_the_next_api_turn(env) -> None:
+    malformed = SimpleNamespace(
+        id="call-malformed",
+        function=SimpleNamespace(
+            name="search_attractions",
+            arguments='{"city":"杭州"',
+        ),
+    )
+    finish = SimpleNamespace(
+        id="call-finish",
+        function=SimpleNamespace(
+            name="finish_without_plan",
+            arguments=json.dumps({"reason": "已收到参数错误"}, ensure_ascii=False),
+        ),
+    )
+
+    def response(response_id, message):
+        return SimpleNamespace(
+            id=response_id,
+            choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
+            usage=_Payload({"total_tokens": 10}),
+        )
+
+    completions = _SequenceCompletions(
+        [
+            response("response-1", _Message(malformed)),
+            response("response-2", _Message(finish)),
+        ]
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    run = ToolCallingAgent(
+        env,
+        DeepSeekConfig(api_key="not-a-real-secret"),
+        client=client,
+    ).run("task-hangzhou")
+
+    second_messages = completions.requests[1]["messages"]
+    malformed_history = next(
+        message
+        for message in second_messages
+        if message.get("role") == "assistant"
+        and message.get("tool_calls", [{}])[0].get("id") == "call-malformed"
+    )
+    assert malformed_history["tool_calls"][0]["function"]["arguments"] == "{}"
+    assert '{"city":"杭州"' not in json.dumps(second_messages, ensure_ascii=False)
+    tool_error = next(
+        json.loads(message["content"])
+        for message in second_messages
+        if message.get("role") == "tool"
+        and message.get("tool_call_id") == "call-malformed"
+    )
+    assert tool_error["valid_action"] is False
+    assert "required property" in tool_error["error"]["message"]
+    assert run.steps[0]["action"]["arguments"] == {}
+    assert run.steps[0]["tool_call"]["function"]["arguments"] == "{}"
+    assert run.steps[0]["raw_tool_call"]["function"]["arguments"] == '{"city":"杭州"'
+    assert any(
+        event["event"] == "tool_argument_normalization"
+        and event["raw_arguments"] == '{"city":"杭州"'
+        for event in run.trajectory
+    )
+
+
 def test_api_agent_rejects_unknown_tool_response_mode(env) -> None:
     with pytest.raises(ValueError, match="Unknown tool response mode"):
         ToolCallingAgent(
@@ -353,7 +417,18 @@ def test_api_agent_rejects_unknown_tool_response_mode(env) -> None:
 def test_rollout_cli_defaults_to_delta_tool_responses(arguments) -> None:
     parser = build_parser()
 
-    assert parser.parse_args(arguments).tool_response_mode == "delta"
+    parsed = parser.parse_args(arguments)
+    assert parsed.tool_response_mode == "delta"
+    if arguments[0].startswith("rollout-"):
+        assert parsed.max_api_turns == 60
+    if arguments[0] == "rollout-generated":
+        assert parsed.limit is None
+        limited = parser.parse_args([*arguments, "--limit", "100"])
+        assert limited.limit == 100
+    if arguments[0] == "rebuild-sft":
+        assert parsed.supervision_mode == "action_only"
+        react = parser.parse_args([*arguments, "--supervision-mode", "react"])
+        assert react.supervision_mode == "react"
     snapshot = parser.parse_args([*arguments, "--tool-response-mode", "snapshot"])
     assert snapshot.tool_response_mode == "snapshot"
 

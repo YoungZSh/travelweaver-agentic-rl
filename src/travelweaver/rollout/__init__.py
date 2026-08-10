@@ -1,6 +1,6 @@
 """Agent policies and trajectory rollout utilities."""
 
-from .api_agent import ApiAgentRun, ToolCallingAgent
+from .api_agent import DEFAULT_MAX_API_TURNS, ApiAgentRun, ToolCallingAgent
 from .batch import (
     DEFAULT_ROLLOUT_CONCURRENCY,
     BenchmarkRolloutBatchConfig,
@@ -25,6 +25,7 @@ __all__ = [
     "ApiAgentRun",
     "BenchmarkRolloutBatchConfig",
     "BenchmarkRolloutBatchReport",
+    "DEFAULT_MAX_API_TURNS",
     "DEFAULT_ROLLOUT_CONCURRENCY",
     "DEFAULT_TOOL_RESPONSE_MODE",
     "DemoTravelAgent",

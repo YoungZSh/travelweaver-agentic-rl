@@ -16,6 +16,7 @@ from ..errors import TravelWeaverError
 from ..llm import DeepSeekConfig, OpenAICompatibleConfig
 from ..paths import project_root
 from ..rollout import (
+    DEFAULT_MAX_API_TURNS,
     DEFAULT_ROLLOUT_CONCURRENCY,
     DEFAULT_TOOL_RESPONSE_MODE,
     TOOL_RESPONSE_MODES,
@@ -28,7 +29,13 @@ from ..rollout import (
     run_benchmark_rollout_batch,
     run_generated_rollout_batch,
 )
-from ..sft import SFTRebuildConfig, SFTSource, rebuild_sft_dataset
+from ..sft import (
+    DEFAULT_SFT_SUPERVISION_MODE,
+    SFT_SUPERVISION_MODES,
+    SFTRebuildConfig,
+    SFTSource,
+    rebuild_sft_dataset,
+)
 from ..synthesis import (
     RepolishConfig,
     SurfaceRepolishPipeline,
@@ -135,6 +142,7 @@ def _rollout_generated(args: argparse.Namespace) -> int:
             max_api_turns=args.max_api_turns,
             seed=args.seed,
             task_id=args.task_id,
+            limit=args.limit,
             tool_response_mode=args.tool_response_mode,
         ),
         llm_config,
@@ -226,6 +234,7 @@ def _rebuild_sft(args: argparse.Namespace) -> int:
             output_dir=Path(args.output_dir),
             repair_surface_semantics=args.repair_surface_semantics,
             tool_response_mode=args.tool_response_mode,
+            supervision_mode=args.supervision_mode,
         )
     )
     _print(report.to_dict())
@@ -278,7 +287,9 @@ def build_parser() -> argparse.ArgumentParser:
     rollout_api.add_argument("--seed", type=int, default=0)
     rollout_api.add_argument("--env-file", default=str(project_root() / ".env"))
     rollout_api.add_argument("--output", help="Append the complete run to this JSONL file.")
-    rollout_api.add_argument("--max-api-turns", type=int, default=40)
+    rollout_api.add_argument(
+        "--max-api-turns", type=int, default=DEFAULT_MAX_API_TURNS
+    )
     rollout_api.add_argument(
         "--tool-response-mode",
         choices=TOOL_RESPONSE_MODES,
@@ -298,9 +309,16 @@ def build_parser() -> argparse.ArgumentParser:
     rollout_generated.add_argument("--output", required=True)
     rollout_generated.add_argument("--errors")
     rollout_generated.add_argument("--task-id")
+    rollout_generated.add_argument(
+        "--limit",
+        type=int,
+        help="Deterministically select a fixed, resumable cohort of at most this many tasks.",
+    )
     rollout_generated.add_argument("--seed", type=int, default=20260808)
     rollout_generated.add_argument("--env-file", default=str(project_root() / ".env"))
-    rollout_generated.add_argument("--max-api-turns", type=int, default=40)
+    rollout_generated.add_argument(
+        "--max-api-turns", type=int, default=DEFAULT_MAX_API_TURNS
+    )
     rollout_generated.add_argument(
         "--tool-response-mode",
         choices=TOOL_RESPONSE_MODES,
@@ -323,7 +341,9 @@ def build_parser() -> argparse.ArgumentParser:
     rollout_benchmark.add_argument("--task-id")
     rollout_benchmark.add_argument("--seed", type=int, default=20260808)
     rollout_benchmark.add_argument("--env-file", default=str(project_root() / ".env"))
-    rollout_benchmark.add_argument("--max-api-turns", type=int, default=40)
+    rollout_benchmark.add_argument(
+        "--max-api-turns", type=int, default=DEFAULT_MAX_API_TURNS
+    )
     rollout_benchmark.add_argument(
         "--tool-response-mode",
         choices=TOOL_RESPONSE_MODES,
@@ -375,7 +395,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     rebuild_sft = subparsers.add_parser(
         "rebuild-sft",
-        help="Replay accepted rollout actions into action-only SFT conversations.",
+        help="Replay accepted rollouts into action-only, clean ReAct, or recovery ReAct SFT.",
     )
     rebuild_sft.add_argument(
         "--source",
@@ -387,6 +407,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rebuild_sft.add_argument("--output-dir", required=True)
     rebuild_sft.add_argument("--repair-surface-semantics", action="store_true")
+    rebuild_sft.add_argument(
+        "--supervision-mode",
+        choices=SFT_SUPERVISION_MODES,
+        default=DEFAULT_SFT_SUPERVISION_MODE,
+        help=(
+            "ReAct preserves visible text; react_recovery keeps invalid turns as masked context."
+        ),
+    )
     rebuild_sft.add_argument(
         "--tool-response-mode",
         choices=TOOL_RESPONSE_MODES,

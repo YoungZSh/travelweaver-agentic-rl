@@ -8,7 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
-from ..env import TravelWeaverEnv
+from ..env import DEFAULT_MAX_VALID_STEPS, TravelWeaverEnv
 from ..errors import ApiRolloutError
 from ..llm import (
     OpenAICompatibleChatClient,
@@ -24,18 +24,26 @@ from .tool_response import (
 
 __all__ = [
     "ApiAgentRun",
+    "DEFAULT_MAX_API_TURNS",
     "OpenAICompatibleConfig",
     "ToolCallingAgent",
+    "render_system_prompt",
     "render_task_user_content",
 ]
 
-TRAJECTORY_VERSION = "travelweaver-trajectory-v5"
+TRAJECTORY_VERSION = "travelweaver-trajectory-v6"
 SUPPORTED_TRAJECTORY_VERSIONS = frozenset(
-    {"travelweaver-trajectory-v3", "travelweaver-trajectory-v4", TRAJECTORY_VERSION}
+    {
+        "travelweaver-trajectory-v3",
+        "travelweaver-trajectory-v4",
+        "travelweaver-trajectory-v5",
+        TRAJECTORY_VERSION,
+    }
 )
 USER_CONTENT_FORMAT = "travelweaver-natural-query-v1"
+DEFAULT_MAX_API_TURNS = 60
 
-SYSTEM_PROMPT = """\
+_SYSTEM_PROMPT_TEMPLATE = """\
 你是 TravelWeaver 旅行规划 Agent。你只能通过提供的工具观察环境和提交答案。
 
 规则：
@@ -50,13 +58,24 @@ SYSTEM_PROMPT = """\
    才调用 get_route；路线出发时间不得早于前一个活动结束时间，且必须在后一个活动开始前到达。
 7. 城际交通的起止时间必须与候选证据完全一致。
 8. 先满足全部硬约束。存在多个可行方案时，再根据题面偏好比较少量候选；无需穷举。
-9. 最多执行 35 个有效工具动作。按任务复杂度尽量减少无效搜索、无用保存和未使用路线。
+9. 最多执行 {max_valid_steps} 个有效工具动作。按任务复杂度尽量减少无效搜索、无用保存和未使用路线。
 10. 找到可行方案后调用 submit_plan；确认无解时调用 finish_without_plan。
     不要输出普通文本作为最终答案。
 11. 对没有额外景点、餐饮或指定地点要求的单日异地任务，选择首个可行的去程、景点和返程后即可提交；
     若题面有额外要求，必须继续查询并落实。
 12. API 即使允许多个 tool call，本环境每轮也只执行第一个。
 """
+
+
+def render_system_prompt(max_valid_steps: int) -> str:
+    """Render the model instruction with the environment's actual action budget."""
+
+    if max_valid_steps <= 0:
+        raise ValueError("max_valid_steps must be positive.")
+    return _SYSTEM_PROMPT_TEMPLATE.format(max_valid_steps=max_valid_steps)
+
+
+SYSTEM_PROMPT = render_system_prompt(DEFAULT_MAX_VALID_STEPS)
 
 
 def render_task_user_content(task: Mapping[str, Any]) -> str:
@@ -130,7 +149,7 @@ class ToolCallingAgent:
         *,
         client: Any | None = None,
         chat_client: Any | None = None,
-        max_api_turns: int = 40,
+        max_api_turns: int = DEFAULT_MAX_API_TURNS,
         tool_response_mode: str = DEFAULT_TOOL_RESPONSE_MODE,
     ) -> None:
         if max_api_turns <= 0:
@@ -148,15 +167,16 @@ class ToolCallingAgent:
         tools = self.env.tool_schemas()
         initial_observation = observation.to_dict()
         user_content = render_task_user_content(initial_observation["task"])
+        system_prompt = render_system_prompt(self.env.max_valid_steps)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ]
         steps: list[dict[str, Any]] = []
         trajectory: list[dict[str, Any]] = [
             {
                 "event": "reset",
-                "system_prompt": SYSTEM_PROMPT,
+                "system_prompt": system_prompt,
                 "observation": initial_observation,
                 "tools": tools,
                 "user_content_format": USER_CONTENT_FORMAT,
@@ -195,7 +215,6 @@ class ToolCallingAgent:
                     "usage": usage,
                 }
             )
-            messages.append(deepcopy(message_payload))
             if dropped_tool_calls:
                 trajectory.append(
                     {
@@ -208,6 +227,7 @@ class ToolCallingAgent:
 
             tool_calls = message_payload.get("tool_calls") or []
             if not tool_calls:
+                messages.append(deepcopy(message_payload))
                 return self._result(
                     observation=observation,
                     messages=messages,
@@ -234,10 +254,37 @@ class ToolCallingAgent:
             if not isinstance(tool_call_id, str) or not tool_call_id:
                 raise ApiRolloutError("Assistant tool call is missing id.")
             raw_arguments = function.get("arguments")
-            try:
-                arguments: Any = json.loads(raw_arguments)
-            except (json.JSONDecodeError, TypeError):
-                arguments = raw_arguments
+            argument_normalization: dict[str, Any] | None = None
+            if isinstance(raw_arguments, dict):
+                arguments: Any = deepcopy(raw_arguments)
+            else:
+                try:
+                    arguments = json.loads(raw_arguments)
+                except (json.JSONDecodeError, TypeError) as error:
+                    arguments = {}
+                    argument_normalization = {
+                        "reason": type(error).__name__,
+                        "raw_arguments": raw_arguments,
+                    }
+            if not isinstance(arguments, dict):
+                argument_normalization = {
+                    "reason": "arguments_not_object",
+                    "raw_arguments": raw_arguments,
+                }
+                arguments = {}
+            canonical_message = deepcopy(message_payload)
+            canonical_tool_call = canonical_message["tool_calls"][0]
+            if argument_normalization is not None:
+                canonical_tool_call["function"]["arguments"] = "{}"
+                trajectory.append(
+                    {
+                        "event": "tool_argument_normalization",
+                        "api_turn": api_turn,
+                        "tool_call_id": tool_call_id,
+                        **deepcopy(argument_normalization),
+                    }
+                )
+            messages.append(canonical_message)
             action = {"tool": tool_name, "arguments": arguments}
             result = self.env.step(action)
             step_count += 1
@@ -250,11 +297,14 @@ class ToolCallingAgent:
             step = {
                 "index": step_count - 1,
                 "api_turn": api_turn,
-                "tool_call": deepcopy(tool_call),
+                "tool_call": deepcopy(canonical_tool_call),
                 "action": action,
                 "result": result_payload,
                 "model_tool_response": deepcopy(model_tool_response),
             }
+            if argument_normalization is not None:
+                step["raw_tool_call"] = deepcopy(tool_call)
+                step["argument_normalization"] = deepcopy(argument_normalization)
             steps.append(step)
             trajectory.append({"event": "step", **deepcopy(step)})
             messages.append(

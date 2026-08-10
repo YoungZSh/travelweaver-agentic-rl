@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from travelweaver.env import InMemoryBackend, ScenarioSpec
 from travelweaver.llm import DeepSeekConfig, OpenAICompatibleConfig
 from travelweaver.rollout import (
@@ -109,6 +111,50 @@ def test_generated_batch_is_resumable_and_persists_model_configuration(tmp_path)
     assert resumed.skipped == 2
     assert resumed.attempted == 0
     assert called == []
+
+    limited_output = tmp_path / "limited.jsonl"
+    limited_config = GeneratedRolloutBatchConfig(
+        input_dir=input_dir,
+        output_path=limited_output,
+        error_path=tmp_path / "limited-errors.jsonl",
+        concurrency=2,
+        limit=1,
+        seed=123,
+    )
+    limited = run_generated_rollout_batch(
+        limited_config,
+        llm_config,
+        base_backend=InMemoryBackend([]),
+        episode_runner=run_episode,
+    )
+    selected_once = called.copy()
+    assert limited.total_tasks == 1
+    assert limited.attempted == 1
+    assert len(selected_once) == 1
+    called.clear()
+
+    limited_resumed = run_generated_rollout_batch(
+        limited_config,
+        llm_config,
+        base_backend=InMemoryBackend([]),
+        episode_runner=run_episode,
+    )
+    assert limited_resumed.total_tasks == 1
+    assert limited_resumed.skipped == 1
+    assert limited_resumed.attempted == 0
+    assert called == []
+
+
+def test_generated_batch_rejects_ambiguous_or_invalid_limit(tmp_path) -> None:
+    common = {
+        "input_dir": tmp_path,
+        "output_path": tmp_path / "out.jsonl",
+        "error_path": tmp_path / "errors.jsonl",
+    }
+    with pytest.raises(ValueError, match="must be positive"):
+        GeneratedRolloutBatchConfig(**common, limit=0)
+    with pytest.raises(ValueError, match="either task_id or limit"):
+        GeneratedRolloutBatchConfig(**common, task_id="task", limit=1)
 
 
 def test_benchmark_batch_is_resumable_and_records_official_split(

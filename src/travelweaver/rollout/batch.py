@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,7 +14,7 @@ from ..data.tasks import JsonlTaskStore
 from ..env import ChinaTravelBackend, ScenarioBackend, ScenarioSpec, TravelWeaverEnv
 from ..errors import DataUnavailableError
 from ..llm import DeepSeekConfig, OpenAICompatibleChatClient, OpenAICompatibleConfig
-from .api_agent import ApiAgentRun, ToolCallingAgent
+from .api_agent import DEFAULT_MAX_API_TURNS, ApiAgentRun, ToolCallingAgent
 from .tool_response import DEFAULT_TOOL_RESPONSE_MODE, validate_tool_response_mode
 from .trajectory import append_trajectory
 
@@ -26,7 +27,7 @@ class BenchmarkRolloutBatchConfig:
     error_path: Path
     split: str = "benchmark"
     concurrency: int = 16
-    max_api_turns: int = 40
+    max_api_turns: int = DEFAULT_MAX_API_TURNS
     seed: int = 20260808
     task_id: str | None = None
     tool_response_mode: str = DEFAULT_TOOL_RESPONSE_MODE
@@ -58,14 +59,19 @@ class GeneratedRolloutBatchConfig:
     output_path: Path
     error_path: Path
     concurrency: int = DEFAULT_ROLLOUT_CONCURRENCY
-    max_api_turns: int = 40
+    max_api_turns: int = DEFAULT_MAX_API_TURNS
     seed: int = 20260808
     task_id: str | None = None
+    limit: int | None = None
     tool_response_mode: str = DEFAULT_TOOL_RESPONSE_MODE
 
     def __post_init__(self) -> None:
         if self.concurrency <= 0 or self.max_api_turns <= 0:
             raise ValueError("Rollout concurrency and API-turn limit must be positive.")
+        if self.limit is not None and self.limit <= 0:
+            raise ValueError("Rollout task limit must be positive.")
+        if self.task_id is not None and self.limit is not None:
+            raise ValueError("Pass either task_id or limit, not both.")
         validate_tool_response_mode(self.tool_response_mode)
 
 
@@ -226,17 +232,23 @@ def run_generated_rollout_batch(
     attempted_ids = _record_ids(config.output_path) | _record_ids(config.error_path)
     if config.task_id is not None:
         store.get_public(config.task_id)
-        pending = [] if config.task_id in attempted_ids else [config.task_id]
+        selected = [config.task_id]
     else:
-        pending = [task_id for task_id in store.task_ids if task_id not in attempted_ids]
+        selected = _select_generated_task_ids(store, limit=config.limit, seed=config.seed)
+    selected_ids = set(selected)
+    attempted_selected = selected_ids & attempted_ids
+    pending = [task_id for task_id in selected if task_id not in attempted_ids]
 
     _emit(
         progress,
         {
             "event": "batch_start",
             "model": llm_config.model,
-            "total": len(store.task_ids),
-            "already_attempted": len(attempted_ids),
+            "source_total": len(store.task_ids),
+            "total": len(selected),
+            "selection_limit": config.limit,
+            "selection_seed": config.seed,
+            "already_attempted": len(attempted_selected),
             "pending": len(pending),
             "concurrency": config.concurrency,
         },
@@ -275,6 +287,8 @@ def run_generated_rollout_batch(
                 "task_type": store.get_public(task_id).get("task_type"),
                 "rollout_index": 0,
                 "tool_response_mode": config.tool_response_mode,
+                "selection_limit": config.limit,
+                "selection_seed": config.seed,
             }
             return payload
         finally:
@@ -323,8 +337,8 @@ def run_generated_rollout_batch(
             )
 
     report = GeneratedRolloutBatchReport(
-        total_tasks=len(store.task_ids),
-        skipped=len(store.task_ids) - len(pending),
+        total_tasks=len(selected),
+        skipped=len(attempted_selected),
         attempted=len(pending),
         accepted=accepted,
         errors=errors,
@@ -333,6 +347,64 @@ def run_generated_rollout_batch(
     )
     _emit(progress, {"event": "batch_complete", **report.to_dict()})
     return report
+
+
+def _select_generated_task_ids(
+    store: JsonlTaskStore,
+    *,
+    limit: int | None,
+    seed: int,
+) -> list[str]:
+    """Select a stable cohort while preserving generated task-type proportions."""
+
+    values = list(store.task_ids)
+    if limit is None or limit >= len(values):
+        return values
+
+    def selection_key(task_id: str) -> tuple[bytes, str]:
+        digest = hashlib.sha256(f"{seed}:{task_id}".encode()).digest()
+        return digest, task_id
+
+    buckets: dict[str, dict[str, list[str]]] = {}
+    for task_id in values:
+        task_type = str(store.get_public(task_id).get("task_type") or "unknown")
+        scenario = store.get_oracle(task_id).get("scenario")
+        scenario_profile = (
+            str(scenario.get("profile") or "unknown")
+            if isinstance(scenario, dict)
+            else "unknown"
+        )
+        buckets.setdefault(task_type, {}).setdefault(scenario_profile, []).append(task_id)
+    type_counts = {
+        task_type: sum(len(task_ids) for task_ids in scenarios.values())
+        for task_type, scenarios in buckets.items()
+    }
+    type_quotas = _proportional_quotas(type_counts, total=limit)
+    selected: list[str] = []
+    for task_type, scenarios in buckets.items():
+        scenario_quotas = _proportional_quotas(
+            {profile: len(task_ids) for profile, task_ids in scenarios.items()},
+            total=type_quotas[task_type],
+        )
+        for profile, task_ids in scenarios.items():
+            selected.extend(
+                sorted(task_ids, key=selection_key)[: scenario_quotas[profile]]
+            )
+    return sorted(selected, key=selection_key)
+
+
+def _proportional_quotas(counts: dict[str, int], *, total: int) -> dict[str, int]:
+    population = sum(counts.values())
+    exact = {key: total * count / population for key, count in counts.items()}
+    quotas = {key: int(value) for key, value in exact.items()}
+    remaining = total - sum(quotas.values())
+    remainder_order = sorted(
+        counts,
+        key=lambda key: (-(exact[key] - quotas[key]), key),
+    )
+    for key in remainder_order[:remaining]:
+        quotas[key] += 1
+    return quotas
 
 
 def _record_ids(path: Path) -> set[str]:

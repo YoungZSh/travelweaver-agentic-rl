@@ -1,4 +1,4 @@
-"""Deterministically rebuild accepted rollout actions into action-only SFT conversations."""
+"""Deterministically rebuild accepted rollouts into replay-verified SFT conversations."""
 
 from __future__ import annotations
 
@@ -10,14 +10,21 @@ from collections import Counter
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
-from ..env import ChinaTravelBackend, ScenarioBackend, ScenarioSpec, TravelWeaverEnv
+from ..env import (
+    DEFAULT_MAX_VALID_STEPS,
+    ChinaTravelBackend,
+    ScenarioBackend,
+    ScenarioSpec,
+    TravelWeaverEnv,
+)
 from ..errors import SFTRebuildError, TaskNotFoundError
 from ..rollout.api_agent import (
     SUPPORTED_TRAJECTORY_VERSIONS,
     SYSTEM_PROMPT,
     USER_CONTENT_FORMAT,
+    render_system_prompt,
     render_task_user_content,
 )
 from ..rollout.tool_response import (
@@ -29,8 +36,25 @@ from ..rollout.tool_response import (
 from ..synthesis.polisher import validate_surface
 from ..synthesis.render import render_canonical
 from ..tasks import TaskBlueprint, TaskSurface, materialize_task_spec
+from .ordering import order_tool_arguments, order_tool_schemas
 
-SFT_FORMAT_VERSION = "travelweaver-sft-v2"
+SFT_FORMAT_VERSION = "travelweaver-sft-v4"
+SFTSupervisionMode = Literal["action_only", "react", "react_recovery"]
+SFT_SUPERVISION_MODES: tuple[SFTSupervisionMode, ...] = (
+    "action_only",
+    "react",
+    "react_recovery",
+)
+DEFAULT_SFT_SUPERVISION_MODE: SFTSupervisionMode = "action_only"
+
+
+def validate_supervision_mode(value: str) -> SFTSupervisionMode:
+    """Return a typed supervision mode or reject an unknown value."""
+
+    if value not in SFT_SUPERVISION_MODES:
+        choices = ", ".join(SFT_SUPERVISION_MODES)
+        raise ValueError(f"Unknown SFT supervision mode {value!r}; expected: {choices}.")
+    return cast(SFTSupervisionMode, value)
 
 
 @dataclass(frozen=True)
@@ -49,11 +73,15 @@ class SFTRebuildConfig:
     output_dir: Path
     repair_surface_semantics: bool = False
     tool_response_mode: str = DEFAULT_TOOL_RESPONSE_MODE
+    supervision_mode: str = DEFAULT_SFT_SUPERVISION_MODE
 
     def __post_init__(self) -> None:
         if not self.sources:
             raise ValueError("At least one SFT source is required.")
         validate_tool_response_mode(self.tool_response_mode)
+        mode = validate_supervision_mode(self.supervision_mode)
+        if mode in {"react", "react_recovery"} and self.repair_surface_semantics:
+            raise ValueError("ReAct SFT cannot change the user query after rollout generation.")
 
 
 @dataclass(frozen=True)
@@ -61,10 +89,14 @@ class SFTRebuildReport:
     """Summary of one completed reconstruction."""
 
     input_rows: int
+    reward_accepted_rows: int
     accepted_rows: int
+    mode_excluded_rows: int
     samples: int
     replayed_valid_actions: int
     invalid_actions_removed: int
+    invalid_actions_retained: int
+    masked_assistant_turns: int
     samples_with_invalid_actions: int
     cursor_remaps: int
     surface_repairs: int
@@ -123,21 +155,41 @@ def rebuild_sft_dataset(
     destinations = {
         "neutral": output / "neutral.jsonl",
         "audit": output / "audit.jsonl",
+        "exclusions": output / "exclusions.jsonl",
         "manifest": output / "manifest.json",
         "preview": output / "preview.md",
     }
     existing = [str(path) for path in destinations.values() if path.exists()]
     if existing:
         raise SFTRebuildError(f"Refusing to overwrite existing SFT artifacts: {existing}")
-    records: list[tuple[SFTSource, dict[str, Any]]] = []
+    reward_records: list[tuple[SFTSource, dict[str, Any]]] = []
     snapshots: dict[SFTSource, _SourceSnapshot] = {}
     input_rows = 0
     for source in config.sources:
         snapshots[source] = _load_source_snapshot(source.task_dir)
         rows = _read_jsonl(source.rollout_path)
         input_rows += len(rows)
-        records.extend((source, row) for row in rows if _is_accepted(row))
+        reward_records.extend((source, row) for row in rows if _is_accepted(row))
+    supervision_mode = validate_supervision_mode(config.supervision_mode)
+    records: list[tuple[SFTSource, dict[str, Any]]] = []
+    exclusions: list[dict[str, Any]] = []
+    for source, row in reward_records:
+        reason = _mode_exclusion_reason(row, supervision_mode)
+        if reason is None:
+            records.append((source, row))
+            continue
+        exclusions.append(
+            {
+                "format_version": SFT_FORMAT_VERSION,
+                "task_id": row.get("task_id"),
+                "episode_id": row.get("episode_id"),
+                "source_rollout": str(source.rollout_path.resolve()),
+                "supervision_mode": supervision_mode,
+                "reason": reason,
+            }
+        )
     records.sort(key=lambda item: (str(item[1]["task_id"]), str(item[1]["episode_id"])))
+    exclusions.sort(key=lambda item: (str(item["task_id"]), str(item["episode_id"])))
     task_ids = [str(row["task_id"]) for _, row in records]
     if len(task_ids) != len(set(task_ids)):
         duplicates = sorted(task_id for task_id, count in Counter(task_ids).items() if count > 1)
@@ -160,6 +212,7 @@ def rebuild_sft_dataset(
             prepared,
             backend,
             tool_response_mode=config.tool_response_mode,
+            supervision_mode=supervision_mode,
         )
         samples.append(sample)
         audits.append(audit)
@@ -171,12 +224,24 @@ def rebuild_sft_dataset(
 
     report = SFTRebuildReport(
         input_rows=input_rows,
+        reward_accepted_rows=len(reward_records),
         accepted_rows=len(records),
+        mode_excluded_rows=len(exclusions),
         samples=len(samples),
         replayed_valid_actions=sum(int(audit["replayed_valid_steps"]) for audit in audits),
         invalid_actions_removed=invalid_removed,
+        invalid_actions_retained=sum(
+            int(audit["invalid_actions_retained"]) for audit in audits
+        ),
+        masked_assistant_turns=sum(
+            int(audit["masked_assistant_turns"]) for audit in audits
+        ),
         samples_with_invalid_actions=sum(
-            int(int(audit["invalid_actions_removed"]) > 0) for audit in audits
+            int(
+                int(audit["invalid_actions_removed"]) > 0
+                or int(audit["invalid_actions_retained"]) > 0
+            )
+            for audit in audits
         ),
         cursor_remaps=sum(int(audit["cursor_remaps"]) for audit in audits),
         surface_repairs=sum(repaired.values()),
@@ -190,6 +255,7 @@ def rebuild_sft_dataset(
         "config": {
             "repair_surface_semantics": config.repair_surface_semantics,
             "tool_response_mode": config.tool_response_mode,
+            "supervision_mode": supervision_mode,
             "model_tool_response_version": MODEL_TOOL_RESPONSE_VERSION,
             "user_content_format": USER_CONTENT_FORMAT,
             "sources": [
@@ -205,9 +271,11 @@ def rebuild_sft_dataset(
         "tool_counts": dict(sorted(_tool_counts(samples).items())),
         "neutral_sha256": _jsonl_digest(samples),
         "audit_sha256": _jsonl_digest(audits),
+        "exclusions_sha256": _jsonl_digest(exclusions),
     }
     _atomic_jsonl(destinations["neutral"], samples)
     _atomic_jsonl(destinations["audit"], audits)
+    _atomic_jsonl(destinations["exclusions"], exclusions)
     _atomic_json(destinations["manifest"], manifest)
     _atomic_text(destinations["preview"], _preview(samples, audits))
     return report
@@ -237,6 +305,144 @@ def _is_accepted(row: dict[str, Any]) -> bool:
         and detail.get("reward_valid") is True
         and detail.get("all_hard_pass") is True
     )
+
+
+def _mode_exclusion_reason(
+    row: dict[str, Any],
+    supervision_mode: SFTSupervisionMode,
+) -> str | None:
+    if supervision_mode == "action_only":
+        return None
+    if _source_thinking(row) != "disabled":
+        return "react_requires_source_thinking_disabled"
+    steps = row.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return "react_requires_nonempty_steps"
+    if supervision_mode == "react" and any(not _step_is_valid(step) for step in steps):
+        return "react_invalid_action_not_supported"
+    try:
+        _react_source_context(row)
+        contents = _react_content_by_call_id(row)
+    except SFTRebuildError as error:
+        return f"react_message_alignment_error:{error}"
+    if not any(content.strip() for content in contents.values()):
+        return "react_requires_visible_assistant_content"
+    return None
+
+
+def _step_is_valid(step: Any) -> bool:
+    if not isinstance(step, dict):
+        return False
+    result = step.get("result")
+    info = result.get("info") if isinstance(result, dict) else None
+    return isinstance(info, dict) and info.get("valid_action") is True
+
+
+def _source_thinking(row: dict[str, Any]) -> str | None:
+    batch_metadata = row.get("batch_metadata")
+    value = batch_metadata.get("thinking") if isinstance(batch_metadata, dict) else None
+    return str(value) if isinstance(value, str) else None
+
+
+def _react_source_context(row: dict[str, Any]) -> tuple[str, str, int]:
+    task_id = str(row.get("task_id"))
+    messages = row.get("messages")
+    if not isinstance(messages, list) or len(messages) < 2:
+        raise SFTRebuildError(f"Trajectory {task_id} has no source prompt context.")
+    system, user = messages[:2]
+    supported_prompts = {
+        render_system_prompt(35): 35,
+        SYSTEM_PROMPT: DEFAULT_MAX_VALID_STEPS,
+    }
+    system_content = system.get("content") if isinstance(system, dict) else None
+    if (
+        not isinstance(system, dict)
+        or system.get("role") != "system"
+        or not isinstance(system_content, str)
+        or system_content not in supported_prompts
+    ):
+        raise SFTRebuildError(f"Trajectory {task_id} used a different system prompt.")
+    content = user.get("content") if isinstance(user, dict) and user.get("role") == "user" else None
+    if not isinstance(content, str) or not content.strip():
+        raise SFTRebuildError(f"Trajectory {task_id} has no natural-language source query.")
+    return system_content, content, supported_prompts[system_content]
+
+
+def _react_content_by_call_id(row: dict[str, Any]) -> dict[str, str]:
+    """Align visible no-thinking assistant text with each executed source action."""
+
+    task_id = str(row.get("task_id"))
+    raw_messages = row.get("messages")
+    raw_steps = row.get("steps")
+    if not isinstance(raw_messages, list) or not isinstance(raw_steps, list):
+        raise SFTRebuildError(f"Trajectory {task_id} has no replayable messages/steps.")
+    assistant_by_id: dict[str, tuple[str, str, dict[str, Any]]] = {}
+    for message in raw_messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        reasoning_content = message.get("reasoning_content")
+        if reasoning_content is not None and reasoning_content != "":
+            raise SFTRebuildError(f"Trajectory {task_id} contains hidden reasoning content.")
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list) or len(calls) != 1 or not isinstance(calls[0], dict):
+            raise SFTRebuildError(
+                f"Trajectory {task_id} assistant turns must contain exactly one tool call."
+            )
+        call = calls[0]
+        call_id = call.get("id")
+        function = call.get("function")
+        content = message.get("content")
+        if not isinstance(call_id, str) or not isinstance(function, dict):
+            raise SFTRebuildError(f"Trajectory {task_id} has an invalid assistant tool call.")
+        if content is None:
+            content = ""
+        if not isinstance(content, str):
+            raise SFTRebuildError(f"Trajectory {task_id} has non-text assistant content.")
+        raw_arguments = function.get("arguments")
+        if isinstance(raw_arguments, str):
+            try:
+                arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError:
+                arguments = {}
+        else:
+            arguments = raw_arguments
+        if not isinstance(arguments, dict) or not isinstance(function.get("name"), str):
+            raise SFTRebuildError(f"Trajectory {task_id} has non-object source arguments.")
+        if call_id in assistant_by_id:
+            raise SFTRebuildError(f"Trajectory {task_id} repeats tool call id {call_id}.")
+        assistant_by_id[call_id] = (content, str(function["name"]), arguments)
+
+    contents: dict[str, str] = {}
+    for step in raw_steps:
+        if not isinstance(step, dict):
+            raise SFTRebuildError(f"Trajectory {task_id} contains a non-object step.")
+        tool_call = step.get("tool_call")
+        action = step.get("action")
+        call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
+        if not isinstance(call_id, str) or not isinstance(action, dict):
+            raise SFTRebuildError(f"Trajectory {task_id} cannot align a source step.")
+        try:
+            content, tool_name, arguments = assistant_by_id[call_id]
+        except KeyError as error:
+            raise SFTRebuildError(
+                f"Trajectory {task_id} has no assistant message for call {call_id}."
+            ) from error
+        source_arguments = action.get("arguments")
+        legacy_malformed_match = (
+            not _step_is_valid(step)
+            and not isinstance(source_arguments, dict)
+            and arguments == {}
+        )
+        if tool_name != action.get("tool") or (
+            arguments != source_arguments and not legacy_malformed_match
+        ):
+            raise SFTRebuildError(
+                f"Trajectory {task_id} source message/action mismatch for call {call_id}."
+            )
+        contents[call_id] = content
+    if len(contents) != len(assistant_by_id):
+        raise SFTRebuildError(f"Trajectory {task_id} has unexecuted assistant tool calls.")
+    return contents
 
 
 def _prepare_task(
@@ -393,21 +599,47 @@ def _rebuild_one(
     base_backend: Any,
     *,
     tool_response_mode: str = DEFAULT_TOOL_RESPONSE_MODE,
+    supervision_mode: str = DEFAULT_SFT_SUPERVISION_MODE,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     response_mode = validate_tool_response_mode(tool_response_mode)
+    selected_supervision = validate_supervision_mode(supervision_mode)
     task_id = str(row["task_id"])
+    is_react = selected_supervision in {"react", "react_recovery"}
+    react_content = _react_content_by_call_id(row) if is_react else {}
+    output_system_prompt = SYSTEM_PROMPT
+    max_valid_steps = DEFAULT_MAX_VALID_STEPS
+    if is_react:
+        output_system_prompt, source_user_content, max_valid_steps = _react_source_context(row)
+        rebuilt_user_content = render_task_user_content(task.public)
+        if source_user_content != rebuilt_user_content:
+            raise SFTRebuildError(
+                f"ReAct trajectory {task_id} source and rebuilt user queries differ."
+            )
     raw_scenario = task.oracle.get("scenario")
     if not isinstance(raw_scenario, dict):
         raise SFTRebuildError(f"Generated task {task_id} has no scenario.")
     scenario = ScenarioSpec.from_dict(raw_scenario)
     store = _SingleTaskStore(task.public, task.oracle)
-    env = TravelWeaverEnv(ScenarioBackend(base_backend, scenario), store)  # type: ignore[arg-type]
+    env = TravelWeaverEnv(  # type: ignore[arg-type]
+        ScenarioBackend(base_backend, scenario),
+        store,
+        max_valid_steps=max_valid_steps,
+    )
+    model_tools = order_tool_schemas(env.tool_schemas())
+    source_tools = row.get("tools")
+    if not isinstance(source_tools, list) or _canonical_json(source_tools) != _canonical_json(
+        model_tools
+    ):
+        raise SFTRebuildError(f"Trajectory {task_id} tool schemas differ from the environment.")
     source_episode_id = str(row["episode_id"])
     cursor_old_to_new: dict[str, str] = {}
     cursor_new_to_old: dict[str, str] = {}
     messages: list[dict[str, Any]] = []
+    assistant_loss_mask: list[bool] = []
     invalid_steps: list[dict[str, Any]] = []
     valid_source_steps: list[dict[str, Any]] = []
+    replayed_steps = 0
+    argument_normalizations = 0
     try:
         reset = env.reset(task_id=task_id, seed=0).to_dict()
         runtime_episode_id = str(reset["episode_id"])
@@ -416,7 +648,7 @@ def _rebuild_one(
         )
         messages.extend(
             [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": output_system_prompt},
                 {
                     "role": "user",
                     "content": render_task_user_content(reset["task"]),
@@ -430,43 +662,89 @@ def _rebuild_one(
             if not isinstance(step, dict):
                 raise SFTRebuildError(f"Trajectory {task_id} contains a non-object step.")
             source_result = step.get("result")
-            valid = bool(
-                isinstance(source_result, dict)
-                and isinstance(source_result.get("info"), dict)
-                and source_result["info"].get("valid_action") is True
-            )
+            valid = _step_is_valid(step)
             if not valid:
+                if selected_supervision == "react":
+                    raise SFTRebuildError(
+                        f"ReAct trajectory {task_id} contains an invalid source action."
+                    )
                 invalid_steps.append(
                     _invalid_audit(step, valid_source_steps, raw_steps[position + 1 :])
                 )
-                continue
-            valid_source_steps.append(step)
+                if selected_supervision == "action_only":
+                    continue
+            else:
+                valid_source_steps.append(step)
             action = deepcopy(step.get("action"))
-            if not isinstance(action, dict) or not isinstance(action.get("arguments"), dict):
-                raise SFTRebuildError(f"Valid source step for {task_id} has no action object.")
-            output_action = deepcopy(action)
+            if not isinstance(action, dict) or not isinstance(action.get("tool"), str):
+                raise SFTRebuildError(f"Source step for {task_id} has no canonical action object.")
+            if not isinstance(action.get("arguments"), dict):
+                if valid or selected_supervision != "react_recovery":
+                    raise SFTRebuildError(
+                        f"Source step for {task_id} has non-object arguments."
+                    )
+                action["arguments"] = {}
+                argument_normalizations += 1
+            tool_name = str(action["tool"])
+            has_tool_schema = any(
+                isinstance(tool, dict)
+                and isinstance(tool.get("function"), dict)
+                and tool["function"].get("name") == tool_name
+                for tool in model_tools
+            )
+            if not has_tool_schema and not valid and selected_supervision == "react_recovery":
+                # An unknown tool name is itself a useful recoverable model error. It has no
+                # schema-directed ordering, and the corresponding assistant turn is masked.
+                ordered_arguments = deepcopy(action["arguments"])
+            else:
+                try:
+                    ordered_arguments = order_tool_arguments(
+                        tool_name, action["arguments"], model_tools
+                    )
+                except ValueError as error:
+                    raise SFTRebuildError(
+                        f"Cannot order source arguments for {task_id}: {error}"
+                    ) from error
+            output_action = {"tool": str(action["tool"]), "arguments": ordered_arguments}
             internal_action = deepcopy(action)
             if action.get("tool") == "next_page":
                 old_cursor = str(action["arguments"].get("cursor", ""))
-                try:
+                if old_cursor in cursor_old_to_new:
                     internal_action["arguments"]["cursor"] = cursor_old_to_new[old_cursor]
-                except KeyError as error:
+                elif valid or selected_supervision != "react_recovery":
                     raise SFTRebuildError(
                         f"Cannot remap cursor {old_cursor!r} for {task_id}."
-                    ) from error
+                    )
+                # A source-invalid unknown cursor has no runtime equivalent. Replaying the
+                # unchanged opaque value must still produce the same invalid-action class.
             result = env.step(internal_action)
-            if result.info.get("valid_action") is not True:
+            replayed_steps += 1
+            replay_valid = result.info.get("valid_action") is True
+            if replay_valid != valid:
                 error = result.observation.error or {}
                 raise SFTRebuildError(
-                    f"Replayed action became invalid for {task_id}: {action}; {error}"
+                    f"Replay changed action validity for {task_id}: {action}; {error}"
                 )
-            _record_cursor_mapping(
-                source_result,
-                result.to_dict(),
-                cursor_old_to_new,
-                cursor_new_to_old,
+            if valid:
+                _record_cursor_mapping(
+                    source_result,
+                    result.to_dict(),
+                    cursor_old_to_new,
+                    cursor_new_to_old,
+                )
+            elif _step_error_code(step) != _result_error_code(result.to_dict()):
+                raise SFTRebuildError(
+                    f"Replay changed invalid-action error code for {task_id}."
+                )
+            tool_call = step.get("tool_call")
+            source_call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
+            visible_content = (
+                react_content[str(source_call_id)]
+                if is_react
+                else ""
             )
-            messages.append(_assistant_message(output_action))
+            messages.append(_assistant_message(output_action, content=visible_content))
+            assistant_loss_mask.append(valid)
             if not result.terminated and not result.truncated:
                 model_tool_response = serialize_model_tool_response(
                     result,
@@ -478,7 +756,7 @@ def _rebuild_one(
                     source_episode_id,
                     cursor_new_to_old,
                 )
-                messages.append({"role": "tool", "content": _compact_json(normalized)})
+                messages.append({"role": "tool", "content": _model_json(normalized)})
         terminal = result if valid_source_steps else None
         if terminal is None or not terminal.terminated or terminal.truncated:
             raise SFTRebuildError(f"Replayed trajectory {task_id} did not terminate normally.")
@@ -497,7 +775,7 @@ def _rebuild_one(
     sample_id = "tw_sft_" + hashlib.sha256(
         (
             f"{SFT_FORMAT_VERSION}:{MODEL_TOOL_RESPONSE_VERSION}:"
-            f"{response_mode}:{task_id}:{source_episode_id}"
+            f"{response_mode}:{selected_supervision}:{task_id}:{source_episode_id}"
         ).encode()
     ).hexdigest()[:24]
     sample = {
@@ -507,8 +785,10 @@ def _rebuild_one(
         "tool_response_mode": response_mode,
         "model_tool_response_version": MODEL_TOOL_RESPONSE_VERSION,
         "user_content_format": USER_CONTENT_FORMAT,
+        "supervision_mode": selected_supervision,
+        "assistant_loss_mask": assistant_loss_mask,
         "messages": messages,
-        "tools": deepcopy(row["tools"]),
+        "tools": model_tools,
         "enable_thinking": False,
     }
     audit = {
@@ -523,10 +803,24 @@ def _rebuild_one(
         "tool_response_mode": response_mode,
         "model_tool_response_version": MODEL_TOOL_RESPONSE_VERSION,
         "user_content_format": USER_CONTENT_FORMAT,
+        "supervision_mode": selected_supervision,
+        "source_thinking": _source_thinking(row),
         "source_step_count": len(row.get("steps", [])),
         "replayed_valid_steps": len(valid_source_steps),
-        "invalid_actions_removed": len(invalid_steps),
+        "replayed_steps": replayed_steps,
+        "invalid_actions_removed": (
+            len(invalid_steps) if selected_supervision == "action_only" else 0
+        ),
+        "invalid_actions_retained": (
+            len(invalid_steps) if selected_supervision == "react_recovery" else 0
+        ),
+        "masked_assistant_turns": sum(not value for value in assistant_loss_mask),
+        "legacy_argument_normalizations": argument_normalizations,
         "invalid_actions": invalid_steps,
+        "assistant_turns_with_content": sum(
+            message["role"] == "assistant" and bool(message["content"].strip())
+            for message in messages
+        ),
         "surface_repair": task.repair_kind,
         "original_query": task.original_query if task.repair_kind else None,
         "rebuilt_query": task.public["query"] if task.repair_kind else None,
@@ -538,10 +832,10 @@ def _rebuild_one(
     return sample, audit
 
 
-def _assistant_message(action: dict[str, Any]) -> dict[str, Any]:
+def _assistant_message(action: dict[str, Any], *, content: str = "") -> dict[str, Any]:
     return {
         "role": "assistant",
-        "content": "",
+        "content": content,
         "tool_calls": [
             {
                 "type": "function",
@@ -584,8 +878,24 @@ def _invalid_audit(
             valid_steps[-1].get("action", {}).get("tool") if valid_steps else None
         ),
         "next_valid_tool": next_valid_tool,
+        "error_code": error.get("code"),
         "error": error.get("message"),
     }
+
+
+def _step_error_code(step: dict[str, Any]) -> str | None:
+    result = step.get("result")
+    observation = result.get("observation") if isinstance(result, dict) else None
+    error = observation.get("error") if isinstance(observation, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return str(code) if isinstance(code, str) else None
+
+
+def _result_error_code(result: dict[str, Any]) -> str | None:
+    observation = result.get("observation")
+    error = observation.get("error") if isinstance(observation, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return str(code) if isinstance(code, str) else None
 
 
 def _record_cursor_mapping(
@@ -702,8 +1012,14 @@ def _preview(samples: list[dict[str, Any]], audits: list[dict[str, Any]]) -> str
     selected: list[int] = []
     for predicate in (
         lambda audit: audit["surface_repair"] is not None,
-        lambda audit: audit["invalid_actions_removed"] > 0,
-        lambda audit: audit["invalid_actions_removed"] == 0,
+        lambda audit: (
+            audit["invalid_actions_removed"] > 0
+            or audit["invalid_actions_retained"] > 0
+        ),
+        lambda audit: (
+            audit["invalid_actions_removed"] == 0
+            and audit["invalid_actions_retained"] == 0
+        ),
     ):
         selected.extend(
             index
@@ -721,23 +1037,37 @@ def _preview(samples: list[dict[str, Any]], audits: list[dict[str, Any]]) -> str
             for message in sample["messages"]
             if message["role"] == "assistant"
         ]
+        visible_contents = [
+            message["content"].strip().replace("\n", " ")
+            for message in sample["messages"]
+            if message["role"] == "assistant" and message["content"].strip()
+        ]
         lines.extend(
             [
                 f"## {sample['task_id']}",
                 "",
                 f"- 题面：{query}",
+                f"- 监督模式：{sample['supervision_mode']}",
                 f"- 有效动作：{len(tools)}",
+                f"- 可见思考回合：{len(visible_contents)}",
                 f"- 删除 invalid：{audit['invalid_actions_removed']}",
+                f"- 保留并 mask invalid：{audit['invalid_actions_retained']}",
                 f"- 题面修复：{audit['surface_repair'] or '无'}",
                 f"- 工具序列：{' → '.join(tools)}",
                 "",
             ]
         )
+        if visible_contents:
+            lines.extend([f"- 思考预览：{visible_contents[0][:300]}", ""])
     return "\n".join(lines)
 
 
-def _compact_json(value: Any) -> str:
+def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _model_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
 
 
 def _sha256_file(path: Path) -> str:
@@ -751,13 +1081,13 @@ def _sha256_file(path: Path) -> str:
 def _jsonl_digest(rows: list[dict[str, Any]]) -> str:
     digest = hashlib.sha256()
     for row in rows:
-        digest.update(_compact_json(row).encode())
+        digest.update(_model_json(row).encode())
         digest.update(b"\n")
     return digest.hexdigest()
 
 
 def _atomic_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    _atomic_text(path, "".join(_compact_json(row) + "\n" for row in rows))
+    _atomic_text(path, "".join(_model_json(row) + "\n" for row in rows))
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:

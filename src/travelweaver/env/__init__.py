@@ -2,6 +2,7 @@
 
 from .backend import ChinaTravelBackend, InMemoryBackend
 from .environment import (
+    DEFAULT_MAX_VALID_STEPS,
     ENVIRONMENT_VERSION,
     OBSERVATION_VERSION,
     TOOLS_VERSION,
@@ -12,6 +13,7 @@ from .scenario import SCENARIO_VERSION, ScenarioBackend, ScenarioEffect, Scenari
 
 __all__ = [
     "ChinaTravelBackend",
+    "DEFAULT_MAX_VALID_STEPS",
     "ENVIRONMENT_VERSION",
     "EvidenceBundle",
     "InMemoryBackend",

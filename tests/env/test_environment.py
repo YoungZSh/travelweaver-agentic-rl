@@ -16,7 +16,7 @@ def _step(env: TravelWeaverEnv, tool: str, **arguments: object):
 
 def test_all_eight_tools_and_pagination(env: TravelWeaverEnv) -> None:
     reset = env.reset("task-hangzhou")
-    assert reset.remaining_steps == 35
+    assert reset.remaining_steps == 50
     assert len(env.tool_schemas()) == 13
 
     attractions = _step(env, "search_attractions", city="杭州")
@@ -122,12 +122,24 @@ def test_step_limit_truncates(backend, task_store) -> None:
     assert final.info["termination_reason"] == "step_limit"
 
 
-def test_default_step_limit_truncates_after_35_valid_actions(backend, task_store) -> None:
+def test_terminal_action_is_allowed_on_the_last_valid_step(backend, task_store) -> None:
+    env = TravelWeaverEnv(backend, task_store, max_valid_steps=1)
+    env.reset("task-hangzhou")
+
+    final = _step(env, "finish_without_plan", reason="无解")
+
+    assert final.terminated
+    assert not final.truncated
+    assert final.observation.remaining_steps == 0
+    assert final.info["termination_reason"] == "finished_without_plan"
+
+
+def test_default_step_limit_truncates_after_50_valid_actions(backend, task_store) -> None:
     env = TravelWeaverEnv(backend, task_store)
     reset = env.reset("task-hangzhou")
-    assert reset.remaining_steps == 35
+    assert reset.remaining_steps == 50
 
-    for expected_remaining in range(34, 0, -1):
+    for expected_remaining in range(49, 0, -1):
         step = _step(env, "search_attractions", city="杭州")
         assert not step.truncated
         assert step.observation.remaining_steps == expected_remaining
