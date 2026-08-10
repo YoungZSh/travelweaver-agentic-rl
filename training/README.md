@@ -163,6 +163,10 @@ run name `qwen3.5-4b-multiturn-sft-v2-natural-633-a800x2-seed20260809`. Its loca
 live under the experiment output directory, and a persisted W&B run ID allows checkpoint-based
 launcher restarts to resume the same dashboard run.
 
+The local training entry point also passes `trainer.seed` to veRL's shuffled
+`DistributedSampler`. Model initialization, stochastic training operations, and the per-epoch data
+permutation therefore share the configured experiment seed instead of the PyTorch sampler default.
+
 The launcher saves every 10 optimizer steps and also saves the final step. It retains only the
 newest checkpoint after each save completes. Each checkpoint contains resumable model/optimizer
 state and a Hugging Face export. Logs live alongside checkpoints under the experiment output
@@ -177,6 +181,12 @@ TRAIN_BATCH_SIZE=8 MAX_TOKEN_LEN_PER_GPU=12288 \
 Checkpoint and tracking settings can likewise be overridden with `SAVE_FREQ`,
 `MAX_CKPT_TO_KEEP`, `RUN_DIR`, `PROJECT_NAME`, `EXPERIMENT_NAME`, and standard `WANDB_*`
 environment variables.
+
+On hosts where `/data2/yzs/gpu_hold.py` protects GPU 0/1, set `GPU_HOLD_HANDOFF=1`. The launcher
+keeps the holder active throughout preflight, stops the single verified holder immediately before
+starting `torchrun`, and installs an `EXIT/INT/TERM` trap that `exec`s the same holder after normal
+completion or failure. It refuses an ambiguous zero- or multi-holder takeover instead of killing
+unrelated GPU processes.
 
 Do not launch until every selected GPU is actually free; the script deliberately does not stop GPU
 holders or other users' processes. Additional veRL Hydra overrides may be appended after the script

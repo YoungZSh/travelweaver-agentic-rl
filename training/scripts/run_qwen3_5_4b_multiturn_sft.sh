@@ -10,6 +10,9 @@ MODEL_PATH="${MODEL_PATH:-ckpts/Qwen3.5-4B}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 NUM_GPUS=2
 SP_SIZE="${SP_SIZE:-2}"
+GPU_HOLD_HANDOFF="${GPU_HOLD_HANDOFF:-0}"
+GPU_HOLD_PYTHON="${GPU_HOLD_PYTHON:-/data2/yzs/.conda/envs/glq_sft/bin/python}"
+GPU_HOLD_SCRIPT="${GPU_HOLD_SCRIPT:-/data2/yzs/gpu_hold.py}"
 
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
 MAX_LENGTH="${MAX_LENGTH:-32768}"
@@ -55,6 +58,10 @@ if [[ "${CUDA_VISIBLE_DEVICES}" != "0,1" ]]; then
 fi
 if [[ "${FUSED_KERNEL_BACKEND}" != "triton" && "${FUSED_KERNEL_BACKEND}" != "torch" ]]; then
     echo "FUSED_KERNEL_BACKEND must be triton or torch." >&2
+    exit 1
+fi
+if [[ "${GPU_HOLD_HANDOFF}" != "0" && "${GPU_HOLD_HANDOFF}" != "1" ]]; then
+    echo "GPU_HOLD_HANDOFF must be 0 or 1." >&2
     exit 1
 fi
 if (( NUM_GPUS < 1 || SP_SIZE < 1 || NUM_GPUS % SP_SIZE != 0 )); then
@@ -263,6 +270,52 @@ if [[ "${DRY_RUN}" == "1" ]]; then
     training/.venv/bin/python training/scripts/run_verl_sft.py \
         --cfg job --resolve "${OVERRIDES[@]}" "$@"
     exit 0
+fi
+
+gpu_holder_pids() {
+    pgrep -u "$(id -u)" -f -- "${GPU_HOLD_SCRIPT} --gpus 0,1 --force$" || true
+}
+
+restore_gpu_holder() {
+    local status=$?
+    trap - EXIT INT TERM
+    if [[ "${GPU_HOLD_HANDOFF}" == "1" ]]; then
+        if [[ -n "$(gpu_holder_pids)" ]]; then
+            echo "GPU holder for 0/1 is already running; not starting a duplicate."
+            exit "${status}"
+        fi
+        if [[ -f "${GPU_HOLD_SCRIPT}" && -x "${GPU_HOLD_PYTHON}" ]]; then
+            echo "Restoring GPU holder on 0/1 after SFT exit (status=${status})."
+            exec "${GPU_HOLD_PYTHON}" -u "${GPU_HOLD_SCRIPT}" --gpus 0,1 --force
+        fi
+        echo "Cannot restore GPU holder: missing script or Python interpreter." >&2
+    fi
+    exit "${status}"
+}
+
+stop_gpu_holder() {
+    local -a holder_pids=()
+    mapfile -t holder_pids < <(gpu_holder_pids)
+    if (( ${#holder_pids[@]} != 1 )); then
+        echo "Expected exactly one GPU holder for 0/1, found ${#holder_pids[@]}." >&2
+        return 1
+    fi
+    echo "Stopping GPU holder PID ${holder_pids[0]} immediately before SFT startup."
+    kill -TERM "${holder_pids[0]}"
+    for _ in $(seq 1 30); do
+        if ! kill -0 "${holder_pids[0]}" 2>/dev/null; then
+            echo "GPU holder stopped; handing GPU 0/1 to SFT."
+            return 0
+        fi
+        sleep 1
+    done
+    echo "GPU holder PID ${holder_pids[0]} did not stop within 30 seconds." >&2
+    return 1
+}
+
+if [[ "${GPU_HOLD_HANDOFF}" == "1" ]]; then
+    trap restore_gpu_holder EXIT INT TERM
+    stop_gpu_holder
 fi
 
 mkdir -p "${CHECKPOINT_DIR}" "${LOG_DIR}" "${WANDB_DIR}"
