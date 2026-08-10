@@ -21,10 +21,11 @@ SEED="${SEED:-20260809}"
 FUSED_KERNEL_BACKEND="${FUSED_KERNEL_BACKEND:-triton}"
 
 PROJECT_NAME="${PROJECT_NAME:-travelweaver-sft}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3.5-4b-multiturn-action-633-sft-v2-natural}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3.5-4b-multiturn-sft-v2-natural-633-a800x2-seed${SEED}}"
 RUN_DIR="${RUN_DIR:-training/outputs/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RUN_DIR}/checkpoints}"
 LOG_DIR="${LOG_DIR:-${RUN_DIR}/logs}"
+WANDB_DIR="${WANDB_DIR:-${RUN_DIR}/wandb}"
 SAVE_FREQ="${SAVE_FREQ:-10}"
 MAX_CKPT_TO_KEEP="${MAX_CKPT_TO_KEEP:-1}"
 RESUME_MODE="${RESUME_MODE:-auto}"
@@ -80,6 +81,7 @@ MODEL_PATH="$(realpath "${MODEL_PATH}")"
 RUN_DIR="$(realpath -m "${RUN_DIR}")"
 CHECKPOINT_DIR="$(realpath -m "${CHECKPOINT_DIR}")"
 LOG_DIR="$(realpath -m "${LOG_DIR}")"
+WANDB_DIR="$(realpath -m "${WANDB_DIR}")"
 DATASET_CLASS="${PROJECT_ROOT}/training/src/travelweaver_sft_dataset.py"
 
 export CUDA_VISIBLE_DEVICES
@@ -88,6 +90,10 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export WANDB_DIR
+export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_RESUME="${WANDB_RESUME:-allow}"
+export WANDB_JOB_TYPE="${WANDB_JOB_TYPE:-sft}"
 
 if [[ "${SKIP_PREFLIGHT}" != "1" ]]; then
     training/.venv/bin/python - \
@@ -116,7 +122,7 @@ required = {
     "tools_json",
     "enable_thinking",
 }
-frame = pd.read_parquet(train_file, columns=list(required))
+frame = pd.read_parquet(train_file)
 missing = required - set(frame.columns)
 if missing:
     raise SystemExit(f"SFT Parquet is missing columns: {sorted(missing)}")
@@ -131,6 +137,11 @@ manifest_path = train_file.parent / "manifest.json"
 sequence_max = None
 if manifest_path.exists():
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format_version") == "travelweaver-sft-v4":
+        if "assistant_loss_mask_json" not in frame.columns:
+            raise SystemExit("SFT V4 Parquet is missing assistant_loss_mask_json.")
+        if frame["assistant_loss_mask_json"].isna().any():
+            raise SystemExit("SFT V4 Parquet contains a null assistant loss mask.")
     adapter = manifest.get("qwen_adapter", {})
     expected_digest = adapter.get("parquet_sha256")
     if expected_digest:
@@ -239,7 +250,7 @@ OVERRIDES=(
     "trainer.total_training_steps=null"
     "trainer.save_freq=${SAVE_FREQ}"
     "trainer.test_freq=-1"
-    "trainer.logger=[console]"
+    "trainer.logger=[console,wandb]"
     "trainer.seed=${SEED}"
     "trainer.resume_mode=${RESUME_MODE}"
     "trainer.max_ckpt_to_keep=${MAX_CKPT_TO_KEEP}"
@@ -254,10 +265,22 @@ if [[ "${DRY_RUN}" == "1" ]]; then
     exit 0
 fi
 
-mkdir -p "${CHECKPOINT_DIR}" "${LOG_DIR}"
+mkdir -p "${CHECKPOINT_DIR}" "${LOG_DIR}" "${WANDB_DIR}"
+
+# Keep one W&B run across checkpoint-based launcher restarts.
+WANDB_RUN_ID_FILE="${RUN_DIR}/wandb-run-id.txt"
+if [[ -f "${WANDB_RUN_ID_FILE}" ]]; then
+    read -r WANDB_RUN_ID < "${WANDB_RUN_ID_FILE}"
+else
+    WANDB_RUN_ID="$(training/.venv/bin/python -c 'import wandb; print(wandb.util.generate_id())')"
+    printf '%s\n' "${WANDB_RUN_ID}" > "${WANDB_RUN_ID_FILE}.tmp"
+    mv "${WANDB_RUN_ID_FILE}.tmp" "${WANDB_RUN_ID_FILE}"
+fi
+export WANDB_RUN_ID
+
 RUN_LOG="${LOG_DIR}/${EXPERIMENT_NAME}-$(date +%Y%m%d-%H%M%S).log"
 
-echo "Starting TravelWeaver multi-turn SFT; log: ${RUN_LOG}"
+echo "Starting TravelWeaver multi-turn SFT; W&B: ${PROJECT_NAME}/${EXPERIMENT_NAME}; log: ${RUN_LOG}"
 training/.venv/bin/torchrun --standalone --nnodes=1 --nproc-per-node="${NUM_GPUS}" \
     training/scripts/run_verl_sft.py "${OVERRIDES[@]}" "$@" 2>&1 | tee "${RUN_LOG}"
 

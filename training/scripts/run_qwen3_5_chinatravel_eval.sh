@@ -10,17 +10,81 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.5-4b}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
 CONCURRENCY="${CONCURRENCY:-32}"
-MAX_API_TURNS="${MAX_API_TURNS:-40}"
+MAX_API_TURNS="${MAX_API_TURNS:-60}"
 MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-8192}"
 GPU_HOLD_PYTHON="${GPU_HOLD_PYTHON:-/data2/yzs/.conda/envs/glq_sft/bin/python}"
 GPU_HOLD_SCRIPT="${GPU_HOLD_SCRIPT:-/data2/yzs/gpu_hold.py}"
 
-OUTPUT_PATH="training/outputs/chinatravel-official-654-qwen3.5-4b-native-agent.jsonl"
-ERROR_PATH="training/outputs/chinatravel-official-654-qwen3.5-4b-native-agent-errors.jsonl"
-SERVER_LOG="training/logs/qwen3_5_4b_chinatravel_server-resume.log"
-RUNNER_LOG="training/logs/qwen3_5_4b_chinatravel_benchmark.log"
+OUTPUT_PATH="${OUTPUT_PATH:-training/outputs/chinatravel-official-654-qwen3.5-4b-native-agent.jsonl}"
+ERROR_PATH="${ERROR_PATH:-training/outputs/chinatravel-official-654-qwen3.5-4b-native-agent-errors.jsonl}"
+SERVER_LOG="${SERVER_LOG:-training/logs/qwen3_5_4b_chinatravel_server-resume.log}"
+RUNNER_LOG="${RUNNER_LOG:-training/logs/qwen3_5_4b_chinatravel_benchmark.log}"
+SUMMARY_PATH="${SUMMARY_PATH:-${OUTPUT_PATH%.jsonl}-summary.json}"
+MANIFEST_PATH="${MANIFEST_PATH:-${OUTPUT_PATH%.jsonl}-manifest.json}"
+BASELINE_OUTPUT_PATH="${BASELINE_OUTPUT_PATH:-training/outputs/chinatravel-official-654-qwen3.5-4b-native-agent.jsonl}"
+BASELINE_ERROR_PATH="${BASELINE_ERROR_PATH:-training/outputs/chinatravel-official-654-qwen3.5-4b-native-agent-errors.jsonl}"
+COMPARISON_PATH="${COMPARISON_PATH:-${OUTPUT_PATH%.jsonl}-vs-base.json}"
 
-mkdir -p training/logs training/outputs
+MODEL_PATH="$(realpath "${MODEL_PATH}")"
+if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
+    echo "Model checkpoint does not exist: ${MODEL_PATH}" >&2
+    exit 1
+fi
+
+mkdir -p \
+    "$(dirname "${OUTPUT_PATH}")" \
+    "$(dirname "${ERROR_PATH}")" \
+    "$(dirname "${SERVER_LOG}")" \
+    "$(dirname "${RUNNER_LOG}")" \
+    "$(dirname "${SUMMARY_PATH}")" \
+    "$(dirname "${MANIFEST_PATH}")" \
+    "$(dirname "${COMPARISON_PATH}")"
+
+uv run python - \
+    "${MANIFEST_PATH}" "${MODEL_PATH}" "${SERVED_MODEL_NAME}" \
+    "${OUTPUT_PATH}" "${ERROR_PATH}" "${CONCURRENCY}" \
+    "${MAX_API_TURNS}" "${MAX_COMPLETION_TOKENS}" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+(
+    manifest_path,
+    model_path,
+    served_model_name,
+    output_path,
+    error_path,
+    concurrency,
+    max_api_turns,
+    max_completion_tokens,
+) = sys.argv[1:]
+manifest = {
+    "schema_version": "travelweaver-benchmark-rollout-run-v1",
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "benchmark": {"split": "benchmark", "expected_tasks": 654},
+    "model": {"path": model_path, "served_name": served_model_name},
+    "rollout": {
+        "output_path": output_path,
+        "error_path": error_path,
+        "concurrency": int(concurrency),
+        "max_api_turns": int(max_api_turns),
+        "max_completion_tokens": int(max_completion_tokens),
+        "enable_thinking": False,
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "seed": 20260808,
+        "tool_response_mode": "delta",
+    },
+}
+Path(manifest_path).write_text(
+    json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
 
 server_pid=""
 
@@ -96,7 +160,7 @@ OPENAI_TEMPERATURE=0.7 \
 runner_status=${PIPESTATUS[0]}
 set -e
 
-uv run python - "${OUTPUT_PATH}" "${ERROR_PATH}" <<'PY'
+uv run python - "${OUTPUT_PATH}" "${ERROR_PATH}" <<'PY' | tee "${SUMMARY_PATH}"
 import collections
 import json
 import sys
@@ -129,5 +193,62 @@ print(
     flush=True,
 )
 PY
+
+if [[ -f "${BASELINE_OUTPUT_PATH}" && -f "${BASELINE_ERROR_PATH}" ]]; then
+    uv run python - \
+        "${BASELINE_OUTPUT_PATH}" "${BASELINE_ERROR_PATH}" \
+        "${OUTPUT_PATH}" "${ERROR_PATH}" "${COMPARISON_PATH}" <<'PY'
+import collections
+import json
+import sys
+from pathlib import Path
+
+
+def load_jsonl(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def summarize(output_path: Path, error_path: Path) -> dict:
+    rows = load_jsonl(output_path)
+    errors = load_jsonl(error_path)
+    attempts = len(rows) + len(errors)
+    accepted = sum(bool(row.get("success")) for row in rows)
+    return {
+        "completed_trajectories": len(rows),
+        "error_records": len(errors),
+        "total_attempts": attempts,
+        "accepted": accepted,
+        "accept_rate_all_attempts": accepted / attempts if attempts else None,
+        "termination_reasons": dict(
+            collections.Counter(str(row.get("termination_reason")) for row in rows)
+        ),
+        "error_types": dict(
+            collections.Counter(str(row.get("error_type")) for row in errors)
+        ),
+    }
+
+
+baseline = summarize(Path(sys.argv[1]), Path(sys.argv[2]))
+trained = summarize(Path(sys.argv[3]), Path(sys.argv[4]))
+baseline_rate = baseline["accept_rate_all_attempts"]
+trained_rate = trained["accept_rate_all_attempts"]
+comparison = {
+    "schema_version": "travelweaver-benchmark-comparison-v1",
+    "baseline": baseline,
+    "trained": trained,
+    "trained_minus_baseline": {
+        "accepted": trained["accepted"] - baseline["accepted"],
+        "accept_rate_all_attempts": (
+            trained_rate - baseline_rate
+            if trained_rate is not None and baseline_rate is not None
+            else None
+        ),
+    },
+}
+text = json.dumps(comparison, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+Path(sys.argv[5]).write_text(text, encoding="utf-8")
+print(text, end="")
+PY
+fi
 
 exit "${runner_status}"
