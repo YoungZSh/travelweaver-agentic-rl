@@ -28,3 +28,6 @@ data/sft/
 training/checkpoints/
 training/logs/
 training/outputs/
+training/wandb/
+training/ray_results/
+training/.cache/
