@@ -7,6 +7,7 @@ cd "${PROJECT_ROOT}"
 
 MODEL_PATH="${MODEL_PATH:-ckpts/Qwen3.5-4B}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.5-4b}"
+BENCHMARK_SPLIT="${BENCHMARK_SPLIT:-benchmark}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
 CONCURRENCY="${CONCURRENCY:-32}"
@@ -14,9 +15,34 @@ MAX_API_TURNS="${MAX_API_TURNS:-60}"
 MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-8192}"
 GPU_HOLD_PYTHON="${GPU_HOLD_PYTHON:-/data2/yzs/.conda/envs/glq_sft/bin/python}"
 GPU_HOLD_SCRIPT="${GPU_HOLD_SCRIPT:-/data2/yzs/gpu_hold.py}"
+GPU_HOLD_HANDOFF="${GPU_HOLD_HANDOFF:-1}"
 
-OUTPUT_PATH="${OUTPUT_PATH:-training/outputs/chinatravel-official-654-qwen3.5-4b-native-agent.jsonl}"
-ERROR_PATH="${ERROR_PATH:-training/outputs/chinatravel-official-654-qwen3.5-4b-native-agent-errors.jsonl}"
+case "${BENCHMARK_SPLIT}" in
+    easy)
+        EXPECTED_TASKS=300
+        ;;
+    medium)
+        EXPECTED_TASKS=150
+        ;;
+    human)
+        EXPECTED_TASKS=154
+        ;;
+    benchmark)
+        EXPECTED_TASKS=654
+        ;;
+    *)
+        echo "Unsupported BENCHMARK_SPLIT=${BENCHMARK_SPLIT}." >&2
+        exit 1
+        ;;
+esac
+
+if [[ "${BENCHMARK_SPLIT}" == "benchmark" ]]; then
+    DEFAULT_OUTPUT_PATH="training/outputs/chinatravel-official-654-qwen3.5-4b-native-agent.jsonl"
+else
+    DEFAULT_OUTPUT_PATH="training/outputs/chinatravel-official-${BENCHMARK_SPLIT}-${EXPECTED_TASKS}-qwen3.5-4b-native-agent.jsonl"
+fi
+OUTPUT_PATH="${OUTPUT_PATH:-${DEFAULT_OUTPUT_PATH}}"
+ERROR_PATH="${ERROR_PATH:-${OUTPUT_PATH%.jsonl}-errors.jsonl}"
 SERVER_LOG="${SERVER_LOG:-training/logs/qwen3_5_4b_chinatravel_server-resume.log}"
 RUNNER_LOG="${RUNNER_LOG:-training/logs/qwen3_5_4b_chinatravel_benchmark.log}"
 SUMMARY_PATH="${SUMMARY_PATH:-${OUTPUT_PATH%.jsonl}-summary.json}"
@@ -43,7 +69,8 @@ mkdir -p \
 uv run python - \
     "${MANIFEST_PATH}" "${MODEL_PATH}" "${SERVED_MODEL_NAME}" \
     "${OUTPUT_PATH}" "${ERROR_PATH}" "${CONCURRENCY}" \
-    "${MAX_API_TURNS}" "${MAX_COMPLETION_TOKENS}" <<'PY'
+    "${MAX_API_TURNS}" "${MAX_COMPLETION_TOKENS}" \
+    "${BENCHMARK_SPLIT}" "${EXPECTED_TASKS}" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -58,11 +85,13 @@ from pathlib import Path
     concurrency,
     max_api_turns,
     max_completion_tokens,
+    benchmark_split,
+    expected_tasks,
 ) = sys.argv[1:]
 manifest = {
     "schema_version": "travelweaver-benchmark-rollout-run-v1",
     "created_at": datetime.now(timezone.utc).isoformat(),
-    "benchmark": {"split": "benchmark", "expected_tasks": 654},
+    "benchmark": {"split": benchmark_split, "expected_tasks": int(expected_tasks)},
     "model": {"path": model_path, "served_name": served_model_name},
     "rollout": {
         "output_path": output_path,
@@ -88,6 +117,10 @@ PY
 
 server_pid=""
 
+gpu_holder_pids() {
+    pgrep -u "$(id -u)" -f -- "${GPU_HOLD_SCRIPT} --gpus 0,1 --force$" || true
+}
+
 restore_gpu_hold() {
     local status=$?
     trap - EXIT INT TERM
@@ -99,12 +132,50 @@ restore_gpu_hold() {
         done
         kill -KILL "${server_pid}" 2>/dev/null || true
     fi
+    if [[ "${GPU_HOLD_HANDOFF}" != "1" ]]; then
+        exit "${status}"
+    fi
+    if [[ -n "$(gpu_holder_pids)" ]]; then
+        echo "GPU holder for 0/1 is already running; not starting a duplicate."
+        exit "${status}"
+    fi
     if [[ -f "${GPU_HOLD_SCRIPT}" && -x "${GPU_HOLD_PYTHON}" ]]; then
+        echo "Restoring GPU holder on 0/1 after benchmark exit (status=${status})."
         exec "${GPU_HOLD_PYTHON}" -u "${GPU_HOLD_SCRIPT}" --gpus 0,1 --force
     fi
+    echo "Cannot restore GPU holder: missing script or Python interpreter." >&2
     exit "${status}"
 }
+
+stop_gpu_holder() {
+    local -a holder_pids=()
+    mapfile -t holder_pids < <(gpu_holder_pids)
+    if (( ${#holder_pids[@]} == 0 )); then
+        echo "No active GPU holder for 0/1; proceeding with benchmark."
+        return 0
+    fi
+    if (( ${#holder_pids[@]} != 1 )); then
+        echo "Expected at most one GPU holder for 0/1, found ${#holder_pids[@]}." >&2
+        return 1
+    fi
+    echo "Stopping GPU holder PID ${holder_pids[0]} immediately before benchmark startup."
+    kill -TERM "${holder_pids[0]}"
+    for _ in $(seq 1 30); do
+        if ! kill -0 "${holder_pids[0]}" 2>/dev/null; then
+            echo "GPU holder stopped; handing GPU 0/1 to benchmark."
+            return 0
+        fi
+        sleep 1
+    done
+    echo "GPU holder PID ${holder_pids[0]} did not stop within 30 seconds." >&2
+    return 1
+}
+
 trap restore_gpu_hold EXIT INT TERM
+
+if [[ "${GPU_HOLD_HANDOFF}" == "1" ]]; then
+    stop_gpu_holder
+fi
 
 CUDA_VISIBLE_DEVICES=0,1 training/.venv/bin/vllm serve "${MODEL_PATH}" \
     --host "${HOST}" \
@@ -152,7 +223,7 @@ OPENAI_TIMEOUT_SECONDS=600 \
 OPENAI_MAX_TOKENS="${MAX_COMPLETION_TOKENS}" \
 OPENAI_TEMPERATURE=0.7 \
     uv run travelweaver rollout-benchmark \
-        --split benchmark \
+        --split "${BENCHMARK_SPLIT}" \
         --output "${OUTPUT_PATH}" \
         --errors "${ERROR_PATH}" \
         --concurrency "${CONCURRENCY}" \
@@ -179,7 +250,9 @@ print(
             "error_records": len(errors),
             "total_attempts": len(rows) + len(errors),
             "accepted": accepted,
-            "accept_rate_all_attempts": accepted / (len(rows) + len(errors)),
+            "accept_rate_all_attempts": (
+                accepted / (len(rows) + len(errors)) if rows or errors else None
+            ),
             "termination_reasons": dict(
                 collections.Counter(str(row.get("termination_reason")) for row in rows)
             ),

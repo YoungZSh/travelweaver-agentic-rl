@@ -15,19 +15,32 @@ import pandas as pd
 from omegaconf import OmegaConf
 from transformers import AutoProcessor
 
-FORMAT_VERSION = "travelweaver-sft-v4"
+FORMAT_VERSION = "travelweaver-sft-v5"
 SUPPORTED_FORMAT_VERSIONS = frozenset(
     {
         "travelweaver-sft-v1",
         "travelweaver-sft-v2",
         "travelweaver-sft-v3",
+        "travelweaver-sft-v4",
         FORMAT_VERSION,
     }
 )
-SUPERVISION_MODES = frozenset({"action_only", "react", "react_recovery"})
-MODEL_TOOL_RESPONSE_VERSION = "travelweaver-model-tool-response-v1"
+SUPERVISION_MODES = frozenset(
+    {"action_only", "react", "react_recovery", "action_selective"}
+)
+MODEL_TOOL_RESPONSE_VERSION = "travelweaver-model-tool-response-v3"
+SUPPORTED_MODEL_TOOL_RESPONSE_VERSIONS = frozenset(
+    {
+        "travelweaver-model-tool-response-v1",
+        "travelweaver-model-tool-response-v2",
+        MODEL_TOOL_RESPONSE_VERSION,
+    }
+)
 USER_CONTENT_FORMAT = "travelweaver-natural-query-v1"
-MODEL_CONTEXT_LIMIT = 262_144
+# Keep preprocessing aligned with the actual SFT launcher.  The base model can
+# accept a longer context, but examples beyond this limit cannot be trained by
+# the configured 4B job and must never be silently truncated.
+MODEL_CONTEXT_LIMIT = 65_536
 
 
 def _load_dataset_class() -> type:
@@ -72,8 +85,14 @@ def _validate_row(row: Any, line_number: int) -> None:
     response_mode = row.get("tool_response_mode")
     if response_mode not in {"delta", "snapshot"}:
         raise ValueError(f"SFT row {line_number} has no supported tool response mode.")
-    if row.get("model_tool_response_version") != MODEL_TOOL_RESPONSE_VERSION:
+    row_response_version = row.get("model_tool_response_version")
+    if row_response_version not in SUPPORTED_MODEL_TOOL_RESPONSE_VERSIONS:
         raise ValueError(f"SFT row {line_number} has an unsupported tool response version.")
+    if row.get("format_version") == FORMAT_VERSION and row_response_version not in {
+        "travelweaver-model-tool-response-v2",
+        MODEL_TOOL_RESPONSE_VERSION,
+    }:
+        raise ValueError(f"SFT row {line_number} mixes the v5 and legacy tool protocols.")
     format_version = row.get("format_version")
     supervision_mode = row.get("supervision_mode")
     if format_version in {"travelweaver-sft-v1", "travelweaver-sft-v2"}:
@@ -138,7 +157,7 @@ def _validate_row(row: Any, line_number: int) -> None:
                     tools,
                     line_number,
                     allow_unknown=(
-                        supervision_mode == "react_recovery"
+                        supervision_mode in {"react_recovery", "action_selective"}
                         and assistant_loss_mask[assistant_turn_index] is False
                     ),
                 )
@@ -157,7 +176,7 @@ def _validate_row(row: Any, line_number: int) -> None:
                 }
                 if not required <= payload.keys():
                     raise ValueError(f"SFT row {line_number} has an incomplete delta response.")
-                if payload["response_version"] != MODEL_TOOL_RESPONSE_VERSION:
+                if payload["response_version"] != row_response_version:
                     raise ValueError(f"SFT row {line_number} mixes tool response versions.")
                 if {"reward", "info", "observation"} & payload.keys():
                     raise ValueError(f"SFT row {line_number} leaks snapshot state into delta data.")
@@ -181,7 +200,10 @@ def _validate_row(row: Any, line_number: int) -> None:
             if not has_tool_response:
                 continue
             payload = json.loads(messages[message_index + 1]["content"])
-            if bool(payload.get("valid_action")) != bool(assistant_loss_mask[turn_index]):
+            if supervision_mode != "action_selective" and (
+                bool(payload.get("valid_action"))
+                != bool(assistant_loss_mask[turn_index])
+            ):
                 raise ValueError(
                     f"SFT row {line_number} loss mask disagrees with tool validity."
                 )

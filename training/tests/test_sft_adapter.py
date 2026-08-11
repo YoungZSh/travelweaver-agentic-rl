@@ -65,6 +65,12 @@ def test_json_adapter_preserves_sparse_tool_arguments() -> None:
         module._decode("{", field="messages_json")
 
 
+def test_prepare_audit_uses_the_configured_training_context_limit() -> None:
+    module = _load("scripts/prepare_qwen_sft.py", "prepare_qwen_sft_context_limit_test")
+
+    assert module.MODEL_CONTEXT_LIMIT == 65_536
+
+
 def test_prepare_validator_rejects_reasoning_and_string_arguments() -> None:
     module = _load("scripts/prepare_qwen_sft.py", "prepare_qwen_sft_test")
     row = {
@@ -167,7 +173,7 @@ def test_prepare_validator_accepts_visible_react_content() -> None:
             {
                 "role": "tool",
                 "content": (
-                    '{"response_version":"travelweaver-model-tool-response-v1",'
+                    f'{{"response_version":"{module.MODEL_TOOL_RESPONSE_VERSION}",'
                     '"valid_action":true,"remaining_steps":34,"tool_result":{}}'
                 ),
             },
@@ -225,7 +231,7 @@ def test_prepare_validator_accepts_recovery_mask_and_rejects_order_drift() -> No
             {
                 "role": "tool",
                 "content": (
-                    '{"response_version":"travelweaver-model-tool-response-v1",'
+                    f'{{"response_version":"{module.MODEL_TOOL_RESPONSE_VERSION}",'
                     '"valid_action":false,"remaining_steps":35,"tool_result":null,'
                     '"error":{"code":"invalid_action","message":"bad"}}'
                 ),

@@ -99,7 +99,7 @@ uses only FSDP for training and vLLM for rollout generation.
 
 ## Qwen3.5 action-only and ReAct SFT data
 
-The root environment produces replay-verified `travelweaver-sft-v4` JSONL with an explicit
+The root environment produces replay-verified `travelweaver-sft-v5` JSONL with an explicit
 `supervision_mode`. Action-only samples supervise tool calls, while clean ReAct samples also
 supervise visible `assistant.content` from thinking-disabled rollouts. Supplier-private
 `reasoning_content` is rejected in both modes. The leading user message is the original
@@ -120,26 +120,24 @@ are not widened into nullable Arrow structs. Configure veRL with
 `training/configs/qwen3_5_4b_sft_data.yaml` and the custom dataset class in
 `training/src/travelweaver_sft_dataset.py`. It decodes those columns and then delegates tokenization,
 masking, and full-conversation consistency checks to veRL's `MultiTurnSFTDataset`.
-The adapter remains compatible with existing v2 action-only and v3 action-only/clean ReAct
-artifacts. Newly rebuilt datasets use v4 so supervision semantics cannot be inferred from message
-text.
+The adapter remains compatible with existing v2 action-only, v3 action-only/clean ReAct, and v4
+recovery artifacts. Newly rebuilt datasets use v5; its `action_selective` mode can retain legal
+teacher-forced context while supervising only selected correct actions and visible reflections.
 
 Recovery ReAct is specified in
-[`docs/react-sft-recovery-v1.md`](../docs/react-sft-recovery-v1.md). V4 retains invalid assistant
+[`docs/react-sft-recovery-v1.md`](../docs/react-sft-recovery-v1.md). V4/V5 retain invalid assistant
 turns and tool errors as causal context, supplies an explicit per-assistant-turn loss mask, and
 supervises only subsequent reflection and valid actions. The adapter reads the separate
 `assistant_loss_mask_json` Parquet column; it does not infer masks from error text or add private
 fields to messages passed through Qwen's official chat template.
 
 The default two-GPU full-parameter run is restricted to GPU 0/1. It uses FSDP2, two-way Ulysses
-sequence parallelism, dynamic token batches, and a 32,768-token sequence limit. The per-GPU token
-budget is 16,384, so the current 22,079-token maximum sample fits across SP=2 without packing an
-unnecessarily large micro-batch.
+sequence parallelism, dynamic token batches, and a 65,536-token sequence limit. The per-GPU token
+budget is 32,768, so the complete sequence fits across SP=2 without truncating early evidence.
 
-This 32,768-token launcher default is lower than Qwen3.5-4B's 262,144-token model limit. The
-79-sample clean/recovery ReAct pilot reaches 46,843 tokens (median 28,216 and p90 40,990). Before
-training ReAct data, either raise the training limit and token budgets or isolate over-limit
-samples; do not truncate early evidence or error-recovery context.
+Qwen3.5-4B supports a 262,144-token context. Keep the launcher at 65,536 by default and raise it
+only after checking the dataset manifest's exact sequence distribution and the available GPU memory;
+never truncate early evidence or error-recovery context.
 
 The launcher preflight checks the Parquet manifest and hash, model family, maximum sequence length,
 parallelism divisibility, fused AdamW support, veRL's fused linear cross-entropy kernel, and
@@ -174,7 +172,7 @@ directory, and a successful completed run publishes `final-model` as a stable sy
 Hugging Face export. Runtime settings can be changed without editing the script, for example:
 
 ```bash
-TRAIN_BATCH_SIZE=8 MAX_TOKEN_LEN_PER_GPU=12288 \
+TRAIN_BATCH_SIZE=8 MAX_TOKEN_LEN_PER_GPU=32768 \
   bash training/scripts/run_qwen3_5_4b_multiturn_sft.sh
 ```
 
