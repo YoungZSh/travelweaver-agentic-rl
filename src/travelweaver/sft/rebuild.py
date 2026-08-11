@@ -38,12 +38,15 @@ from ..synthesis.render import render_canonical
 from ..tasks import TaskBlueprint, TaskSurface, materialize_task_spec
 from .ordering import order_tool_arguments, order_tool_schemas
 
-SFT_FORMAT_VERSION = "travelweaver-sft-v4"
-SFTSupervisionMode = Literal["action_only", "react", "react_recovery"]
+SFT_FORMAT_VERSION = "travelweaver-sft-v5"
+SFTSupervisionMode = Literal[
+    "action_only", "react", "react_recovery", "action_selective"
+]
 SFT_SUPERVISION_MODES: tuple[SFTSupervisionMode, ...] = (
     "action_only",
     "react",
     "react_recovery",
+    "action_selective",
 )
 DEFAULT_SFT_SUPERVISION_MODE: SFTSupervisionMode = "action_only"
 
@@ -80,7 +83,10 @@ class SFTRebuildConfig:
             raise ValueError("At least one SFT source is required.")
         validate_tool_response_mode(self.tool_response_mode)
         mode = validate_supervision_mode(self.supervision_mode)
-        if mode in {"react", "react_recovery"} and self.repair_surface_semantics:
+        if (
+            mode in {"react", "react_recovery", "action_selective"}
+            and self.repair_surface_semantics
+        ):
             raise ValueError("ReAct SFT cannot change the user query after rollout generation.")
 
 
@@ -318,14 +324,28 @@ def _mode_exclusion_reason(
     steps = row.get("steps")
     if not isinstance(steps, list) or not steps:
         return "react_requires_nonempty_steps"
-    if supervision_mode == "react" and any(not _step_is_valid(step) for step in steps):
+    if supervision_mode in {"react", "action_selective"} and any(
+        not _step_is_valid(step) for step in steps
+    ):
         return "react_invalid_action_not_supported"
+    if supervision_mode == "action_selective":
+        mask = row.get("assistant_loss_mask")
+        if (
+            not isinstance(mask, list)
+            or len(mask) != len(steps)
+            or any(not isinstance(value, bool) for value in mask)
+            or not mask
+            or mask[-1] is not True
+        ):
+            return "action_selective_requires_explicit_loss_mask"
     try:
         _react_source_context(row)
         contents = _react_content_by_call_id(row)
     except SFTRebuildError as error:
         return f"react_message_alignment_error:{error}"
-    if not any(content.strip() for content in contents.values()):
+    if supervision_mode in {"react", "react_recovery"} and not any(
+        content.strip() for content in contents.values()
+    ):
         return "react_requires_visible_assistant_content"
     return None
 
@@ -353,6 +373,7 @@ def _react_source_context(row: dict[str, Any]) -> tuple[str, str, int]:
     supported_prompts = {
         render_system_prompt(35): 35,
         SYSTEM_PROMPT: DEFAULT_MAX_VALID_STEPS,
+        render_system_prompt(100): 100,
     }
     system_content = system.get("content") if isinstance(system, dict) else None
     if (
@@ -604,7 +625,7 @@ def _rebuild_one(
     response_mode = validate_tool_response_mode(tool_response_mode)
     selected_supervision = validate_supervision_mode(supervision_mode)
     task_id = str(row["task_id"])
-    is_react = selected_supervision in {"react", "react_recovery"}
+    is_react = selected_supervision in {"react", "react_recovery", "action_selective"}
     react_content = _react_content_by_call_id(row) if is_react else {}
     output_system_prompt = SYSTEM_PROMPT
     max_valid_steps = DEFAULT_MAX_VALID_STEPS
@@ -743,8 +764,13 @@ def _rebuild_one(
                 if is_react
                 else ""
             )
+            selected_loss = (
+                bool(row["assistant_loss_mask"][position])
+                if selected_supervision == "action_selective"
+                else valid
+            )
             messages.append(_assistant_message(output_action, content=visible_content))
-            assistant_loss_mask.append(valid)
+            assistant_loss_mask.append(selected_loss)
             if not result.terminated and not result.truncated:
                 model_tool_response = serialize_model_tool_response(
                     result,

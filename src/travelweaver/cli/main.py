@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -13,7 +14,12 @@ from ..data.bootstrap import install_database, validate_database
 from ..data.tasks import JsonlTaskStore, import_benchmark_tasks, import_task_split
 from ..env import ChinaTravelBackend, TravelWeaverEnv
 from ..errors import TravelWeaverError
-from ..llm import DeepSeekConfig, OpenAICompatibleConfig
+from ..evaluation import audit_synthesis_directory
+from ..llm import (
+    DEFAULT_DEEPSEEK_CONCURRENCY,
+    DeepSeekConfig,
+    OpenAICompatibleConfig,
+)
 from ..paths import project_root
 from ..rollout import (
     DEFAULT_MAX_API_TURNS,
@@ -32,9 +38,16 @@ from ..rollout import (
 from ..sft import (
     DEFAULT_SFT_SUPERVISION_MODE,
     SFT_SUPERVISION_MODES,
+    ProgrammaticBuildConfig,
+    RationalePolishConfig,
+    RationaleRevalidationConfig,
     SFTRebuildConfig,
     SFTSource,
+    audit_programmatic_batch,
+    build_programmatic_trajectories,
+    polish_programmatic_rationales,
     rebuild_sft_dataset,
+    revalidate_programmatic_rationales,
 )
 from ..synthesis import (
     RepolishConfig,
@@ -181,7 +194,11 @@ def _rollout_benchmark(args: argparse.Namespace) -> int:
 
 
 def _synthesize_tasks(args: argparse.Namespace) -> int:
-    llm_config = DeepSeekConfig.from_env(args.env_file)
+    llm_config = (
+        DeepSeekConfig(api_key="offline-canonical", model="deterministic-canonical")
+        if args.canonical_only
+        else DeepSeekConfig.from_env(args.env_file)
+    )
     output_dir = (
         Path(args.output_dir)
         if args.output_dir
@@ -195,6 +212,10 @@ def _synthesize_tasks(args: argparse.Namespace) -> int:
             max_api_calls=args.max_api_calls,
             profile=args.profile,
             validation_policy=args.validation_policy,
+            llm_concurrency=args.llm_concurrency,
+            witness_concurrency=args.witness_concurrency,
+            exclude_task_dirs=tuple(Path(value) for value in args.exclude_task_dir),
+            canonical_only=args.canonical_only,
         ),
         llm_config,
     ).run()
@@ -203,7 +224,11 @@ def _synthesize_tasks(args: argparse.Namespace) -> int:
 
 
 def _repolish_tasks(args: argparse.Namespace) -> int:
-    llm_config = DeepSeekConfig.from_env(args.env_file)
+    llm_config = (
+        DeepSeekConfig(api_key="offline-canonical", model="deterministic-canonical")
+        if args.canonical_only
+        else DeepSeekConfig.from_env(args.env_file)
+    )
     input_dir = Path(args.input_dir)
     output_dir = (
         Path(args.output_dir)
@@ -217,6 +242,7 @@ def _repolish_tasks(args: argparse.Namespace) -> int:
             llm_concurrency=args.llm_concurrency,
             max_api_calls=args.max_api_calls,
             validation_policy=args.validation_policy,
+            canonical_only=args.canonical_only,
         ),
         llm_config,
     ).run()
@@ -239,6 +265,98 @@ def _rebuild_sft(args: argparse.Namespace) -> int:
     )
     _print(report.to_dict())
     return 0
+
+
+def _programmatic_sft(args: argparse.Namespace) -> int:
+    output_path = Path(args.output)
+    audit_path = (
+        Path(args.audit)
+        if args.audit
+        else output_path.with_name(f"{output_path.stem}-audit.jsonl")
+    )
+    report = build_programmatic_trajectories(
+        ProgrammaticBuildConfig(
+            task_dir=Path(args.input_dir),
+            output_path=output_path,
+            audit_path=audit_path,
+            seed=args.seed,
+            concurrency=args.concurrency,
+        )
+    )
+    _print(report)
+    return 0
+
+
+def _polish_programmatic_react(args: argparse.Namespace) -> int:
+    llm_config = DeepSeekConfig.from_env(args.env_file)
+    output_path = Path(args.output)
+    output_audit_path = (
+        Path(args.audit)
+        if args.audit
+        else output_path.with_name(f"{output_path.stem}-audit.jsonl")
+    )
+    work_dir = (
+        Path(args.work_dir)
+        if args.work_dir
+        else output_path.with_name(f".{output_path.stem}-work")
+    )
+    report = polish_programmatic_rationales(
+        RationalePolishConfig(
+            input_path=Path(args.input),
+            input_audit_path=Path(args.input_audit),
+            output_path=output_path,
+            output_audit_path=output_audit_path,
+            work_dir=work_dir,
+            llm_concurrency=args.llm_concurrency,
+            max_api_calls=args.max_api_calls,
+            task_ids=tuple(args.task_id),
+        ),
+        llm_config,
+        progress=lambda payload: print(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True
+        ),
+    )
+    _print(report.to_dict())
+    return 0
+
+
+def _revalidate_programmatic_react(args: argparse.Namespace) -> int:
+    report = revalidate_programmatic_rationales(
+        RationaleRevalidationConfig(
+            input_path=Path(args.input),
+            input_audit_path=Path(args.input_audit),
+            source_audit_path=Path(args.source_audit),
+            output_path=Path(args.output),
+            output_audit_path=Path(args.audit),
+        ),
+        DeepSeekConfig.from_env(args.env_file),
+    )
+    _print(report.to_dict())
+    return 0
+
+
+def _audit_official(args: argparse.Namespace) -> int:
+    report = audit_synthesis_directory(
+        args.input_dir,
+        output_path=args.output,
+        exports_path=args.exports,
+        concurrency=args.concurrency,
+    )
+    _print(report)
+    return 0 if report["commonsense_passes"] == report["count"] else 2
+
+
+def _audit_programmatic(args: argparse.Namespace) -> int:
+    report = audit_programmatic_batch(
+        args.input_dir,
+        args.trajectory,
+        args.trajectory_audit,
+        sft_manifest_path=args.sft_manifest,
+        output_path=args.output,
+        require_rationale_polish=args.require_rationale_polish,
+    )
+    _print(report)
+    return 0 if report["accepted"] else 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -349,7 +467,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=TOOL_RESPONSE_MODES,
         default=DEFAULT_TOOL_RESPONSE_MODE,
     )
-    rollout_benchmark.add_argument("--concurrency", type=int, default=16)
+    rollout_benchmark.add_argument(
+        "--concurrency", type=int, default=DEFAULT_ROLLOUT_CONCURRENCY
+    )
     rollout_benchmark.set_defaults(handler=_rollout_benchmark)
 
     synthesize = subparsers.add_parser(
@@ -362,6 +482,31 @@ def build_parser() -> argparse.ArgumentParser:
     synthesize.add_argument("--output-dir")
     synthesize.add_argument("--max-api-calls", type=int, default=300)
     synthesize.add_argument(
+        "--canonical-only",
+        action="store_true",
+        help="Build and validate canonical surfaces without making paid API calls.",
+    )
+    synthesize.add_argument(
+        "--llm-concurrency",
+        type=int,
+        default=DEFAULT_DEEPSEEK_CONCURRENCY,
+    )
+    synthesize.add_argument(
+        "--witness-concurrency",
+        type=int,
+        default=min(8, os.cpu_count() or 1),
+        help="CPU concurrency for deterministic witness construction.",
+    )
+    synthesize.add_argument(
+        "--exclude-task-dir",
+        action="append",
+        default=[],
+        help=(
+            "Repeatable completed synthesis directory whose task ids, normalized Questions, "
+            "Blueprints, and surfaces must not be reused."
+        ),
+    )
+    synthesize.add_argument(
         "--validation-policy",
         choices=["strict", "minimal_semantic"],
         default="minimal_semantic",
@@ -372,6 +517,7 @@ def build_parser() -> argparse.ArgumentParser:
             "pilot_v2_1",
             "chinatravel_blended_v1",
             "chinatravel_blended_v1_1",
+            "chinatravel_official_hybrid_v2",
         ],
         default="pilot_v2_1",
     )
@@ -385,7 +531,16 @@ def build_parser() -> argparse.ArgumentParser:
     repolish.add_argument("--output-dir")
     repolish.add_argument("--env-file", default=str(project_root() / ".env"))
     repolish.add_argument("--max-api-calls", type=int, default=400)
-    repolish.add_argument("--llm-concurrency", type=int, default=256)
+    repolish.add_argument(
+        "--canonical-only",
+        action="store_true",
+        help="Re-render validated natural canonical surfaces without an external API call.",
+    )
+    repolish.add_argument(
+        "--llm-concurrency",
+        type=int,
+        default=DEFAULT_DEEPSEEK_CONCURRENCY,
+    )
     repolish.add_argument(
         "--validation-policy",
         choices=["strict", "minimal_semantic"],
@@ -421,6 +576,81 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TOOL_RESPONSE_MODE,
     )
     rebuild_sft.set_defaults(handler=_rebuild_sft)
+
+    programmatic_sft = subparsers.add_parser(
+        "generate-programmatic-sft",
+        help="Build deterministic 8:1:1 policy trajectories from synthesis witnesses.",
+    )
+    programmatic_sft.add_argument("--input-dir", required=True)
+    programmatic_sft.add_argument("--output", required=True)
+    programmatic_sft.add_argument("--audit")
+    programmatic_sft.add_argument("--seed", type=int, default=20260821)
+    programmatic_sft.add_argument(
+        "--concurrency", type=int, default=min(32, os.cpu_count() or 1)
+    )
+    programmatic_sft.set_defaults(handler=_programmatic_sft)
+
+    polish_programmatic_react = subparsers.add_parser(
+        "polish-programmatic-react",
+        help="Polish template-first visible rationales for programmatic ReAct trajectories.",
+    )
+    polish_programmatic_react.add_argument("--input", required=True)
+    polish_programmatic_react.add_argument("--input-audit", required=True)
+    polish_programmatic_react.add_argument("--output", required=True)
+    polish_programmatic_react.add_argument("--audit")
+    polish_programmatic_react.add_argument("--work-dir")
+    polish_programmatic_react.add_argument(
+        "--env-file", default=str(project_root() / ".env")
+    )
+    polish_programmatic_react.add_argument("--max-api-calls", type=int, default=500)
+    polish_programmatic_react.add_argument(
+        "--task-id",
+        action="append",
+        default=[],
+        help="Repeatable task id filter for a fixed pilot cohort.",
+    )
+    polish_programmatic_react.add_argument(
+        "--llm-concurrency", type=int, default=DEFAULT_DEEPSEEK_CONCURRENCY
+    )
+    polish_programmatic_react.set_defaults(handler=_polish_programmatic_react)
+
+    revalidate_programmatic_react = subparsers.add_parser(
+        "revalidate-programmatic-react",
+        help="Revalidate saved ReAct rationale responses without a new API request.",
+    )
+    revalidate_programmatic_react.add_argument("--input", required=True)
+    revalidate_programmatic_react.add_argument("--input-audit", required=True)
+    revalidate_programmatic_react.add_argument("--source-audit", required=True)
+    revalidate_programmatic_react.add_argument("--output", required=True)
+    revalidate_programmatic_react.add_argument("--audit", required=True)
+    revalidate_programmatic_react.add_argument(
+        "--env-file", default=str(project_root() / ".env")
+    )
+    revalidate_programmatic_react.set_defaults(handler=_revalidate_programmatic_react)
+
+    official_audit = subparsers.add_parser(
+        "audit-chinatravel-official",
+        help="Export synthesis witnesses and run the pinned official schema/commonsense checks.",
+    )
+    official_audit.add_argument("--input-dir", required=True)
+    official_audit.add_argument("--output")
+    official_audit.add_argument("--exports")
+    official_audit.add_argument(
+        "--concurrency", type=int, default=min(32, os.cpu_count() or 1)
+    )
+    official_audit.set_defaults(handler=_audit_official)
+
+    batch_audit = subparsers.add_parser(
+        "audit-programmatic-batch",
+        help="Aggregate Question, policy, Reward, official, and token acceptance metrics.",
+    )
+    batch_audit.add_argument("--input-dir", required=True)
+    batch_audit.add_argument("--trajectory", required=True)
+    batch_audit.add_argument("--trajectory-audit", required=True)
+    batch_audit.add_argument("--sft-manifest")
+    batch_audit.add_argument("--output")
+    batch_audit.add_argument("--require-rationale-polish", action="store_true")
+    batch_audit.set_defaults(handler=_audit_programmatic)
     return parser
 
 

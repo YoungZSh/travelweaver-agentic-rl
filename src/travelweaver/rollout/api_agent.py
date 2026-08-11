@@ -31,12 +31,15 @@ __all__ = [
     "render_task_user_content",
 ]
 
-TRAJECTORY_VERSION = "travelweaver-trajectory-v6"
+TRAJECTORY_VERSION = "travelweaver-trajectory-v9"
 SUPPORTED_TRAJECTORY_VERSIONS = frozenset(
     {
         "travelweaver-trajectory-v3",
         "travelweaver-trajectory-v4",
         "travelweaver-trajectory-v5",
+        "travelweaver-trajectory-v6",
+        "travelweaver-trajectory-v7",
+        "travelweaver-trajectory-v8",
         TRAJECTORY_VERSION,
     }
 )
@@ -54,15 +57,16 @@ _SYSTEM_PROMPT_TEMPLATE = """\
 4. 多日行程应在第 1 天至倒数第 2 天各安排一次当晚住宿，最后一天不要重复安排住宿。
    住宿必须填写 rooms 和 room_type。
 5. 每个完整的中间旅行日应安排至少一个景点或用餐活动，避免出现只有住宿的空白日期。
-6. 每天第一个本地活动不得填写 route_from_previous_id。只有同一天相邻的两个本地活动之间
-   才调用 get_route；路线出发时间不得早于前一个活动结束时间，且必须在后一个活动开始前到达。
+6. 行程地点按时间连续衔接。去程到达站至首个地点、同日地点之间、酒店至次日首个地点、
+   最后地点至返程站均须调用 get_route，并在后一个活动引用 route_from_previous_id；同一地点
+   连续活动无需路线。
 7. 城际交通的起止时间必须与候选证据完全一致。
 8. 先满足全部硬约束。存在多个可行方案时，再根据题面偏好比较少量候选；无需穷举。
 9. 最多执行 {max_valid_steps} 个有效工具动作。按任务复杂度尽量减少无效搜索、无用保存和未使用路线。
-10. 找到可行方案后调用 submit_plan；确认无解时调用 finish_without_plan。
+10. 找到可行方案后调用 submit_plan；第一次合法格式的 submit_plan 就是最终答案，不能二次修改。
     不要输出普通文本作为最终答案。
-11. 对没有额外景点、餐饮或指定地点要求的单日异地任务，选择首个可行的去程、景点和返程后即可提交；
-    若题面有额外要求，必须继续查询并落实。
+11. 在时间、预算和题面允许时安排内容完整且不重复的游览与合理餐饮；不要为了缩短动作数退化为
+    缺乏正常用餐和游览内容的最低可行行程。
 12. API 即使允许多个 tool call，本环境每轮也只执行第一个。
 """
 

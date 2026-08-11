@@ -13,12 +13,17 @@ from typing import Any
 from ..data.tasks import JsonlTaskStore
 from ..env import ChinaTravelBackend, ScenarioBackend, ScenarioSpec, TravelWeaverEnv
 from ..errors import DataUnavailableError
-from ..llm import DeepSeekConfig, OpenAICompatibleChatClient, OpenAICompatibleConfig
+from ..llm import (
+    DEFAULT_DEEPSEEK_CONCURRENCY,
+    DeepSeekConfig,
+    OpenAICompatibleChatClient,
+    OpenAICompatibleConfig,
+)
 from .api_agent import DEFAULT_MAX_API_TURNS, ApiAgentRun, ToolCallingAgent
 from .tool_response import DEFAULT_TOOL_RESPONSE_MODE, validate_tool_response_mode
 from .trajectory import append_trajectory
 
-DEFAULT_ROLLOUT_CONCURRENCY = 256
+DEFAULT_ROLLOUT_CONCURRENCY = DEFAULT_DEEPSEEK_CONCURRENCY
 
 
 @dataclass(frozen=True)
@@ -26,7 +31,7 @@ class BenchmarkRolloutBatchConfig:
     output_path: Path
     error_path: Path
     split: str = "benchmark"
-    concurrency: int = 16
+    concurrency: int = DEFAULT_ROLLOUT_CONCURRENCY
     max_api_turns: int = DEFAULT_MAX_API_TURNS
     seed: int = 20260808
     task_id: str | None = None

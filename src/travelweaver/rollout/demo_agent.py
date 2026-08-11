@@ -95,12 +95,22 @@ class DemoTravelAgent:
             self._save(returning, "return_transport", "返程城际交通")
 
         route_ids: dict[tuple[str, str], str] = {}
-        local_sequence = [attraction]
+        local_sequence: list[dict[str, Any]] = []
+        if outbound is not None:
+            local_sequence.append({"place_id": outbound["destination_anchor_id"]})
+        local_sequence.append(attraction)
         if restaurant is not None:
             local_sequence.append(restaurant)
         if hotel is not None:
             local_sequence.append(hotel)
-        route_start_times = ["12:00", "13:30"]
+        if returning is not None:
+            local_sequence.append({"place_id": returning["origin_anchor_id"]})
+        route_start_times = [
+            str(outbound["arrival_time"]) if outbound is not None else "12:00",
+            "12:00",
+            "13:30",
+            "20:00",
+        ]
         for index, (origin, destination) in enumerate(
             zip(local_sequence, local_sequence[1:], strict=False)
         ):
@@ -185,8 +195,19 @@ class DemoTravelAgent:
         return result
 
     def _finish(self, reason: str) -> AgentRun:
-        result = self._call("finish_without_plan", {"reason": reason}, require_valid=False)
-        return self._result(result, None)
+        assert self._observation is not None
+        return AgentRun(
+            task_id=str(self._observation.task["uid"]),
+            success=False,
+            termination_reason="no_plan",
+            step_count=len(
+                [event for event in self._trajectory if event["event"] == "step"]
+            ),
+            final_plan=None,
+            final_reward=-1.0,
+            reward_detail={"reason": reason},
+            trajectory=tuple(self._trajectory),
+        )
 
     def _result(self, terminal: StepResult, plan: dict[str, Any] | None) -> AgentRun:
         assert self._observation is not None
@@ -236,6 +257,15 @@ class DemoTravelAgent:
                     "type": "attraction",
                     "start_time": "10:00",
                     "end_time": "12:00",
+                    **(
+                        {
+                            "route_from_previous_id": route_ids[
+                                (outbound["destination_anchor_id"], attraction["place_id"])
+                            ]
+                        }
+                        if day_number == 1 and outbound is not None
+                        else {}
+                    ),
                 }
             )
             if restaurant is not None:
@@ -251,12 +281,16 @@ class DemoTravelAgent:
                     }
                 )
             if day_number == days and returning is not None:
+                previous = restaurant if restaurant is not None else attraction
                 activities.append(
                     {
                         "candidate_id": returning["transport_id"],
                         "type": returning["mode"],
                         "start_time": returning["departure_time"],
                         "end_time": returning["arrival_time"],
+                        "route_from_previous_id": route_ids[
+                            (previous["place_id"], returning["origin_anchor_id"])
+                        ],
                     }
                 )
             elif hotel is not None:

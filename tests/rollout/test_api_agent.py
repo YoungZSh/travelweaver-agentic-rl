@@ -67,14 +67,40 @@ class _SequenceCompletions(_Completions):
         return next(self.responses)
 
 
-def test_api_agent_executes_model_tool_call_and_records_trajectory(env) -> None:
-    tool_call = SimpleNamespace(
-        id="call-1",
+def _terminal_call(call_id: str):
+    return SimpleNamespace(
+        id=call_id,
         function=SimpleNamespace(
-            name="finish_without_plan",
-            arguments=json.dumps({"reason": "测试终止"}, ensure_ascii=False),
+            name="submit_plan",
+            arguments=json.dumps(
+                {
+                    "plan": {
+                        "people_number": 1,
+                        "start_city": "上海",
+                        "target_city": "杭州",
+                        "itinerary": [
+                            {
+                                "day": 1,
+                                "activities": [
+                                    {
+                                        "candidate_id": "not-saved",
+                                        "type": "attraction",
+                                        "start_time": "10:00",
+                                        "end_time": "12:00",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                },
+                ensure_ascii=False,
+            ),
         ),
     )
+
+
+def test_api_agent_executes_model_tool_call_and_records_trajectory(env) -> None:
+    tool_call = _terminal_call("call-1")
     message = _Message(tool_call)
     response = SimpleNamespace(
         id="response-1",
@@ -90,10 +116,10 @@ def test_api_agent_executes_model_tool_call_and_records_trajectory(env) -> None:
     run = ToolCallingAgent(env, config, client=client).run("task-hangzhou")
 
     assert not run.success
-    assert run.termination_reason == "finished_without_plan"
+    assert run.termination_reason == "invalid_plan_submitted"
     assert run.step_count == 1
     assert run.usage["total_tokens"] == 110
-    assert len(completions.requests[0]["tools"]) == 13
+    assert len(completions.requests[0]["tools"]) == 17
     assert completions.requests[0]["tool_choice"] == "auto"
     assert completions.requests[0]["messages"][1] == {
         "role": "user",
@@ -102,7 +128,8 @@ def test_api_agent_executes_model_tool_call_and_records_trajectory(env) -> None:
     system_prompt = completions.requests[0]["messages"][0]["content"]
     assert "最多执行 50 个有效工具动作" in system_prompt
     assert "按任务复杂度尽量减少无效搜索" in system_prompt
-    assert "每天第一个本地活动不得填写 route_from_previous_id" in system_prompt
+    assert "去程到达站至首个地点" in system_prompt
+    assert "酒店至次日首个地点" in system_prompt
     assert "15 个动作内完成" not in system_prompt
     assert completions.requests[0]["extra_body"] == {
         "thinking": {"type": "disabled"}
@@ -114,7 +141,7 @@ def test_api_agent_executes_model_tool_call_and_records_trajectory(env) -> None:
         "assistant",
         "tool",
     ]
-    assert run.messages[-1]["name"] == "finish_without_plan"
+    assert run.messages[-1]["name"] == "submit_plan"
     terminal_payload = json.loads(run.messages[-1]["content"])
     assert terminal_payload["response_version"] == MODEL_TOOL_RESPONSE_VERSION
     assert terminal_payload["terminated"] is True
@@ -123,9 +150,9 @@ def test_api_agent_executes_model_tool_call_and_records_trajectory(env) -> None:
     assert run.steps[0]["tool_call"]["id"] == "call-1"
     assert run.steps[0]["model_tool_response"] == terminal_payload
     assert "observation" in run.steps[0]["result"]
-    assert len(run.tools) == 13
+    assert len(run.tools) == 17
     persisted = run.to_dict(include_trajectory=True)
-    assert persisted["trajectory_version"] == "travelweaver-trajectory-v6"
+    assert persisted["trajectory_version"] == "travelweaver-trajectory-v9"
     assert persisted["user_content_format"] == "travelweaver-natural-query-v1"
     assert persisted["tool_response_mode"] == "delta"
     assert persisted["model_tool_response_version"] == MODEL_TOOL_RESPONSE_VERSION
@@ -159,13 +186,7 @@ def test_api_agent_executes_only_first_tool_call_per_turn(env) -> None:
             arguments=json.dumps({"city": "杭州"}, ensure_ascii=False),
         ),
     )
-    finish = SimpleNamespace(
-        id="call-finish",
-        function=SimpleNamespace(
-            name="finish_without_plan",
-            arguments=json.dumps({"reason": "测试结束"}, ensure_ascii=False),
-        ),
-    )
+    finish = _terminal_call("call-finish")
 
     def response(response_id, message):
         return SimpleNamespace(
@@ -189,7 +210,7 @@ def test_api_agent_executes_only_first_tool_call_per_turn(env) -> None:
     ).run("task-hangzhou")
 
     assert run.step_count == 2
-    assert run.termination_reason == "finished_without_plan"
+    assert run.termination_reason == "invalid_plan_submitted"
     events = [event["event"] for event in run.trajectory]
     assert events == [
         "reset",
@@ -233,13 +254,7 @@ def test_snapshot_tool_response_mode_reproduces_legacy_full_step(env) -> None:
             arguments=json.dumps({"city": "杭州"}, ensure_ascii=False),
         ),
     )
-    finish = SimpleNamespace(
-        id="call-finish",
-        function=SimpleNamespace(
-            name="finish_without_plan",
-            arguments=json.dumps({"reason": "测试结束"}, ensure_ascii=False),
-        ),
-    )
+    finish = _terminal_call("call-finish")
 
     def response(response_id, message):
         return SimpleNamespace(
@@ -282,13 +297,7 @@ def test_delta_tool_response_preserves_invalid_action_recovery_signal(env) -> No
             arguments="{}",
         ),
     )
-    finish = SimpleNamespace(
-        id="call-finish",
-        function=SimpleNamespace(
-            name="finish_without_plan",
-            arguments=json.dumps({"reason": "收到错误后结束"}, ensure_ascii=False),
-        ),
-    )
+    finish = _terminal_call("call-finish")
 
     def response(response_id, message):
         return SimpleNamespace(
@@ -332,13 +341,7 @@ def test_malformed_arguments_are_canonicalized_for_the_next_api_turn(env) -> Non
             arguments='{"city":"杭州"',
         ),
     )
-    finish = SimpleNamespace(
-        id="call-finish",
-        function=SimpleNamespace(
-            name="finish_without_plan",
-            arguments=json.dumps({"reason": "已收到参数错误"}, ensure_ascii=False),
-        ),
-    )
+    finish = _terminal_call("call-finish")
 
     def response(response_id, message):
         return SimpleNamespace(
@@ -421,6 +424,8 @@ def test_rollout_cli_defaults_to_delta_tool_responses(arguments) -> None:
     assert parsed.tool_response_mode == "delta"
     if arguments[0].startswith("rollout-"):
         assert parsed.max_api_turns == 60
+        if arguments[0] != "rollout-api":
+            assert parsed.concurrency == 256
     if arguments[0] == "rollout-generated":
         assert parsed.limit is None
         limited = parser.parse_args([*arguments, "--limit", "100"])
@@ -434,13 +439,7 @@ def test_rollout_cli_defaults_to_delta_tool_responses(arguments) -> None:
 
 
 def test_generic_agent_does_not_send_provider_specific_thinking_fields(env) -> None:
-    tool_call = SimpleNamespace(
-        id="call-generic",
-        function=SimpleNamespace(
-            name="finish_without_plan",
-            arguments=json.dumps({"reason": "generic endpoint"}),
-        ),
-    )
+    tool_call = _terminal_call("call-generic")
     response = SimpleNamespace(
         id="response-generic",
         choices=[SimpleNamespace(message=_Message(tool_call), finish_reason="tool_calls")],

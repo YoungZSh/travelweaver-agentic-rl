@@ -41,6 +41,16 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     )
 
 
+def test_deepseek_batch_defaults_to_256_workers(tmp_path) -> None:
+    config = GeneratedRolloutBatchConfig(
+        input_dir=tmp_path,
+        output_path=tmp_path / "output.jsonl",
+        error_path=tmp_path / "errors.jsonl",
+    )
+
+    assert config.concurrency == 256
+
+
 def test_generated_batch_is_resumable_and_persists_model_configuration(tmp_path) -> None:
     input_dir = tmp_path / "generated"
     output_path = tmp_path / "trajectories.jsonl"

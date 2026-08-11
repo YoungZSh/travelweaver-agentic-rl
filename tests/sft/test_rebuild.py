@@ -78,7 +78,7 @@ def test_rebuild_skips_invalid_turn_and_replays_reward_one(backend, task_store) 
     assert sample["enable_thinking"] is False
     assert sample["tool_response_mode"] == "delta"
     assert sample["model_tool_response_version"] == MODEL_TOOL_RESPONSE_VERSION
-    assert sample["format_version"] == "travelweaver-sft-v4"
+    assert sample["format_version"] == "travelweaver-sft-v5"
     assert sample["supervision_mode"] == "action_only"
     assert sample["assistant_loss_mask"] == [
         True
@@ -169,7 +169,7 @@ def test_react_rebuild_preserves_visible_text_for_clean_no_thinking_run(
     )
 
     assistants = [message for message in sample["messages"] if message["role"] == "assistant"]
-    assert sample["format_version"] == "travelweaver-sft-v4"
+    assert sample["format_version"] == "travelweaver-sft-v5"
     assert sample["supervision_mode"] == "react"
     assert all(message["content"].startswith("第 ") for message in assistants)
     assert all("reasoning_content" not in message for message in assistants)

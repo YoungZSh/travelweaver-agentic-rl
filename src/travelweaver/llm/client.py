@@ -11,6 +11,8 @@ from typing import Any
 from ..errors import ApiRolloutError, ConfigurationError
 from ..paths import project_root
 
+DEFAULT_DEEPSEEK_CONCURRENCY = 256
+
 
 @dataclass(frozen=True)
 class OpenAICompatibleConfig:
