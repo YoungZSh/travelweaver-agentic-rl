@@ -14,10 +14,17 @@ def _step(env: TravelWeaverEnv, tool: str, **arguments: object):
     return result
 
 
-def test_all_eight_tools_and_pagination(env: TravelWeaverEnv) -> None:
+def test_query_and_evidence_tools_and_pagination(env: TravelWeaverEnv) -> None:
     reset = env.reset("task-hangzhou")
     assert reset.remaining_steps == 50
-    assert len(env.tool_schemas()) == 13
+    assert len(env.tool_schemas()) == 17
+
+    categories = _step(env, "list_attraction_categories", city="杭州")
+    assert "公园" in categories.observation.tool_result["categories"]
+    cuisines = _step(env, "list_restaurant_cuisines", city="杭州")
+    assert "杭帮菜" in cuisines.observation.tool_result["cuisines"]
+    hotel_features = _step(env, "list_hotel_features", city="杭州")
+    assert 2 in hotel_features.observation.tool_result["room_types"]
 
     attractions = _step(env, "search_attractions", city="杭州")
     first_page = attractions.observation.tool_result
@@ -32,6 +39,8 @@ def test_all_eight_tools_and_pagination(env: TravelWeaverEnv) -> None:
 
     restaurants = _step(env, "search_restaurants", city="杭州", cuisine="杭帮菜")
     assert restaurants.observation.tool_result["items"][0]["name"] == "西湖餐厅"
+    food = _step(env, "search_restaurants_by_food", city="杭州", food="西湖醋鱼")
+    assert food.observation.tool_result["items"][0]["name"] == "西湖餐厅"
 
     hotels = _step(env, "search_hotels", city="杭州", room_type=2)
     assert hotels.observation.tool_result["items"][0]["name"] == "湖畔酒店"
@@ -48,6 +57,8 @@ def test_all_eight_tools_and_pagination(env: TravelWeaverEnv) -> None:
     first_id, second_id = first_page["items"][0]["place_id"], first_page["items"][1]["place_id"]
     inspected = _step(env, "inspect_place", place_id=first_id)
     assert inspected.observation.tool_result["item"]["place_id"] == first_id
+    open_check = _step(env, "check_place_open", place_id=first_id, at_time="12:00")
+    assert open_check.observation.tool_result["is_open"] is True
 
     nearby = _step(env, "search_nearby", place_id=first_id, category="attraction")
     assert nearby.observation.tool_result["items"]
@@ -122,16 +133,37 @@ def test_step_limit_truncates(backend, task_store) -> None:
     assert final.info["termination_reason"] == "step_limit"
 
 
-def test_terminal_action_is_allowed_on_the_last_valid_step(backend, task_store) -> None:
+def test_rejected_submission_is_terminal_on_the_last_valid_step(backend, task_store) -> None:
     env = TravelWeaverEnv(backend, task_store, max_valid_steps=1)
     env.reset("task-hangzhou")
 
-    final = _step(env, "finish_without_plan", reason="无解")
+    final = _step(
+        env,
+        "submit_plan",
+        plan={
+            "people_number": 1,
+            "start_city": "上海",
+            "target_city": "杭州",
+            "itinerary": [
+                {
+                    "day": 1,
+                    "activities": [
+                        {
+                            "candidate_id": "not-saved",
+                            "type": "attraction",
+                            "start_time": "10:00",
+                            "end_time": "12:00",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
 
     assert final.terminated
     assert not final.truncated
     assert final.observation.remaining_steps == 0
-    assert final.info["termination_reason"] == "finished_without_plan"
+    assert final.info["termination_reason"] == "invalid_plan_submitted"
 
 
 def test_default_step_limit_truncates_after_50_valid_actions(backend, task_store) -> None:
@@ -207,6 +239,22 @@ def test_candidate_management_and_plan_submission_close_the_loop(env: TravelWeav
         mode="walk",
         start_time="12:00",
     ).observation.tool_result["route"]
+    arrival_route = _step(
+        env,
+        "get_route",
+        origin_place_id=outbound["destination_anchor_id"],
+        destination_place_id=attraction["place_id"],
+        mode="walk",
+        start_time="09:00",
+    ).observation.tool_result["route"]
+    return_route = _step(
+        env,
+        "get_route",
+        origin_place_id=restaurant["place_id"],
+        destination_place_id=returning["origin_anchor_id"],
+        mode="walk",
+        start_time="13:30",
+    ).observation.tool_result["route"]
 
     for item, purpose in (
         (attraction, "attraction"),
@@ -251,6 +299,7 @@ def test_candidate_management_and_plan_submission_close_the_loop(env: TravelWeav
                         "type": "attraction",
                         "start_time": "10:00",
                         "end_time": "12:00",
+                        "route_from_previous_id": arrival_route["route_id"],
                     },
                     {
                         "candidate_id": restaurant["place_id"],
@@ -264,6 +313,7 @@ def test_candidate_management_and_plan_submission_close_the_loop(env: TravelWeav
                         "type": "train",
                         "start_time": "18:00",
                         "end_time": "19:00",
+                        "route_from_previous_id": return_route["route_id"],
                     },
                 ],
             }
@@ -279,20 +329,14 @@ def test_candidate_management_and_plan_submission_close_the_loop(env: TravelWeav
     assert submitted.observation.tool_result["validation"]["candidate_grounding"]
     assert submitted.observation.tool_result["validation"]["route_grounding"]
     assert submitted.observation.tool_result["plan_snapshot"]["total_cost"] == 234.0
-    assert submitted.observation.tool_result["evidence_bundle"]["routes"] == {
-        route["route_id"]: route
+    assert set(submitted.observation.tool_result["evidence_bundle"]["routes"]) == {
+        arrival_route["route_id"],
+        route["route_id"],
+        return_route["route_id"],
     }
 
 
-def test_finish_without_plan_is_terminal(env: TravelWeaverEnv) -> None:
-    env.reset("task-hangzhou")
-    finished = _step(env, "finish_without_plan", reason="没有符合预算的候选。")
-    assert finished.terminated
-    assert finished.info["termination_reason"] == "finished_without_plan"
-    assert finished.reward == -1.0
-
-
-def test_invalid_submission_does_not_terminate(env: TravelWeaverEnv) -> None:
+def test_schema_valid_invalid_submission_terminates_without_retry(env: TravelWeaverEnv) -> None:
     env.reset("task-hangzhou")
     invalid = env.step(
         {
@@ -319,5 +363,7 @@ def test_invalid_submission_does_not_terminate(env: TravelWeaverEnv) -> None:
             },
         }
     )
-    assert not invalid.info["valid_action"]
-    assert not invalid.terminated
+    assert invalid.info["valid_action"]
+    assert invalid.terminated
+    assert invalid.info["termination_reason"] == "invalid_plan_submitted"
+    assert invalid.reward == -1.0

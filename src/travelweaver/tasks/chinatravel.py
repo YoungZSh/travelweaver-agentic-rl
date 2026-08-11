@@ -10,7 +10,7 @@ from ..errors import TaskSpecError
 from .compiler import CompileResult, build_base_spec
 from .models import ConstraintSpec
 
-ADAPTER_VERSION = "travelweaver-chinatravel-adapter-v1"
+ADAPTER_VERSION = "travelweaver-chinatravel-adapter-v2"
 
 _BUDGET = re.compile(r"total_cost\s*<=\s*(\d+(?:\.\d+)?)")
 _PER_PERSON_BUDGET = re.compile(r"total_cost\s*<=\s*people_number\s*\*\s*(\d+(?:\.\d+)?)")
@@ -170,6 +170,7 @@ class ChinaTravelOracleAdapter:
         left, operator, right = comparison.left, comparison.ops[0], comparison.comparators[0]
         left_set = cls._string_set(left)
         right_set = cls._string_set(right)
+        set_is_required_subset = left_set is not None and isinstance(right, ast.Name)
         variable = right.id if left_set is not None and isinstance(right, ast.Name) else None
         expected = left_set
         if right_set is not None and isinstance(left, ast.Name):
@@ -189,6 +190,16 @@ class ChinaTravelOracleAdapter:
                 source_text=source_text,
             )
         if variable == "innercity_transport_set" and isinstance(operator, ast.LtE):
+            if set_is_required_subset:
+                return ConstraintSpec(
+                    id=constraint_id,
+                    kind="transport_mode",
+                    operator="include",
+                    value={"modes": sorted(expected)},
+                    scope="innercity_route",
+                    hardness="hard",
+                    source_text=source_text,
+                )
             return ConstraintSpec(
                 id=constraint_id,
                 kind="transport_mode",

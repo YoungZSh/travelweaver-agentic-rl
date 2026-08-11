@@ -1,4 +1,4 @@
-"""Deterministic TravelReward v1."""
+"""Deterministic unified plan validity and TravelReward v2."""
 
 from __future__ import annotations
 
@@ -11,7 +11,29 @@ from ..tasks import TravelTaskSpec
 from .evaluators import evaluate_constraint
 from .models import CHECK_FAIL, CHECK_PASS, CHECK_UNVERIFIABLE, CheckResult, RewardResult
 
-REWARD_VERSION = "travelweaver-reward-v1"
+REWARD_VERSION = "travelweaver-reward-v2"
+
+REWARD_GROUPS = (
+    "protocol_structure",
+    "evidence_grounding",
+    "spatiotemporal_commonsense",
+    "task_constraints",
+    "quantity_cost",
+)
+
+_CHECK_GROUPS = {
+    "task_alignment": "protocol_structure",
+    "plan_structure": "protocol_structure",
+    "terminal_plan": "protocol_structure",
+    "entity_grounding": "evidence_grounding",
+    "route_grounding": "evidence_grounding",
+    "opening_hours": "spatiotemporal_commonsense",
+    "trip_coverage": "spatiotemporal_commonsense",
+    "entity_uniqueness": "spatiotemporal_commonsense",
+    "meal_commonsense": "spatiotemporal_commonsense",
+    "quantity_consistency": "quantity_cost",
+    "cost_accounting": "quantity_cost",
+}
 
 
 def _env_check(
@@ -87,16 +109,20 @@ class TravelReward:
             all_hard_pass=False,
             checks=(check,),
             task_spec_hash=None,
+            group_results={group: False for group in REWARD_GROUPS},
+            sft_accepted=False,
+            rl_reward=-1.0,
         )
 
     @staticmethod
     def _score(
         checks: tuple[CheckResult, ...], termination_reason: str, spec_hash: str
     ) -> RewardResult:
+        group_results = TravelReward._group_results(checks)
         if any(check.status == CHECK_UNVERIFIABLE for check in checks):
             return RewardResult(
                 reward_version=REWARD_VERSION,
-                reward=0.0,
+                reward=-1.0,
                 reward_type="reward_unverifiable",
                 reward_valid=False,
                 termination_reason=termination_reason,
@@ -105,6 +131,9 @@ class TravelReward:
                 all_hard_pass=False,
                 checks=checks,
                 task_spec_hash=spec_hash,
+                group_results=group_results,
+                sft_accepted=False,
+                rl_reward=-1.0,
             )
         hard = [check for check in checks if check.hardness == "hard"]
         soft = [check for check in checks if check.hardness == "soft"]
@@ -115,11 +144,13 @@ class TravelReward:
             reward = 0.5 + 0.5 * soft_score
             reward_type = "strict_valid_plan" if soft_score == 1.0 else "feasible_plan"
         else:
-            reward = -1.0 + hard_score
+            reward = -0.5 + 0.1 * sum(group_results.values())
             reward_type = "hard_constraint_failure"
+        reward = round(reward, 8)
+        sft_accepted = all_hard_pass and soft_score == 1.0
         return RewardResult(
             reward_version=REWARD_VERSION,
-            reward=round(reward, 8),
+            reward=reward,
             reward_type=reward_type,
             reward_valid=True,
             termination_reason=termination_reason,
@@ -128,7 +159,26 @@ class TravelReward:
             all_hard_pass=all_hard_pass,
             checks=checks,
             task_spec_hash=spec_hash,
+            group_results=group_results,
+            sft_accepted=sft_accepted,
+            rl_reward=reward,
         )
+
+    @staticmethod
+    def _group_results(checks: tuple[CheckResult, ...]) -> dict[str, bool]:
+        grouped: dict[str, list[CheckResult]] = {group: [] for group in REWARD_GROUPS}
+        for check in checks:
+            group = (
+                "task_constraints"
+                if check.source == "task_spec"
+                else _CHECK_GROUPS.get(check.id, "protocol_structure")
+            )
+            if check.hardness == "hard":
+                grouped[group].append(check)
+        return {
+            group: all(check.status == CHECK_PASS for check in group_checks)
+            for group, group_checks in grouped.items()
+        }
 
     def _environment_checks(
         self,
@@ -151,9 +201,116 @@ class TravelReward:
         checks.append(self._route_grounding(activities, routes))
         checks.append(self._opening_hours(activities, entities))
         checks.append(self._trip_coverage(spec, activities, entities))
+        checks.append(self._entity_uniqueness(activities, entities))
+        checks.append(self._meal_commonsense(activities, entities))
         checks.append(self._quantity_consistency(spec, activities, evidence))
         checks.append(self._cost_accounting(activities, evidence))
         return checks
+
+    @staticmethod
+    def _entity_uniqueness(
+        activities: list[dict[str, Any]], entities: Mapping[str, Any]
+    ) -> CheckResult:
+        attraction_ids: list[str] = []
+        restaurant_ids: list[str] = []
+        for activity in activities:
+            candidate_id = activity.get("candidate_id")
+            if not isinstance(candidate_id, str):
+                continue
+            activity_type = activity.get("activity_type")
+            entity = entities.get(candidate_id, {})
+            entity_type = entity.get("entity_type") if isinstance(entity, Mapping) else None
+            if activity_type == "attraction":
+                attraction_ids.append(candidate_id)
+            elif activity_type in {"breakfast", "lunch", "dinner"} and entity_type == "restaurant":
+                restaurant_ids.append(candidate_id)
+        repeated_attractions = sorted(
+            candidate_id
+            for candidate_id in set(attraction_ids)
+            if attraction_ids.count(candidate_id) > 1
+        )
+        repeated_restaurants = sorted(
+            candidate_id
+            for candidate_id in set(restaurant_ids)
+            if restaurant_ids.count(candidate_id) > 1
+        )
+        passed = not repeated_attractions and not repeated_restaurants
+        return _env_check(
+            "entity_uniqueness",
+            CHECK_PASS if passed else CHECK_FAIL,
+            "Attractions and ordinary restaurants are not repeated during the trip.",
+            {
+                "repeated_attractions": repeated_attractions,
+                "repeated_restaurants": repeated_restaurants,
+            },
+        )
+
+    @staticmethod
+    def _meal_commonsense(
+        activities: list[dict[str, Any]], entities: Mapping[str, Any]
+    ) -> CheckResult:
+        windows = {
+            "breakfast": (6 * 60, 9 * 60),
+            "lunch": (11 * 60, 14 * 60),
+            "dinner": (17 * 60, 20 * 60),
+        }
+        counts: dict[tuple[int, str], int] = defaultdict(int)
+        inappropriate: list[dict[str, Any]] = []
+        repeated: list[dict[str, Any]] = []
+        unverifiable: list[dict[str, Any]] = []
+        for activity in activities:
+            meal_type = activity.get("activity_type")
+            if meal_type not in windows:
+                continue
+            day = activity.get("day")
+            start = _minutes(activity.get("start_time"))
+            end = _minutes(activity.get("end_time"), allow_24=True)
+            if not isinstance(day, int) or start is None or end is None:
+                unverifiable.append({"day": day, "candidate_id": activity.get("candidate_id")})
+                continue
+            key = (day, str(meal_type))
+            counts[key] += 1
+            if counts[key] > 1:
+                repeated.append({"day": day, "meal_type": meal_type})
+            lower, upper = windows[str(meal_type)]
+            if start < lower or end > upper:
+                inappropriate.append(
+                    {
+                        "day": day,
+                        "meal_type": meal_type,
+                        "candidate_id": activity.get("candidate_id"),
+                        "start_time": activity.get("start_time"),
+                        "end_time": activity.get("end_time"),
+                    }
+                )
+            if meal_type == "breakfast":
+                entity = entities.get(activity.get("candidate_id"), {})
+                if isinstance(entity, Mapping) and entity.get("entity_type") == "hotel":
+                    price = _number(activity.get("unit_price"))
+                    amount = _number(activity.get("amount"))
+                    if price != 0.0 or amount != 0.0:
+                        inappropriate.append(
+                            {
+                                "day": day,
+                                "meal_type": meal_type,
+                                "candidate_id": activity.get("candidate_id"),
+                                "reason": "hotel_breakfast_must_be_free",
+                            }
+                        )
+        if unverifiable:
+            status = CHECK_UNVERIFIABLE
+        else:
+            status = CHECK_PASS if not inappropriate and not repeated else CHECK_FAIL
+        return _env_check(
+            "meal_commonsense",
+            status,
+            "Meal types are unique per day and occur inside official meal windows.",
+            {
+                "inappropriate": inappropriate,
+                "repeated": repeated,
+                "unverifiable": unverifiable,
+            },
+        )
 
     @staticmethod
     def _task_alignment(spec: TravelTaskSpec, plan: Mapping[str, Any]) -> CheckResult:
@@ -185,8 +342,22 @@ class TravelReward:
         attraction_count = 0
         for activity in activities:
             day = activity.get("day")
-            start = _minutes(activity.get("start_time"))
-            end = _minutes(activity.get("end_time"), allow_24=True)
+            start = activity.get("absolute_start")
+            end = activity.get("absolute_end")
+            if not isinstance(start, int):
+                clock = _minutes(activity.get("start_time"))
+                start = (
+                    (day - 1) * 24 * 60 + clock
+                    if isinstance(day, int) and clock is not None
+                    else None
+                )
+            if not isinstance(end, int):
+                clock = _minutes(activity.get("end_time"), allow_24=True)
+                end = (
+                    (day - 1) * 24 * 60 + clock
+                    if isinstance(day, int) and clock is not None
+                    else None
+                )
             if not isinstance(day, int) or start is None or end is None or end <= start:
                 valid = False
                 continue
@@ -230,49 +401,66 @@ class TravelReward:
         missing = []
         mismatched = []
         unverifiable = []
-        by_day: dict[int, list[dict[str, Any]]] = defaultdict(list)
-        for activity in activities:
-            if isinstance(activity.get("day"), int):
-                by_day[activity["day"]].append(activity)
-        for day_activities in by_day.values():
-            previous: dict[str, Any] | None = None
-            for activity in sorted(
-                day_activities, key=lambda item: int(item.get("activity_index", 0))
-            ):
-                if activity.get("activity_type") in {"train", "airplane"}:
-                    continue
-                if previous is not None:
-                    route_id = activity.get("route_from_previous_id")
-                    route = routes.get(route_id) if isinstance(route_id, str) else None
-                    if not isinstance(route, Mapping):
-                        missing.append(
-                            {
-                                "origin": previous.get("candidate_id"),
-                                "destination": activity.get("candidate_id"),
-                                "route_id": route_id,
-                            }
-                        )
-                    elif (
-                        route.get("origin_place_id") != previous.get("candidate_id")
-                        or route.get("destination_place_id") != activity.get("candidate_id")
-                    ):
-                        mismatched.append(route_id)
+        ordered = sorted(
+            activities,
+            key=lambda item: (int(item.get("day", 0)), int(item.get("activity_index", 0))),
+        )
+        previous: dict[str, Any] | None = None
+        for activity in ordered:
+            current_origin = activity.get("origin_position_id") or activity.get("candidate_id")
+            previous_destination = (
+                previous.get("destination_position_id") or previous.get("candidate_id")
+                if previous is not None
+                else None
+            )
+            requires_route = previous is not None and previous_destination != current_origin
+            route_id = activity.get("route_from_previous_id")
+            if requires_route:
+                route = routes.get(route_id) if isinstance(route_id, str) else None
+                if not isinstance(route, Mapping):
+                    missing.append(
+                        {
+                            "origin": previous_destination,
+                            "destination": current_origin,
+                            "route_id": route_id,
+                        }
+                    )
+                elif (
+                    route.get("origin_place_id") != previous_destination
+                    or route.get("destination_place_id") != current_origin
+                ):
+                    mismatched.append(route_id)
+                else:
+                    segments = route.get("segments")
+                    if not isinstance(segments, list) or not segments:
+                        unverifiable.append(route_id)
                     else:
-                        segments = route.get("segments")
-                        if not isinstance(segments, list) or not segments:
+                        first = segments[0] if isinstance(segments[0], Mapping) else {}
+                        last = segments[-1] if isinstance(segments[-1], Mapping) else {}
+                        route_start = _minutes(first.get("start_time"))
+                        route_end = _minutes(last.get("end_time"), allow_24=True)
+                        previous_end = previous.get("absolute_end")
+                        next_start = activity.get("absolute_start")
+                        day = activity.get("day")
+                        if (
+                            route_start is None
+                            or route_end is None
+                            or not isinstance(previous_end, int)
+                            or not isinstance(next_start, int)
+                            or not isinstance(day, int)
+                        ):
                             unverifiable.append(route_id)
                         else:
-                            first = segments[0] if isinstance(segments[0], Mapping) else {}
-                            last = segments[-1] if isinstance(segments[-1], Mapping) else {}
-                            route_start = _minutes(first.get("start_time"))
-                            route_end = _minutes(last.get("end_time"), allow_24=True)
-                            previous_end = _minutes(previous.get("end_time"), allow_24=True)
-                            next_start = _minutes(activity.get("start_time"))
-                            if None in {route_start, route_end, previous_end, next_start}:
-                                unverifiable.append(route_id)
-                            elif route_start < previous_end or route_end > next_start:
+                            day_base = (day - 1) * 24 * 60
+                            route_start += day_base
+                            route_end += day_base
+                            if route_end < route_start:
+                                route_end += 24 * 60
+                            if route_start < previous_end or route_end > next_start:
                                 mismatched.append(route_id)
-                previous = activity
+            elif route_id is not None:
+                mismatched.append(route_id)
+            previous = activity
         if unverifiable:
             status = CHECK_UNVERIFIABLE
         else:
@@ -296,6 +484,11 @@ class TravelReward:
             entity = entities.get(activity.get("candidate_id"))
             if not isinstance(entity, Mapping):
                 unverifiable.append(activity.get("candidate_id"))
+                continue
+            if (
+                activity.get("activity_type") == "breakfast"
+                and entity.get("entity_type") == "hotel"
+            ):
                 continue
             opening = _minutes(entity.get("open_time"))
             closing = _minutes(entity.get("close_time"), allow_24=True)
@@ -339,6 +532,21 @@ class TravelReward:
         )
         valid = accommodations >= max(0, spec.trip.days - 1)
         valid = valid and required_directions.issubset(actual_directions)
+        ordered = sorted(
+            activities,
+            key=lambda item: (int(item.get("day", 0)), int(item.get("activity_index", 0))),
+        )
+        if required_directions and ordered:
+            first_entity = entities.get(ordered[0].get("candidate_id"), {})
+            last_entity = entities.get(ordered[-1].get("candidate_id"), {})
+            valid = valid and isinstance(first_entity, Mapping) and (
+                str(first_entity.get("origin_city")),
+                str(first_entity.get("destination_city")),
+            ) == (spec.trip.origin, destination)
+            valid = valid and isinstance(last_entity, Mapping) and (
+                str(last_entity.get("origin_city")),
+                str(last_entity.get("destination_city")),
+            ) == (destination, spec.trip.origin)
         return _env_check(
             "trip_coverage",
             CHECK_PASS if valid else CHECK_FAIL,
@@ -347,6 +555,8 @@ class TravelReward:
                 "required_directions": sorted(required_directions),
                 "actual_directions": sorted(actual_directions),
                 "accommodation_nights": accommodations,
+                "first_activity": ordered[0].get("candidate_id") if ordered else None,
+                "last_activity": ordered[-1].get("candidate_id") if ordered else None,
             },
         )
 

@@ -43,6 +43,9 @@ class RewardResult:
     all_hard_pass: bool
     checks: tuple[CheckResult, ...]
     task_spec_hash: str | None
+    group_results: dict[str, bool]
+    sft_accepted: bool
+    rl_reward: float
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)

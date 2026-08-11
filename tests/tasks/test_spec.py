@@ -151,3 +151,22 @@ def test_chinatravel_adapter_maps_all_654_pinned_tasks_without_exec() -> None:
     )
     assert not unsafe.accepted
     assert "unsafe AST" in unsafe.errors[0]
+
+
+def test_chinatravel_adapter_distinguishes_required_and_allowed_innercity_modes() -> None:
+    adapter = ChinaTravelOracleAdapter()
+    required = adapter.compile(
+        _task(),
+        {"hard_logic": ["result = ({'metro'} <= innercity_transport_set)"]},
+    )
+    allowed = adapter.compile(
+        _task(),
+        {"hard_logic": ["result = (innercity_transport_set <= {'metro', 'walk'})"]},
+    )
+
+    assert required.accepted and required.spec is not None
+    assert required.spec.constraints[0].operator == "include"
+    assert required.spec.constraints[0].value == {"modes": ["metro"]}
+    assert allowed.accepted and allowed.spec is not None
+    assert allowed.spec.constraints[0].operator == "not_in"
+    assert allowed.spec.constraints[0].value == {"modes": ["taxi"]}

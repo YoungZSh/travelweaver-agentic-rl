@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from ..errors import BackendQueryError
-from .backend import Backend
+from .backend import Backend, _facet_values, _is_open, _number
 
 SCENARIO_VERSION = "travelweaver-scenario-v1"
 
@@ -117,26 +117,58 @@ class ScenarioBackend:
     def search_attractions(self, **arguments: Any) -> list[dict[str, Any]]:
         return self._search_places("search_attractions", arguments)
 
+    def list_attraction_categories(self, city: str) -> dict[str, Any]:
+        return {
+            "city": city,
+            "categories": _facet_values(self._records("attraction", city), "category"),
+        }
+
     def search_restaurants(self, **arguments: Any) -> list[dict[str, Any]]:
         return self._search_places("search_restaurants", arguments)
 
+    def list_restaurant_cuisines(self, city: str) -> dict[str, Any]:
+        return {
+            "city": city,
+            "cuisines": _facet_values(self._records("restaurant", city), "cuisine"),
+        }
+
+    def search_restaurants_by_food(self, **arguments: Any) -> list[dict[str, Any]]:
+        return self._search_places("search_restaurants_by_food", arguments)
+
     def search_hotels(self, **arguments: Any) -> list[dict[str, Any]]:
         return self._search_places("search_hotels", arguments)
+
+    def list_hotel_features(self, city: str) -> dict[str, Any]:
+        records = self._records("hotel", city)
+        room_types = sorted(
+            {
+                int(value)
+                for record in records
+                if (value := _number(record.get("room_type"))) is not None and value >= 1
+            }
+        )
+        return {
+            "city": city,
+            "features": _facet_values(records, "hotel_type"),
+            "room_types": room_types,
+        }
 
     def _search_places(
         self,
         method_name: str,
         arguments: dict[str, Any],
     ) -> list[dict[str, Any]]:
+        requested_min_price = arguments.get("min_price")
         requested_max_price = arguments.get("max_price")
         base_arguments = dict(arguments)
+        base_arguments["min_price"] = None
         base_arguments["max_price"] = None
         records = getattr(self.base, method_name)(**base_arguments)
         adjusted = [
             item
             for record in records
             if (item := self._adjust_place(record)) is not None
-            and _within_price(item, requested_max_price)
+            and _within_price_range(item, requested_min_price, requested_max_price)
         ]
         if arguments.get("sort_by", "name") == "price":
             adjusted.sort(key=_price_sort_key)
@@ -158,12 +190,15 @@ class ScenarioBackend:
 
     def search_nearby(self, **arguments: Any) -> list[dict[str, Any]]:
         self._require_available(str(arguments["place_id"]))
-        records = self.base.search_nearby(**arguments)
-        return [
+        base_arguments = dict(arguments)
+        top_k = base_arguments.pop("top_k", None)
+        records = self.base.search_nearby(**base_arguments)
+        adjusted = [
             item
             for record in records
             if (item := self._adjust_place(record)) is not None
         ]
+        return adjusted[: int(top_k)] if top_k is not None else adjusted
 
     def inspect_place(self, place_id: str) -> dict[str, Any]:
         self._require_available(place_id)
@@ -171,6 +206,19 @@ class ScenarioBackend:
         if adjusted is None:
             raise BackendQueryError(f"场景中地点 {place_id!r} 不可用。")
         return adjusted
+
+    def check_place_open(self, place_id: str, at_time: str) -> dict[str, Any]:
+        record = self.inspect_place(place_id)
+        if record.get("entity_type") not in {"attraction", "restaurant"}:
+            raise BackendQueryError("只有景点和餐厅支持开放时间检查。")
+        return {
+            "place_id": place_id,
+            "name": record.get("name"),
+            "at_time": at_time,
+            "is_open": _is_open(record, at_time),
+            "open_time": record.get("open_time"),
+            "close_time": record.get("close_time"),
+        }
 
     def get_route(self, **arguments: Any) -> dict[str, Any]:
         self._require_available(str(arguments["origin_place_id"]))
@@ -192,14 +240,14 @@ class ScenarioBackend:
             raise BackendQueryError(f"场景中实体 {entity_id!r} 不可用。")
 
 
-def _within_price(record: dict[str, Any], maximum: Any) -> bool:
-    if maximum is None:
+def _within_price_range(record: dict[str, Any], minimum: Any, maximum: Any) -> bool:
+    if minimum is None and maximum is None:
         return True
     price = record.get("price")
-    return (
-        isinstance(price, (int, float))
-        and not isinstance(price, bool)
-        and float(price) <= float(maximum)
+    if not isinstance(price, (int, float)) or isinstance(price, bool):
+        return False
+    return (minimum is None or float(price) >= float(minimum)) and (
+        maximum is None or float(price) <= float(maximum)
     )
 
 

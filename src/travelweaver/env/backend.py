@@ -26,17 +26,27 @@ class Backend(Protocol):
 
     def _records(self, kind: str, city: str) -> list[dict[str, Any]]: ...
 
+    def list_attraction_categories(self, city: str) -> dict[str, Any]: ...
+
     def search_attractions(self, **arguments: Any) -> list[dict[str, Any]]: ...
 
     def search_restaurants(self, **arguments: Any) -> list[dict[str, Any]]: ...
 
+    def list_restaurant_cuisines(self, city: str) -> dict[str, Any]: ...
+
+    def search_restaurants_by_food(self, **arguments: Any) -> list[dict[str, Any]]: ...
+
     def search_hotels(self, **arguments: Any) -> list[dict[str, Any]]: ...
+
+    def list_hotel_features(self, city: str) -> dict[str, Any]: ...
 
     def search_intercity_transport(self, **arguments: Any) -> list[dict[str, Any]]: ...
 
     def search_nearby(self, **arguments: Any) -> list[dict[str, Any]]: ...
 
     def inspect_place(self, place_id: str) -> dict[str, Any]: ...
+
+    def check_place_open(self, place_id: str, at_time: str) -> dict[str, Any]: ...
 
     def get_route(self, **arguments: Any) -> dict[str, Any]: ...
 
@@ -113,6 +123,19 @@ def _is_open(record: Mapping[str, Any], at: str | None) -> bool:
     return query >= opening or query <= closing
 
 
+def _facet_values(records: Iterable[Mapping[str, Any]], field: str) -> list[str]:
+    values: set[str] = set()
+    for record in records:
+        raw = record.get(field)
+        if raw is None:
+            continue
+        for value in re.split(r"[,，、|/]+", str(raw)):
+            normalized = value.strip()
+            if normalized:
+                values.add(normalized)
+    return sorted(values, key=normalize_name)
+
+
 def _add_hours(start_time: str, hours: float) -> str:
     start = datetime.strptime(start_time, "%H:%M")
     end = start + timedelta(hours=hours)
@@ -149,7 +172,10 @@ class RecordBackend:
             self._places[place_id] = record
             self._by_kind_city[(str(record["entity_type"]), str(record["city"]))].append(place_id)
 
-        self._transports = [_json_value(dict(record)) for record in transports]
+        self._route_anchors: dict[str, dict[str, Any]] = {}
+        self._transports = [
+            self._attach_route_anchors(_json_value(dict(record))) for record in transports
+        ]
         self._route_provider = route_provider
 
     @property
@@ -186,6 +212,7 @@ class RecordBackend:
         kind: str,
         city: str,
         query: str | None = None,
+        min_price: float | None = None,
         max_price: float | None = None,
         open_at: str | None = None,
         sort_by: str = "name",
@@ -198,6 +225,8 @@ class RecordBackend:
             if not _contains(record.get("name"), query):
                 continue
             price = _number(record.get("price"))
+            if min_price is not None and (price is None or price < min_price):
+                continue
             if max_price is not None and (price is None or price > max_price):
                 continue
             if not _is_open(record, open_at):
@@ -229,25 +258,59 @@ class RecordBackend:
             )
         return filtered
 
+    def list_attraction_categories(self, city: str) -> dict[str, Any]:
+        return {
+            "city": city,
+            "categories": _facet_values(self._records("attraction", city), "category"),
+        }
+
     def search_attractions(
         self,
         *,
         city: str,
         query: str | None = None,
         category: str | None = None,
+        min_price: float | None = None,
         max_price: float | None = None,
+        min_recommended_hours: float | None = None,
+        max_recommended_hours: float | None = None,
         open_at: str | None = None,
         sort_by: str = "name",
     ) -> list[dict[str, Any]]:
-        return self._search(
+        results = self._search(
             kind="attraction",
             city=city,
             query=query,
+            min_price=min_price,
             max_price=max_price,
             open_at=open_at,
             sort_by=sort_by,
             string_filters={"category": category},
         )
+        return [
+            item
+            for item in results
+            if (
+                min_recommended_hours is None
+                or (
+                    (value := _number(item.get("recommended_min_hours"))) is not None
+                    and value >= min_recommended_hours
+                )
+            )
+            and (
+                max_recommended_hours is None
+                or (
+                    (value := _number(item.get("recommended_max_hours"))) is not None
+                    and value <= max_recommended_hours
+                )
+            )
+        ]
+
+    def list_restaurant_cuisines(self, city: str) -> dict[str, Any]:
+        return {
+            "city": city,
+            "cuisines": _facet_values(self._records("restaurant", city), "cuisine"),
+        }
 
     def search_restaurants(
         self,
@@ -256,6 +319,7 @@ class RecordBackend:
         query: str | None = None,
         cuisine: str | None = None,
         recommended_food: str | None = None,
+        min_price: float | None = None,
         max_price: float | None = None,
         open_at: str | None = None,
         sort_by: str = "name",
@@ -264,11 +328,44 @@ class RecordBackend:
             kind="restaurant",
             city=city,
             query=query,
+            min_price=min_price,
             max_price=max_price,
             open_at=open_at,
             sort_by=sort_by,
             string_filters={"cuisine": cuisine, "recommended_food": recommended_food},
         )
+
+    def search_restaurants_by_food(
+        self,
+        *,
+        city: str,
+        food: str,
+        min_price: float | None = None,
+        max_price: float | None = None,
+        sort_by: str = "name",
+    ) -> list[dict[str, Any]]:
+        return self.search_restaurants(
+            city=city,
+            recommended_food=food,
+            min_price=min_price,
+            max_price=max_price,
+            sort_by=sort_by,
+        )
+
+    def list_hotel_features(self, city: str) -> dict[str, Any]:
+        records = self._records("hotel", city)
+        room_types = sorted(
+            {
+                int(value)
+                for record in records
+                if (value := _number(record.get("room_type"))) is not None and value >= 1
+            }
+        )
+        return {
+            "city": city,
+            "features": _facet_values(records, "hotel_type"),
+            "room_types": room_types,
+        }
 
     def search_hotels(
         self,
@@ -277,6 +374,7 @@ class RecordBackend:
         query: str | None = None,
         hotel_type: str | None = None,
         room_type: int | None = None,
+        min_price: float | None = None,
         max_price: float | None = None,
         sort_by: str = "name",
     ) -> list[dict[str, Any]]:
@@ -284,6 +382,7 @@ class RecordBackend:
             kind="hotel",
             city=city,
             query=query,
+            min_price=min_price,
             max_price=max_price,
             sort_by=sort_by,
             string_filters={"hotel_type": hotel_type},
@@ -322,6 +421,7 @@ class RecordBackend:
         place_id: str,
         category: str,
         radius_km: float = 2.0,
+        top_k: int | None = None,
     ) -> list[dict[str, Any]]:
         origin = self._require_place(place_id)
         origin_position = self._position(origin)
@@ -344,10 +444,24 @@ class RecordBackend:
                 str(row.get("place_id", "")),
             )
         )
-        return results
+        return results[:top_k] if top_k is not None else results
 
     def inspect_place(self, place_id: str) -> dict[str, Any]:
         return dict(self._require_place(place_id))
+
+    def check_place_open(self, place_id: str, at_time: str) -> dict[str, Any]:
+        record = self._require_place(place_id)
+        if record.get("entity_type") not in {"attraction", "restaurant"}:
+            raise BackendQueryError("只有景点和餐厅支持开放时间检查。")
+        _minutes(at_time)
+        return {
+            "place_id": place_id,
+            "name": record.get("name"),
+            "at_time": at_time,
+            "is_open": _is_open(record, at_time),
+            "open_time": record.get("open_time"),
+            "close_time": record.get("close_time"),
+        }
 
     def get_route(
         self,
@@ -399,9 +513,51 @@ class RecordBackend:
 
     def _require_place(self, place_id: str) -> dict[str, Any]:
         try:
-            return self._places[place_id]
+            return self._places.get(place_id) or self._route_anchors[place_id]
         except KeyError as error:
             raise BackendQueryError(f"未知 place_id：{place_id}。") from error
+
+    def _attach_route_anchors(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Attach deterministic station/airport anchors to one intercity record."""
+
+        result = dict(record)
+        origin_city = str(result.get("origin_city") or "")
+        destination_city = str(result.get("destination_city") or "")
+        origin_name = str(result.get("origin") or origin_city)
+        destination_name = str(result.get("destination") or destination_city)
+        origin = self._route_anchor(origin_city, origin_name)
+        destination = self._route_anchor(destination_city, destination_name)
+        result["origin_anchor_id"] = origin["place_id"]
+        result["destination_anchor_id"] = destination["place_id"]
+        result["origin_anchor"] = self._summary(origin)
+        result["destination_anchor"] = self._summary(destination)
+        return result
+
+    def _route_anchor(self, city: str, name: str) -> dict[str, Any]:
+        anchor_id = make_place_id(entity_type="route_anchor", city=city, name=name)
+        existing = self._route_anchors.get(anchor_id)
+        if existing is not None:
+            return existing
+        coordinates = [
+            self._position(record)
+            for record in self._places.values()
+            if record.get("city") == city
+            and _number(record.get("latitude")) is not None
+            and _number(record.get("longitude")) is not None
+        ]
+        latitude = sum(item[0] for item in coordinates) / len(coordinates) if coordinates else None
+        longitude = sum(item[1] for item in coordinates) / len(coordinates) if coordinates else None
+        anchor = {
+            "place_id": anchor_id,
+            "entity_type": "route_anchor",
+            "city": city,
+            "name": name,
+            "latitude": latitude,
+            "longitude": longitude,
+            "price": 0.0,
+        }
+        self._route_anchors[anchor_id] = anchor
+        return anchor
 
     @staticmethod
     def _position(record: Mapping[str, Any]) -> tuple[float, float]:
@@ -543,7 +699,8 @@ class ChinaTravelBackend(RecordBackend):
         for raw in frame.to_dict("records"):
             raw = {str(key): _json_value(value) for key, value in raw.items()}
             records.append(
-                {
+                self._attach_route_anchors(
+                    {
                     "transport_id": make_transport_id(mode, raw),
                     "mode": mode,
                     "source_id": raw.get("TrainID") or raw.get("FlightID"),
@@ -555,8 +712,9 @@ class ChinaTravelBackend(RecordBackend):
                     "arrival_time": raw.get("EndTime"),
                     "duration_hours": raw.get("Duration"),
                     "cost": raw.get("Cost"),
-                    "train_type": raw.get("TrainType"),
-                }
+                        "train_type": raw.get("TrainType"),
+                    }
+                )
             )
         records.sort(
             key=lambda row: (

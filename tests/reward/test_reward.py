@@ -20,7 +20,7 @@ def test_environment_returns_strict_terminal_reward(env) -> None:
 
     assert terminal["reward"] == 1.0
     detail = terminal["info"]["reward_detail"]
-    assert detail["reward_version"] == "travelweaver-reward-v1"
+    assert detail["reward_version"] == "travelweaver-reward-v2"
     assert detail["reward_type"] == "strict_valid_plan"
     assert detail["all_hard_pass"] is True
     assert all(check["status"] == "pass" for check in detail["checks"])
@@ -68,7 +68,7 @@ def test_unverifiable_evidence_is_excluded_from_rft(env) -> None:
     result = TravelReward().evaluate(build_base_spec(public_task), plan, broken)
     decision = strict_rft_filter(result, termination_reason="plan_submitted")
 
-    assert result.reward == 0.0
+    assert result.reward == -1.0
     assert not result.reward_valid
     assert not decision.accepted
     assert decision.reason == "reward_unverifiable"
@@ -115,3 +115,38 @@ def test_rft_accepts_only_normal_valid_hard_pass(env) -> None:
     assert detail["reward_valid"] is True
     assert accepted.accepted
     assert not wrong_terminal.accepted
+
+
+def test_reward_v2_groups_duplicate_entities_and_meal_time_as_commonsense(env) -> None:
+    _, public_task, plan, evidence = _terminal_evidence(env)
+    spec = build_base_spec(public_task)
+
+    duplicate_plan = deepcopy(plan)
+    duplicate_plan["activities"] = list(duplicate_plan["activities"])
+    attraction = next(
+        item for item in duplicate_plan["activities"] if item["activity_type"] == "attraction"
+    )
+    repeated = deepcopy(attraction)
+    repeated["activity_index"] = len(duplicate_plan["activities"])
+    repeated["start_time"] = "16:00"
+    repeated["end_time"] = "17:00"
+    duplicate_plan["activities"].append(repeated)
+    duplicate_result = TravelReward().evaluate(spec, duplicate_plan, evidence)
+
+    uniqueness = next(
+        check for check in duplicate_result.checks if check.id == "entity_uniqueness"
+    )
+    assert uniqueness.status == "fail"
+    assert not duplicate_result.group_results["spatiotemporal_commonsense"]
+    assert not duplicate_result.sft_accepted
+
+    meal_plan = deepcopy(plan)
+    lunch = next(
+        item for item in meal_plan["activities"] if item["activity_type"] == "lunch"
+    )
+    lunch["start_time"] = "15:00"
+    lunch["end_time"] = "16:00"
+    meal_result = TravelReward().evaluate(spec, meal_plan, evidence)
+    meal_check = next(check for check in meal_result.checks if check.id == "meal_commonsense")
+    assert meal_check.status == "fail"
+    assert not meal_result.group_results["spatiotemporal_commonsense"]

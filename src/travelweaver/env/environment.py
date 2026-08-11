@@ -21,20 +21,27 @@ from .ids import make_route_id
 from .models import EvidenceBundle, Observation, PlanSnapshot, StepResult
 from .tool_schemas import parameter_schema, tool_schemas
 
-ENVIRONMENT_VERSION = "travelweaver-environment-v0.3"
-OBSERVATION_VERSION = "travelweaver-observation-v3"
-TOOLS_VERSION = "travelweaver-tools-v2-agent"
-PLAN_SNAPSHOT_VERSION = "travelweaver-plan-snapshot-v1"
-EVIDENCE_BUNDLE_VERSION = "travelweaver-evidence-v1"
+ENVIRONMENT_VERSION = "travelweaver-environment-v0.5"
+OBSERVATION_VERSION = "travelweaver-observation-v4"
+TOOLS_VERSION = "travelweaver-tools-v4-agent"
+PLAN_SNAPSHOT_VERSION = "travelweaver-plan-snapshot-v2"
+EVIDENCE_BUNDLE_VERSION = "travelweaver-evidence-v2"
 QUANTITY_RULES_VERSION = "travelweaver-quantity-rules-v1"
 DEFAULT_MAX_VALID_STEPS = 50
 
 _SEARCH_TOOLS = {
     "search_attractions",
     "search_restaurants",
+    "search_restaurants_by_food",
     "search_hotels",
     "search_intercity_transport",
     "search_nearby",
+}
+
+_CATALOG_TOOLS = {
+    "list_attraction_categories",
+    "list_restaurant_cuisines",
+    "list_hotel_features",
 }
 
 
@@ -114,9 +121,14 @@ class TravelWeaverEnv:
         self._ensure_active()
         try:
             tool, arguments = self._validate_action(action)
+        except (BackendQueryError, TravelWeaverError, ValueError, TypeError) as error:
+            return self._invalid_step(error)
+        try:
             self._guard_visible_ids(tool, arguments)
             outcome = self._execute(tool, arguments)
         except (BackendQueryError, TravelWeaverError, ValueError, TypeError) as error:
+            if tool == "submit_plan":
+                return self._rejected_submission(error)
             return self._invalid_step(error)
 
         self._valid_steps += 1
@@ -194,7 +206,7 @@ class TravelWeaverEnv:
 
     def _guard_visible_ids(self, tool: str, arguments: Mapping[str, Any]) -> None:
         guarded: tuple[str, ...] = ()
-        if tool in {"inspect_place", "search_nearby"}:
+        if tool in {"inspect_place", "check_place_open", "search_nearby"}:
             guarded = (str(arguments["place_id"]),)
         elif tool == "save_candidate":
             guarded = (str(arguments["entity_id"]),)
@@ -221,15 +233,6 @@ class TravelWeaverEnv:
             return _ToolOutcome(self._remove_candidate(**arguments))
         if tool == "submit_plan":
             return _ToolOutcome(self._submit_plan(arguments["plan"]), "plan_submitted")
-        if tool == "finish_without_plan":
-            return _ToolOutcome(
-                {
-                    "tool": tool,
-                    "status": "finished_without_plan",
-                    "reason": arguments["reason"],
-                },
-                "finished_without_plan",
-            )
         if tool == "get_route":
             return _ToolOutcome(self._get_route(**arguments))
         method = getattr(self.backend, tool)
@@ -240,7 +243,11 @@ class TravelWeaverEnv:
             return _ToolOutcome(self._first_page(tool, arguments, raw))
         if not isinstance(raw, dict):
             raise BackendQueryError(f"Backend returned invalid result for {tool}.")
-        return _ToolOutcome({"tool": tool, "item" if tool == "inspect_place" else "route": raw})
+        if tool == "inspect_place":
+            return _ToolOutcome({"tool": tool, "item": raw})
+        if tool in _CATALOG_TOOLS or tool == "check_place_open":
+            return _ToolOutcome({"tool": tool, **raw})
+        raise BackendQueryError(f"Backend tool {tool} has no result serializer.")
 
     def _get_route(
         self,
@@ -328,6 +335,14 @@ class TravelWeaverEnv:
             if isinstance(entity_id, str):
                 self._visible_ids.add(entity_id)
                 self._visible_entities[entity_id] = dict(item)
+            for key in ("origin_anchor", "destination_anchor"):
+                anchor = item.get(key)
+                if not isinstance(anchor, Mapping):
+                    continue
+                anchor_id = anchor.get("place_id")
+                if isinstance(anchor_id, str):
+                    self._visible_ids.add(anchor_id)
+                    self._visible_entities[anchor_id] = dict(anchor)
 
     def _save_candidate(
         self, *, entity_id: str, purpose: str, note: str | None = None
@@ -405,10 +420,10 @@ class TravelWeaverEnv:
         used_entities: dict[str, dict[str, Any]] = {}
         used_routes: dict[str, dict[str, Any]] = {}
         people = int(self._task["people_number"])
+        previous_position_id: str | None = None
+        previous_absolute_end: int | None = None
         for day in itinerary:
-            previous_end = 0
-            previous_local_id: str | None = None
-            previous_local_end: int | None = None
+            day_number = int(day["day"])
             for activity_index, activity in enumerate(day["activities"]):
                 candidate_id = activity["candidate_id"]
                 candidate = self._candidates.get(candidate_id)
@@ -416,21 +431,28 @@ class TravelWeaverEnv:
                     raise ValueError(
                         f"Plan references a candidate that was not saved: {candidate_id}"
                     )
+                activity_type = activity["type"]
+                self._validate_candidate_type(candidate, activity_type)
+                evidence = dict(candidate["evidence"])
+                used_entities[candidate_id] = evidence
+
                 start = self._plan_minutes(activity["start_time"], allow_24=False)
                 end = self._plan_minutes(activity["end_time"], allow_24=True)
-                if end <= start:
+                overnight = activity_type in {"train", "airplane"} and end <= start
+                if end <= start and not overnight:
                     raise ValueError(
                         f"Activity {candidate_id} must end after it starts within a day."
                     )
-                if start < previous_end:
-                    raise ValueError(f"Activities overlap on day {day['day']}.")
-                previous_end = end
+                absolute_start = (day_number - 1) * 24 * 60 + start
+                absolute_end = (
+                    (day_number - 1 + int(overnight)) * 24 * 60 + end
+                )
+                if previous_absolute_end is not None and absolute_start < previous_absolute_end:
+                    raise ValueError(
+                        f"Activity {candidate_id} starts before the preceding activity ends."
+                    )
 
-                activity_type = activity["type"]
-                self._validate_candidate_type(candidate, activity_type)
                 activity_types.append(activity_type)
-                evidence = dict(candidate["evidence"])
-                used_entities[candidate_id] = evidence
                 if activity_type == "accommodation":
                     accommodation_count += 1
                     self._validate_room_selection(activity, evidence, people)
@@ -439,69 +461,87 @@ class TravelWeaverEnv:
                     transport_directions.add(
                         (str(evidence.get("origin_city")), str(evidence.get("destination_city")))
                     )
-                elif evidence.get("city") != self._task["target_city"]:
-                    raise ValueError(
-                        f"Destination activity is outside {self._task['target_city']}: "
-                        f"{candidate_id}"
-                    )
-
-                if activity_type not in {"train", "airplane"}:
+                    origin_position_id = str(evidence.get("origin_anchor_id") or "")
+                    destination_position_id = str(evidence.get("destination_anchor_id") or "")
+                    if not origin_position_id or not destination_position_id:
+                        raise ValueError(
+                            f"Intercity candidate {candidate_id} has no route anchor evidence."
+                        )
+                else:
+                    if evidence.get("city") != self._task["target_city"]:
+                        raise ValueError(
+                            f"Destination activity is outside {self._task['target_city']}: "
+                            f"{candidate_id}"
+                        )
                     self._validate_opening_hours(activity, evidence)
-                    route_id = activity.get("route_from_previous_id")
-                    if previous_local_id is None:
-                        if route_id is not None:
-                            raise ValueError(
-                                f"First local activity on day {day['day']} must not "
-                                "reference a route."
-                            )
-                    else:
-                        if not isinstance(route_id, str):
-                            raise ValueError(
-                                f"Activity {candidate_id} must reference route_from_previous_id."
-                            )
-                        route = self._validate_route_reference(
-                            route_id=route_id,
-                            origin_id=previous_local_id,
-                            destination_id=candidate_id,
-                            previous_end=previous_local_end,
-                            next_start=start,
+                    origin_position_id = candidate_id
+                    destination_position_id = candidate_id
+
+                route_id = activity.get("route_from_previous_id")
+                needs_route = (
+                    previous_position_id is not None
+                    and previous_position_id != origin_position_id
+                )
+                if needs_route:
+                    if not isinstance(route_id, str):
+                        raise ValueError(
+                            f"Activity {candidate_id} must reference route_from_previous_id "
+                            f"for {previous_position_id}->{origin_position_id}."
                         )
-                        used_routes[route_id] = route
-                        route_cost = self._route_cost_item(
-                            route, people, day["day"], activity_index
-                        )
-                        cost_items.append(route_cost)
-                    previous_local_id = candidate_id
-                    previous_local_end = end
+                    route = self._validate_route_reference(
+                        route_id=route_id,
+                        origin_id=str(previous_position_id),
+                        destination_id=origin_position_id,
+                        previous_absolute_end=previous_absolute_end,
+                        next_absolute_start=absolute_start,
+                        destination_day=day_number,
+                    )
+                    used_routes[route_id] = route
+                    for endpoint in (previous_position_id, origin_position_id):
+                        endpoint_evidence = self._visible_entities.get(str(endpoint))
+                        if isinstance(endpoint_evidence, Mapping):
+                            used_entities[str(endpoint)] = dict(endpoint_evidence)
+                    cost_items.append(
+                        self._route_cost_item(route, people, day_number, activity_index)
+                    )
+                elif route_id is not None:
+                    raise ValueError(
+                        f"Activity {candidate_id} references an unnecessary route."
+                    )
 
                 quantity, unit_price = self._activity_quantity_and_price(
                     activity_type, activity, evidence, people
                 )
-                amount = (
-                    round(quantity * unit_price, 2) if unit_price is not None else None
+                amount = round(quantity * unit_price, 2) if unit_price is not None else None
+                cost_items.append(
+                    {
+                        "kind": "activity",
+                        "day": day_number,
+                        "activity_index": activity_index,
+                        "candidate_id": candidate_id,
+                        "activity_type": activity_type,
+                        "quantity": quantity,
+                        "unit_price": unit_price,
+                        "amount": amount,
+                        "verifiable": unit_price is not None,
+                    }
                 )
-                cost_item = {
-                    "kind": "activity",
-                    "day": day["day"],
-                    "activity_index": activity_index,
-                    "candidate_id": candidate_id,
-                    "activity_type": activity_type,
-                    "quantity": quantity,
-                    "unit_price": unit_price,
-                    "amount": amount,
-                    "verifiable": unit_price is not None,
-                }
-                cost_items.append(cost_item)
                 normalized_activities.append(
                     {
-                        "day": day["day"],
+                        "day": day_number,
                         "activity_index": activity_index,
                         "candidate_id": candidate_id,
                         "entity_type": candidate["entity_type"],
                         "activity_type": activity_type,
                         "start_time": activity["start_time"],
                         "end_time": activity["end_time"],
-                        "route_from_previous_id": activity.get("route_from_previous_id"),
+                        "start_day_offset": day_number - 1,
+                        "end_day_offset": day_number - 1 + int(overnight),
+                        "absolute_start": absolute_start,
+                        "absolute_end": absolute_end,
+                        "origin_position_id": origin_position_id,
+                        "destination_position_id": destination_position_id,
+                        "route_from_previous_id": route_id,
                         "rooms": activity.get("rooms"),
                         "room_type": activity.get("room_type"),
                         "derived_quantity": quantity,
@@ -509,6 +549,8 @@ class TravelWeaverEnv:
                         "amount": amount,
                     }
                 )
+                previous_position_id = destination_position_id
+                previous_absolute_end = absolute_end
 
         if "attraction" not in activity_types:
             raise ValueError("A submitted travel plan must include at least one attraction.")
@@ -613,8 +655,9 @@ class TravelWeaverEnv:
         route_id: str,
         origin_id: str,
         destination_id: str,
-        previous_end: int | None,
-        next_start: int,
+        previous_absolute_end: int | None,
+        next_absolute_start: int,
+        destination_day: int,
     ) -> dict[str, Any]:
         route = self._routes.get(route_id)
         if route is None:
@@ -626,11 +669,24 @@ class TravelWeaverEnv:
         segments = route.get("segments")
         if not isinstance(segments, list) or not segments:
             raise ValueError(f"Route {route_id} has no verifiable segments.")
-        route_start = self._segment_boundary(segments[0], "start_time")
-        route_end = self._segment_boundary(segments[-1], "end_time")
-        if previous_end is not None and route_start is not None and route_start < previous_end:
+        route_start_clock = self._segment_boundary(segments[0], "start_time")
+        route_end_clock = self._segment_boundary(segments[-1], "end_time")
+        day_base = (destination_day - 1) * 24 * 60
+        route_start = day_base + route_start_clock if route_start_clock is not None else None
+        route_end = day_base + route_end_clock if route_end_clock is not None else None
+        if (
+            route_start is not None
+            and route_end is not None
+            and route_end < route_start
+        ):
+            route_end += 24 * 60
+        if (
+            previous_absolute_end is not None
+            and route_start is not None
+            and route_start < previous_absolute_end
+        ):
             raise ValueError(f"Route {route_id} starts before the previous activity ends.")
-        if route_end is not None and route_end > next_start:
+        if route_end is not None and route_end > next_absolute_start:
             raise ValueError(f"Route {route_id} ends after the next activity starts.")
         return dict(route)
 
@@ -693,6 +749,8 @@ class TravelWeaverEnv:
             quantity = int(activity["rooms"])
         else:
             quantity = people
+        if activity_type == "breakfast" and evidence.get("entity_type") == "hotel":
+            return quantity, 0.0
         price_key = "cost" if activity_type in {"train", "airplane"} else "price"
         return quantity, cls._number(evidence.get(price_key))
 
@@ -726,16 +784,16 @@ class TravelWeaverEnv:
     @staticmethod
     def _validate_candidate_type(candidate: Mapping[str, Any], activity_type: str) -> None:
         actual = candidate["entity_type"]
-        expected = {
+        expected: str | set[str] = {
             "attraction": "attraction",
-            "breakfast": "restaurant",
+            "breakfast": {"restaurant", "hotel"},
             "lunch": "restaurant",
             "dinner": "restaurant",
             "accommodation": "hotel",
             "train": "train",
             "airplane": "airplane",
         }[activity_type]
-        if actual != expected:
+        if actual not in expected if isinstance(expected, set) else actual != expected:
             raise ValueError(
                 f"Candidate {candidate['candidate_id']} has type {actual!r}, "
                 f"not {expected!r} required by activity {activity_type!r}."
@@ -779,6 +837,37 @@ class TravelWeaverEnv:
                 "task_spec_version": self._require_task_spec().spec_version,
                 "task_spec_hash": self._require_task_spec().spec_hash,
                 "reward_detail": reward_result.to_dict() if reward_result is not None else None,
+            },
+        )
+
+    def _rejected_submission(self, error: Exception) -> StepResult:
+        """Terminate after the first schema-valid submit_plan, even when it is invalid."""
+
+        self._valid_steps += 1
+        self._invalid_streak = 0
+        self._done = True
+        reward_result = self.reward_evaluator.no_plan("invalid_plan_submitted")
+        result = {
+            "tool": "submit_plan",
+            "status": "rejected",
+            "validation": {"reward_status": reward_result.reward_type},
+        }
+        return StepResult(
+            observation=self._observation(tool_result=result),
+            reward=reward_result.reward,
+            terminated=True,
+            truncated=False,
+            info={
+                "valid_action": True,
+                "termination_reason": "invalid_plan_submitted",
+                "tools_version": TOOLS_VERSION,
+                "task_spec_version": self._require_task_spec().spec_version,
+                "task_spec_hash": self._require_task_spec().spec_hash,
+                "reward_detail": reward_result.to_dict(),
+                "submission_error": {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                },
             },
         )
 
