@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import SynthesisError
-from ..llm import DeepSeekConfig
+from ..llm import DEFAULT_DEEPSEEK_CONCURRENCY, DeepSeekConfig
 from ..reward import TravelReward
 from ..tasks import TaskBlueprint, materialize_task_spec
 from .artifacts import ArtifactStore, record_bundle
@@ -20,7 +20,7 @@ from .models import (
     WORLD_SNAPSHOT_VERSION,
     PilotSlot,
 )
-from .polisher import POLISHER_PROMPT_HASH, TaskPolisher
+from .polisher import POLISHER_PROMPT_HASH, TaskPolisher, canonical_surface
 from .render import render_canonical
 
 
@@ -28,13 +28,16 @@ from .render import render_canonical
 class RepolishConfig:
     input_dir: Path
     output_dir: Path
-    llm_concurrency: int = 256
+    llm_concurrency: int = DEFAULT_DEEPSEEK_CONCURRENCY
     max_api_calls: int = 400
     validation_policy: str = "minimal_semantic"
+    canonical_only: bool = False
 
     def __post_init__(self) -> None:
-        if self.llm_concurrency <= 0 or self.max_api_calls <= 0:
-            raise ValueError("LLM concurrency and API-call budget must be positive.")
+        if self.llm_concurrency <= 0:
+            raise ValueError("LLM concurrency must be positive.")
+        if self.max_api_calls < 0 or (not self.canonical_only and self.max_api_calls <= 0):
+            raise ValueError("API-call budget must be positive unless canonical_only is enabled.")
         if self.validation_policy not in {"strict", "minimal_semantic"}:
             raise ValueError("Repolish validation policy is unsupported.")
 
@@ -85,7 +88,10 @@ class SurfaceRepolishPipeline:
         source_records = _read_records(self.config.input_dir / "records")
         if not source_records:
             raise SynthesisError("Repolish input directory has no synthesis records.")
-        if self.config.max_api_calls < len(source_records) * self.polisher.max_attempts:
+        if (
+            not self.config.canonical_only
+            and self.config.max_api_calls < len(source_records) * self.polisher.max_attempts
+        ):
             raise SynthesisError(
                 "API budget must cover every record at the configured maximum polish attempts."
             )
@@ -111,6 +117,7 @@ class SurfaceRepolishPipeline:
                 "source_dir": str(self.config.input_dir.resolve()),
                 "llm_concurrency": self.config.llm_concurrency,
                 "validation_policy": self.config.validation_policy,
+                "canonical_only": self.config.canonical_only,
             },
         )
         completed = store.completed_indices()
@@ -173,13 +180,22 @@ class SurfaceRepolishPipeline:
             style_profile=slot.surface_style,
             validation_profile=slot.validation_profile,
         )
-        surface, polish_audit = self.polisher.polish_with_audit(
-            blueprint,
-            canonical,
-            style_profile=slot.surface_style,
-            validation_profile=slot.validation_profile,
-            audit_context={"slot_index": slot.index},
-        )
+        if self.config.canonical_only:
+            surface, polish_audit = canonical_surface(
+                blueprint,
+                canonical,
+                validation_profile=slot.validation_profile,
+                validation_policy=self.config.validation_policy,
+                audit_context={"slot_index": slot.index},
+            )
+        else:
+            surface, polish_audit = self.polisher.polish_with_audit(
+                blueprint,
+                canonical,
+                style_profile=slot.surface_style,
+                validation_profile=slot.validation_profile,
+                audit_context={"slot_index": slot.index},
+            )
         task_id = str(source["task_spec"]["task_id"])
         spec = materialize_task_spec(blueprint, surface, task_id=task_id)
         witness = deepcopy(source["witness"])

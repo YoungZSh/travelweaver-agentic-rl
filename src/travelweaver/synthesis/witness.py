@@ -114,6 +114,22 @@ class WitnessBuilder:
             if _minutes(item["arrival_time"]) > _minutes(item["departure_time"])
             and _minutes(item["departure_time"]) >= 14 * 60
         ]
+        if (
+            slot.synthesis_profile == "chinatravel_official_hybrid_v2"
+            and slot.days == 1
+        ):
+            outbound_limit = 11 * 60 if slot.include_meal else 13 * 60
+            return_limit = 17 * 60 if slot.include_meal else 16 * 60
+            usable_outbound = [
+                item
+                for item in usable_outbound
+                if _minutes(item["arrival_time"]) <= outbound_limit
+            ]
+            usable_return = [
+                item
+                for item in usable_return
+                if _minutes(item["departure_time"]) >= return_limit
+            ]
         if not usable_outbound or not usable_return:
             raise SynthesisError(
                 f"No same-day {slot.outbound_mode}/{slot.return_mode} transport for "
@@ -163,6 +179,11 @@ class WitnessBuilder:
     ) -> WitnessResult:
         needs_restaurant = slot.include_meal
         hotel = self._select_hotel(slot, route_mode) if slot.days > 1 else None
+        attraction_targets = _attraction_targets(
+            slot,
+            outbound_arrival=str(outbound["arrival_time"]),
+            return_departure=str(return_transport["departure_time"]),
+        )
         attractions = self._select_attractions(
             slot,
             outbound_arrival=str(outbound["arrival_time"]),
@@ -170,24 +191,31 @@ class WitnessBuilder:
             needs_restaurant=needs_restaurant,
             hotel=hotel,
             route_mode=route_mode,
+            attraction_targets=attraction_targets,
         )
-        restaurant = (
-            self._select_restaurant(
-                slot.destination,
-                anchor=attractions[min(slot.attractions_per_day, len(attractions)) - 1],
-                route_mode=route_mode,
-            )
-            if needs_restaurant
-            else None
-        )
-        local_days = self._schedule_local_days(
+        restaurants: list[dict[str, Any]] = []
+        if needs_restaurant:
+            selected_count = 0
+            for target in attraction_targets:
+                selected_count += target
+                anchor_index = min(selected_count, len(attractions)) - 1
+                restaurants.append(
+                    self._select_restaurant(
+                        slot.destination,
+                        anchor=attractions[anchor_index],
+                        route_mode=route_mode,
+                        excluded={str(item["place_id"]) for item in restaurants},
+                    )
+                )
+        local_days, return_route = self._schedule_local_days(
             slot,
             attractions,
             hotel,
-            restaurant,
+            restaurants,
             outbound,
             return_transport,
             route_mode,
+            attraction_targets,
         )
 
         env = TravelWeaverEnv(
@@ -244,7 +272,20 @@ class WitnessBuilder:
                         activity["rooms"] = math.ceil(slot.travelers / room_type)
                     activities.append(activity)
                 if day_index == slot.days:
-                    activities.append(_transport_activity(return_transport))
+                    route_step = self._step(
+                        env,
+                        "get_route",
+                        {
+                            "origin_place_id": return_route["origin_place_id"],
+                            "destination_place_id": return_route["destination_place_id"],
+                            "mode": return_route["mode"],
+                            "start_time": return_route["segments"][0]["start_time"],
+                        },
+                    )
+                    resolved_return_route = (route_step.observation.tool_result or {})["route"]
+                    return_activity = _transport_activity(return_transport)
+                    return_activity["route_from_previous_id"] = resolved_return_route["route_id"]
+                    activities.append(return_activity)
                 itinerary.append({"day": day_index, "activities": activities})
 
             plan = {
@@ -262,7 +303,8 @@ class WitnessBuilder:
                 "outbound": outbound,
                 "return": return_transport,
                 "attractions": attractions,
-                "restaurant": restaurant,
+                "restaurant": restaurants[0] if restaurants else None,
+                "restaurants": restaurants,
                 "hotel": hotel,
             }
             return WitnessResult(
@@ -286,6 +328,7 @@ class WitnessBuilder:
         needs_restaurant: bool,
         hotel: dict[str, Any] | None,
         route_mode: str,
+        attraction_targets: tuple[int, ...],
     ) -> list[dict[str, Any]]:
         records = [
             dict(item)
@@ -304,24 +347,24 @@ class WitnessBuilder:
         )
         nearby = [record for record in records if _distance_km(anchor, record) <= radius]
         self.rng.shuffle(nearby)
-        required = slot.days * slot.attractions_per_day
+        required = sum(attraction_targets)
         if len(nearby) < required:
             raise SynthesisError(
                 f"Only {len(nearby)} attractions fit the {route_mode} spatial cluster; "
                 f"need {required}."
             )
         selected: list[dict[str, Any]] = []
-        for day in range(1, slot.days + 1):
+        for day, target in enumerate(attraction_targets, 1):
             lower = _minutes(outbound_arrival) + 20 if day == 1 else 9 * 60
             upper = _minutes(return_departure) - 20 if day == slot.days else 20 * 60
-            if needs_restaurant and day == 1:
+            if needs_restaurant:
                 upper -= 90
             day_matches = [
                 item
                 for item in nearby
                 if item not in selected and _fits_one_hour(item, lower, upper)
-            ][: slot.attractions_per_day]
-            if len(day_matches) != slot.attractions_per_day:
+            ][:target]
+            if len(day_matches) != target:
                 raise SynthesisError(f"Not enough attractions fit day {day} schedule.")
             selected.extend(day_matches)
         return selected
@@ -361,6 +404,7 @@ class WitnessBuilder:
         *,
         anchor: Mapping[str, Any],
         route_mode: str,
+        excluded: set[str] | None = None,
     ) -> dict[str, Any]:
         records = [
             dict(item)
@@ -372,6 +416,9 @@ class WitnessBuilder:
         ]
         radius = {"walk": 2.0, "metro": 20.0, "taxi": 30.0}[route_mode]
         records = [record for record in records if _distance_km(anchor, record) <= radius]
+        records = [
+            record for record in records if str(record["place_id"]) not in (excluded or set())
+        ]
         records.sort(key=lambda record: _distance_km(anchor, record))
         if not records:
             raise SynthesisError("No restaurant has complete price, cuisine, and hours.")
@@ -382,37 +429,48 @@ class WitnessBuilder:
         slot: PilotSlot,
         attractions: list[dict[str, Any]],
         hotel: dict[str, Any] | None,
-        restaurant: dict[str, Any] | None,
+        restaurants: list[dict[str, Any]],
         outbound: Mapping[str, Any],
         return_transport: Mapping[str, Any],
         route_mode: str,
-    ) -> list[list[_LocalActivity]]:
+        attraction_targets: tuple[int, ...],
+    ) -> tuple[list[list[_LocalActivity]], dict[str, Any]]:
         scheduled: list[list[_LocalActivity]] = []
-        attractions_by_day = [
-            attractions[index : index + slot.attractions_per_day]
-            for index in range(0, len(attractions), slot.attractions_per_day)
-        ]
+        attractions_by_day: list[list[dict[str, Any]]] = []
+        offset = 0
+        for target in attraction_targets:
+            attractions_by_day.append(attractions[offset : offset + target])
+            offset += target
+        previous_day_hotel: Mapping[str, Any] | None = None
+        final_previous: Mapping[str, Any] | None = None
+        final_previous_end: int | None = None
         for day, day_attractions in enumerate(attractions_by_day, 1):
-            earliest = _minutes(outbound["arrival_time"]) + 20 if day == 1 else 9 * 60
+            earliest = _minutes(outbound["arrival_time"]) if day == 1 else 8 * 60
             latest = (
-                _minutes(return_transport["departure_time"]) - 20
+                _minutes(return_transport["departure_time"])
                 if day == slot.days
                 else 20 * 60
             )
             day_items: list[_LocalActivity] = []
-            previous: Mapping[str, Any] | None = None
+            if day == 1:
+                previous = {
+                    "place_id": outbound["destination_anchor_id"],
+                    "entity_type": "route_anchor",
+                }
+            else:
+                if previous_day_hotel is None:
+                    raise SynthesisError("Cross-day route has no preceding hotel anchor.")
+                previous = previous_day_hotel
             previous_end = earliest
             for attraction in day_attractions:
-                route = None
-                if previous is not None:
-                    route = self.backend.get_route(
-                        origin_place_id=str(previous["place_id"]),
-                        destination_place_id=str(attraction["place_id"]),
-                        mode=route_mode,
-                        start_time=_clock(previous_end),
-                    )
-                    _validate_route(route, route_mode)
-                    previous_end = _route_end(route)
+                route = self.backend.get_route(
+                    origin_place_id=str(previous["place_id"]),
+                    destination_place_id=str(attraction["place_id"]),
+                    mode=route_mode,
+                    start_time=_clock(previous_end),
+                )
+                _validate_route(route, route_mode)
+                previous_end = _route_end(route)
                 attraction_start = max(previous_end, _minutes(attraction["open_time"]))
                 attraction_end = attraction_start + 60
                 if attraction_end > min(latest, _minutes(attraction["close_time"])):
@@ -429,7 +487,8 @@ class WitnessBuilder:
                 previous = attraction
                 previous_end = attraction_end
             assert previous is not None
-            if restaurant is not None and day == 1:
+            restaurant = restaurants[day - 1] if day <= len(restaurants) else None
+            if restaurant is not None:
                 route = self.backend.get_route(
                     origin_place_id=str(previous["place_id"]),
                     destination_place_id=str(restaurant["place_id"]),
@@ -438,14 +497,24 @@ class WitnessBuilder:
                 )
                 _validate_route(route, route_mode)
                 route_end = _route_end(route)
-                meal_start = max(route_end, _minutes(restaurant["open_time"]))
+                restaurant_open = _minutes(restaurant["open_time"])
+                if max(route_end, restaurant_open, 11 * 60) + 60 <= 14 * 60:
+                    meal_type = "lunch"
+                    meal_start = max(route_end, restaurant_open, 11 * 60)
+                    meal_deadline = 14 * 60
+                else:
+                    meal_type = "dinner"
+                    meal_start = max(route_end, restaurant_open, 17 * 60)
+                    meal_deadline = 20 * 60
                 meal_end = meal_start + 60
-                if meal_end > min(_minutes(restaurant["close_time"]), latest):
+                if meal_end > min(
+                    _minutes(restaurant["close_time"]), latest, meal_deadline
+                ):
                     raise SynthesisError("Selected restaurant does not fit the witness schedule.")
                 day_items.append(
                     _LocalActivity(
                         evidence=restaurant,
-                        activity_type="lunch" if meal_start < 15 * 60 else "dinner",
+                        activity_type=meal_type,
                         start_time=_clock(meal_start),
                         end_time=_clock(meal_end),
                         route=route,
@@ -474,10 +543,27 @@ class WitnessBuilder:
                         route=route,
                     )
                 )
+                previous_day_hotel = hotel
+                final_previous = hotel
+                final_previous_end = 24 * 60
             elif previous_end > _minutes(return_transport["departure_time"]):
                 raise SynthesisError("Local activities overlap the return transport.")
+            else:
+                final_previous = previous
+                final_previous_end = previous_end
             scheduled.append(day_items)
-        return scheduled
+        if final_previous is None or final_previous_end is None:
+            raise SynthesisError("Witness has no final local activity for return routing.")
+        return_route = self.backend.get_route(
+            origin_place_id=str(final_previous["place_id"]),
+            destination_place_id=str(return_transport["origin_anchor_id"]),
+            mode=route_mode,
+            start_time=_clock(final_previous_end),
+        )
+        _validate_route(return_route, route_mode)
+        if _route_end(return_route) > _minutes(return_transport["departure_time"]):
+            raise SynthesisError("Route to the return station overlaps return transport.")
+        return scheduled, dict(return_route)
 
     def _reveal_and_save_transport(
         self, env: TravelWeaverEnv, transport: Mapping[str, Any], purpose: str
@@ -549,6 +635,28 @@ class WitnessBuilder:
         return tuple(dict.fromkeys((preferred, "taxi")))
 
 
+def _attraction_targets(
+    slot: PilotSlot,
+    *,
+    outbound_arrival: str,
+    return_departure: str,
+) -> tuple[int, ...]:
+    """Keep complete days dense while respecting the smaller first/last-day envelope."""
+
+    desired = slot.attractions_per_day
+    if slot.synthesis_profile != "chinatravel_official_hybrid_v2":
+        return (desired,) * slot.days
+    targets: list[int] = []
+    for day in range(1, slot.days + 1):
+        target = desired
+        if day == 1 and _minutes(outbound_arrival) > 10 * 60:
+            target = min(target, 1)
+        if day == slot.days and _minutes(return_departure) < 18 * 60:
+            target = min(target, 1)
+        targets.append(max(1, target))
+    return tuple(targets)
+
+
 def _transport_activity(transport: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "candidate_id": transport["transport_id"],
@@ -595,7 +703,8 @@ def _validate_route(route: Mapping[str, Any], mode: str) -> None:
     total_distance = sum(distances)
     if mode == "walk" and total_distance > 2.0:
         raise SynthesisError(f"Walking leg is implausibly long: {total_distance:.2f} km.")
-    if mode == "taxi" and total_distance > 30.0:
+    # Airport and high-speed rail boundary legs can legitimately cross the urban fringe.
+    if mode == "taxi" and total_distance > 80.0:
         raise SynthesisError(f"Taxi leg is implausibly long: {total_distance:.2f} km.")
     if mode == "metro":
         walking_distance = sum(

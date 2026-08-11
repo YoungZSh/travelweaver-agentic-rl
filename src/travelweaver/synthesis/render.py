@@ -121,8 +121,11 @@ def render_canonical(
         core = _human_core(blueprint, destination)
     elif style_profile in {"human_v1_1_metadata", "human_v1_1_dialogue"}:
         core = _human_v1_1_core(blueprint, destination)
-    if blueprint.metadata_prefix:
-        core = blueprint.metadata_prefix + core
+    elif blueprint.persona_context:
+        core = f"这次是{blueprint.persona_context}，{core}"
+    # Metadata is synthesis-side provenance, not part of a real user's request.  Keeping the
+    # bracketed generator shorthand out of the surface prevents it from becoming a shortcut the
+    # model learns to expect while the natural core still states every relevant trip fact.
     clauses: dict[str, str] = {}
     protected = {
         trip.origin,
@@ -154,8 +157,6 @@ def render_canonical(
     query = core + joined + closing
     if blueprint.persona_context:
         protected.add(blueprint.persona_context)
-    if blueprint.metadata_prefix:
-        protected.add(blueprint.metadata_prefix)
     return CanonicalTask(
         query=query,
         clauses=clauses,
@@ -191,22 +192,13 @@ def _human_core(blueprint: TaskBlueprint, destination: str) -> str:
 
 def _human_v1_1_core(blueprint: TaskBlueprint, destination: str) -> str:
     trip = blueprint.trip
-    if blueprint.metadata_prefix:
-        templates = (
-            "想请你帮忙规划从{origin}到{destination}的{days}天行程，我们一共{travelers}人。",
-            "准备从{origin}去{destination}玩{days}天，共{travelers}人，想请你帮忙安排一下。",
-            "这趟行程从{origin}出发去{destination}，一共{travelers}人，玩{days}天。",
-            "我们{travelers}人计划由{origin}前往{destination}旅行{days}天。",
-            "麻烦看看{origin}到{destination}怎么玩比较合适，同行{travelers}人，共{days}天。",
-        )
-    else:
-        templates = (
-            "我准备{persona}，从{origin}去{destination}玩{days}天，一共{travelers}人。",
-            "这次是{persona}，我们{travelers}人想从{origin}到{destination}待{days}天。",
-            "打算来一次{persona}，共{travelers}人，从{origin}出发去{destination}{days}天。",
-            "最近计划{persona}，{travelers}人由{origin}前往{destination}旅行{days}天。",
-            "想请你安排一次{persona}：从{origin}到{destination}，{travelers}人玩{days}天。",
-        )
+    templates = (
+        "我准备{persona}，从{origin}去{destination}玩{days}天，一共{travelers}人。",
+        "这次是{persona}，我们{travelers}人想从{origin}到{destination}待{days}天。",
+        "打算来一次{persona}，共{travelers}人，从{origin}出发去{destination}{days}天。",
+        "最近计划{persona}，{travelers}人由{origin}前往{destination}旅行{days}天。",
+        "想请你安排一次{persona}：从{origin}到{destination}，{travelers}人玩{days}天。",
+    )
     template = templates[blueprint.generation_seed % len(templates)]
     return template.format(
         persona=blueprint.persona_context or "出行",
@@ -225,7 +217,7 @@ def _preference_clause(
         "less_innercity_time": ("minimize", "希望少花时间在市内交通上"),
         "shorter_meal_transfer": ("minimize", "希望去吃饭的路程短一些"),
         "higher_dining_share": ("maximize", "希望餐饮支出占比高一些"),
-        "lower_lodging_share": ("minimize", "希望住宿支出占比低一些"),
+        "lower_lodging_share": ("minimize", "希望住宿总支出低一些"),
         "less_walking": ("minimize", "希望少走路"),
         "lower_total_cost": ("minimize", "希望总花费低一些"),
         "relaxed_itinerary": ("minimize", "希望行程轻松一些"),

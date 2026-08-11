@@ -101,12 +101,55 @@ _STYLE_DIRECTIONS = {
     "itinerary": "围绕行程安排来组织句子，避免逐条模板复述。",
     "question": "以自然问句提出规划请求，再说明硬性条件。",
     "compact": "紧凑表达全部信息，减少冗余连接词。",
-    "human_metadata": "保留方括号元数据前缀，其余内容写得像真人发来的旅行咨询。",
+    "human_metadata": "使用自然的真人旅行咨询语气，不输出任何方括号元数据。",
     "human_dialogue": "写成纯自然对话，允许拆合句子，避免‘硬性条件’等模板措辞。",
-    "human_v1_1_metadata": "保留事实元数据前缀，正文不要重复元数据中的人设，使用自然咨询语气。",
+    "human_v1_1_metadata": "使用自然咨询语气，在正文中自然交代同行背景，不输出任何元数据前缀。",
     "human_v1_1_dialogue": "使用纯自然对话和确定表达，不列举‘硬性要求’或机械复述条件。",
 }
 POLISHER_PROMPT_HASH = hashlib.sha256(_SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+
+
+def canonical_surface(
+    blueprint: TaskBlueprint,
+    canonical: CanonicalTask,
+    *,
+    validation_profile: str,
+    validation_policy: str,
+    audit_context: Mapping[str, Any] | None = None,
+) -> tuple[TaskSurface, tuple[dict[str, Any], ...]]:
+    """Materialize a validated canonical surface without making an external API call."""
+
+    surface = validate_surface(
+        blueprint,
+        canonical,
+        {
+            "query": canonical.query,
+            "mentions": [
+                {"constraint_id": constraint_id, "text": text}
+                for constraint_id, text in canonical.clauses.items()
+            ],
+            "preference_mentions": [
+                {"preference_id": preference_id, "text": text}
+                for preference_id, text in canonical.preference_clauses.items()
+            ],
+        },
+        model="deterministic-canonical",
+        usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        validation_profile=validation_profile,
+        validation_policy=validation_policy,
+    )
+    event = {
+        **dict(audit_context or {}),
+        "blueprint_id": blueprint.blueprint_id,
+        "attempt": None,
+        "outcome": "canonical_only",
+        "validation_errors": [],
+        "request": None,
+        "raw_response": None,
+        "parsed_payload": None,
+        "validation_warnings": list(surface.validation_warnings),
+    }
+    return surface, (event,)
 
 
 class TaskPolisher:
@@ -299,7 +342,6 @@ class TaskPolisher:
             "validation_profile": validation_profile,
             "validation_policy": validation_policy,
             "persona_context": blueprint.persona_context,
-            "metadata_prefix": blueprint.metadata_prefix,
         }
         return [
             {"role": "system", "content": _SYSTEM_PROMPT},
@@ -394,16 +436,6 @@ def validate_surface(
                 warnings.append(f"protected_literal_changed:{literal}")
             else:
                 raise SynthesisError(f"Protected literal was changed or removed: {literal}")
-    if (
-        blueprint.metadata_prefix
-        and blueprint.metadata_prefix.startswith("[当前位置")
-        and blueprint.persona_context
-        and blueprint.persona_context in query[len(blueprint.metadata_prefix) :]
-    ):
-        if minimal:
-            warnings.append("metadata_persona_repeated_in_body")
-        else:
-            raise SynthesisError("V1.1 Human body repeats the persona already stored in metadata.")
     canonical_cities = {city for city in _SUPPORTED_CITIES if city in canonical.query}
     unexpected_cities = {city for city in _SUPPORTED_CITIES if city in query} - canonical_cities
     if unexpected_cities:
@@ -412,16 +444,9 @@ def validate_surface(
         if city not in query:
             raise SynthesisError(f"Polisher removed trip city: {city}")
     if minimal:
-        metadata_preserved = bool(
-            blueprint.metadata_prefix and blueprint.metadata_prefix in query
-        )
-        if not metadata_preserved and not _contains_traveler_count(
-            query, blueprint.trip.travelers
-        ):
+        if not _contains_traveler_count(query, blueprint.trip.travelers):
             raise SynthesisError("Polisher changed or removed the traveler count.")
-        if not metadata_preserved and not _contains_count(
-            query, blueprint.trip.days, ("天", "日")
-        ):
+        if not _contains_count(query, blueprint.trip.days, ("天", "日")):
             raise SynthesisError("Polisher changed or removed the trip duration.")
     canonical_numbers = Counter(_NUMBER.findall(canonical.query))
     output_numbers = Counter(_NUMBER.findall(query))
@@ -1018,7 +1043,7 @@ def _occurrence_starts(query: str, text: str) -> tuple[int, ...]:
 def _validate_preference(kind: str, direction: str, text: str) -> None:
     markers = {
         "more_attractions": ("多",),
-        "less_innercity_time": ("少", "短"),
+        "less_innercity_time": ("少", "短", "压缩"),
         "shorter_meal_transfer": ("短", "少"),
         "higher_dining_share": ("高", "多"),
         "lower_lodging_share": ("低", "少"),

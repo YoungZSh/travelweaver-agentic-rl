@@ -11,9 +11,15 @@ import pytest
 from travelweaver.env import InMemoryBackend, ScenarioBackend, ScenarioEffect, ScenarioSpec
 from travelweaver.errors import SynthesisError
 from travelweaver.llm import DeepSeekConfig
-from travelweaver.synthesis.artifacts import _alignment
+from travelweaver.synthesis.artifacts import ArtifactStore, _alignment
 from travelweaver.synthesis.catalog import build_pilot_slots
-from travelweaver.synthesis.pipeline import SynthesisPipeline, _preference_metric
+from travelweaver.synthesis.pipeline import (
+    SynthesisConfig,
+    SynthesisPipeline,
+    _load_task_exclusions,
+    _normalize_question,
+    _preference_metric,
+)
 from travelweaver.synthesis.polisher import TaskPolisher, validate_surface
 from travelweaver.synthesis.render import render_canonical
 from travelweaver.tasks import (
@@ -64,6 +70,73 @@ def _payload(blueprint: TaskBlueprint) -> dict:
             for preference_id, text in canonical.preference_clauses.items()
         ],
     }
+
+
+def test_question_normalization_ignores_only_surface_typography() -> None:
+    assert _normalize_question("请安排 上海→杭州，2 天！") == _normalize_question(
+        "请安排上海杭州2天"
+    )
+    assert _normalize_question("上海到杭州2天") != _normalize_question("上海到杭州3天")
+
+
+def test_task_exclusions_load_complete_synthesis_records(tmp_path) -> None:
+    task_dir = tmp_path / "batch"
+    records_dir = task_dir / "records"
+    records_dir.mkdir(parents=True)
+    (task_dir / "manifest.json").write_text(
+        json.dumps({"status": "complete"}), encoding="utf-8"
+    )
+    (records_dir / "000.json").write_text(
+        json.dumps(
+            {
+                "task_spec": {"task_id": "task-1"},
+                "blueprint": {"blueprint_id": "blueprint-1"},
+                "surface": {
+                    "surface_id": "surface-1",
+                    "public_query": "请安排上海到杭州两天。",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    exclusions = _load_task_exclusions((task_dir,))
+
+    assert exclusions["task_ids"] == {"task-1"}
+    assert exclusions["blueprint_ids"] == {"blueprint-1"}
+    assert exclusions["surface_ids"] == {"surface-1"}
+    assert exclusions["normalized_queries"] == {"请安排上海到杭州两天"}
+    assert len(exclusions["sha256"]) == 64
+
+
+def test_synthesis_defaults_to_256_llm_workers(tmp_path) -> None:
+    assert SynthesisConfig(output_dir=tmp_path).llm_concurrency == 256
+
+
+def test_witness_refill_cycles_viable_origins_with_distinct_attempts(monkeypatch) -> None:
+    pipeline = object.__new__(SynthesisPipeline)
+    monkeypatch.setattr(pipeline, "_origins", lambda slot: ("武汉", "广州"))
+    slot = build_pilot_slots(1, 20260813, "chinatravel_blended_v1_1")[0]
+
+    origins = pipeline._candidate_origins(slot)
+
+    assert len(origins) == 12
+    assert origins == ("武汉", "广州") * 6
+
+
+def test_artifact_store_migrates_only_missing_llm_concurrency(tmp_path) -> None:
+    output_dir = tmp_path / "batch"
+    output_dir.mkdir()
+    old_config = {"count": 500, "seed": 17}
+    (output_dir / "manifest.json").write_text(
+        json.dumps({"status": "in_progress", "config": old_config}),
+        encoding="utf-8",
+    )
+
+    store = ArtifactStore(output_dir, {**old_config, "llm_concurrency": 256})
+
+    assert store.manifest["config"]["llm_concurrency"] == 256
 
 
 def test_pilot_catalog_has_balanced_100_task_distribution() -> None:
@@ -266,6 +339,36 @@ def test_chinatravel_blended_v1_1_scales_to_500_task_quotas() -> None:
     }
     assert sum(kind in official for kind in preferences) == 35
     assert max(Counter(preferences).values()) - min(Counter(preferences).values()) <= 4
+
+
+def test_official_hybrid_v2_first_batch_has_locked_quotas() -> None:
+    slots = build_pilot_slots(500, 20260821, "chinatravel_official_hybrid_v2")
+
+    assert Counter(slot.task_type for slot in slots) == {
+        "easy_like": 184,
+        "medium_like": 92,
+        "human_like": 94,
+        "preference_base": 30,
+        "preference_like": 50,
+        "generalization": 50,
+    }
+    assert Counter(slot.scenario_profile for slot in slots) == {
+        "normal": 450,
+        "price_change": 15,
+        "transport_cancellation": 13,
+        "poi_closure": 12,
+        "hotel_unavailable": 10,
+    }
+    assert Counter(
+        slot.preference_kinds[0] for slot in slots if slot.preference_kinds
+    ) == {
+        "more_attractions": 9,
+        "less_innercity_time": 9,
+        "shorter_meal_transfer": 8,
+        "higher_dining_share": 8,
+        "lower_lodging_share": 8,
+        "near_poi": 8,
+    }
 
 
 def test_scaled_alignment_uses_the_same_500_task_targets() -> None:
@@ -891,7 +994,7 @@ def test_surface_validator_allows_city_substring_in_protected_entity_name() -> N
     assert "北京路步行街" in surface.public_query
 
 
-def test_v1_1_human_metadata_fallback_does_not_repeat_persona() -> None:
+def test_v1_1_human_metadata_is_not_exposed_in_the_natural_user_surface() -> None:
     metadata = "[当前位置上海,目标位置杭州,旅行人数2,旅行天数2,出行背景情侣出行]"
     blueprint = TaskBlueprint(
         trip=TripSpec(origin="上海", destinations=("杭州",), days=2, travelers=2),
@@ -917,17 +1020,17 @@ def test_v1_1_human_metadata_fallback_does_not_repeat_persona() -> None:
         validation_profile="human_conservative",
     )
 
+    assert not surface.public_query.startswith("[")
+    assert metadata not in surface.public_query
     assert surface.public_query.count("情侣出行") == 1
-    repeated = dict(payload)
-    repeated["query"] += "我们是情侣出行。"
-    with pytest.raises(SynthesisError, match="repeats the persona"):
-        validate_surface(
-            blueprint,
-            canonical,
-            repeated,
-            model="human-v1-1-repeat-test",
-            validation_profile="human_conservative",
-        )
+
+    direct = render_canonical(
+        blueprint,
+        style_profile="direct",
+        validation_profile="human_conservative",
+    )
+    assert not direct.query.startswith("[")
+    assert direct.query.count("情侣出行") == 1
 
 
 def test_surface_validator_rejects_changed_numeric_semantics() -> None:

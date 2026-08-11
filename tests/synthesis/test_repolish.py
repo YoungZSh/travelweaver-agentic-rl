@@ -185,3 +185,38 @@ def test_surface_repolish_uses_configured_concurrency_and_writes_audit(
     assert len(audit) == 2
     assert all(event["outcome"] == "accepted" for event in audit)
     assert all(event["raw_response"]["choices"] for event in audit)
+
+
+def test_surface_repolish_canonical_only_makes_no_model_call(tmp_path, monkeypatch) -> None:
+    input_dir = tmp_path / "input"
+    records_dir = input_dir / "records"
+    records_dir.mkdir(parents=True)
+    (input_dir / "manifest.json").write_text(
+        json.dumps({"config": {"profile": "pilot_v2_1", "seed": 17}}),
+        encoding="utf-8",
+    )
+    (records_dir / "000.json").write_text(
+        json.dumps(_record(0, "上海", "杭州"), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("travelweaver.synthesis.repolish.TravelReward", _RewardEvaluator)
+
+    report = SurfaceRepolishPipeline(
+        RepolishConfig(
+            input_dir=input_dir,
+            output_dir=tmp_path / "output",
+            llm_concurrency=256,
+            max_api_calls=0,
+            canonical_only=True,
+        ),
+        DeepSeekConfig(api_key="offline-canonical", model="deterministic-canonical"),
+    ).run()
+
+    audit = [
+        json.loads(line)
+        for line in (tmp_path / "output" / "polish-audit.jsonl").read_text().splitlines()
+    ]
+    assert report.completed == 1
+    assert report.api_calls == 0
+    assert audit[0]["outcome"] == "canonical_only"
+    assert audit[0]["raw_response"] is None

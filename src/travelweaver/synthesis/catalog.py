@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import TypeVar
 
 from .models import PilotSlot
@@ -46,8 +47,14 @@ _SURFACE_STYLE_WEIGHTS = {
 }
 BLENDED_PROFILE = "chinatravel_blended_v1"
 BLENDED_V1_1_PROFILE = "chinatravel_blended_v1_1"
+OFFICIAL_HYBRID_V2_PROFILE = "chinatravel_official_hybrid_v2"
 DEFAULT_PROFILE = "pilot_v2_1"
-SUPPORTED_PROFILES = (DEFAULT_PROFILE, BLENDED_PROFILE, BLENDED_V1_1_PROFILE)
+SUPPORTED_PROFILES = (
+    DEFAULT_PROFILE,
+    BLENDED_PROFILE,
+    BLENDED_V1_1_PROFILE,
+    OFFICIAL_HYBRID_V2_PROFILE,
+)
 
 _BLENDED_TYPE_QUOTAS = {
     "easy_like": 50,
@@ -156,6 +163,8 @@ def build_pilot_slots(
 
     if count <= 0:
         raise ValueError("Synthesis count must be positive.")
+    if profile == OFFICIAL_HYBRID_V2_PROFILE:
+        return _build_official_hybrid_slots(count, seed)
     if profile in {BLENDED_PROFILE, BLENDED_V1_1_PROFILE}:
         return _build_blended_slots(count, seed, profile)
     if profile != DEFAULT_PROFILE:
@@ -270,6 +279,195 @@ def build_pilot_slots(
             )
         )
     _validate_slots(slots)
+    return tuple(slots)
+
+
+def _build_official_hybrid_slots(count: int, seed: int) -> tuple[PilotSlot, ...]:
+    """Build the official-core plus generalization-tail v2 profile."""
+
+    base = list(_build_blended_slots(count, seed, BLENDED_V1_1_PROFILE))
+    batch_core = {
+        20260821: (184, 92, 94, 30),
+        20260822: (184, 92, 94, 30),
+        20260823: (184, 91, 94, 31),
+        20260824: (184, 91, 94, 31),
+        20260825: (183, 92, 95, 30),
+        20260826: (183, 92, 95, 30),
+        20260827: (183, 92, 94, 31),
+        20260828: (183, 92, 94, 31),
+    }
+    if count == 500 and seed in batch_core:
+        easy, medium, human, preference_base = batch_core[seed]
+        quotas = {
+            "easy_like": easy,
+            "medium_like": medium,
+            "human_like": human,
+            "preference_base": preference_base,
+            "preference_like": 50,
+            "generalization": 50,
+        }
+    else:
+        quotas = _scaled_quotas(
+            count,
+            {
+                "easy_like": 184,
+                "medium_like": 92,
+                "human_like": 94,
+                "preference_base": 30,
+                "preference_like": 50,
+                "generalization": 50,
+            },
+            seed,
+            "official-hybrid-types",
+        )
+    task_types = _exact_values(quotas, seed, "official-hybrid-types")
+    days = _quota_values(
+        count,
+        {1: 0.10, 2: 0.45, 3: 0.34, 4: 0.07, 5: 0.03, 6: 0.01},
+        seed=seed,
+        scope="official-hybrid-days",
+    )
+    travelers = _quota_values(
+        count,
+        {1: 0.30, 2: 0.30, 3: 0.22, 4: 0.16, 5: 0.01, 6: 0.005, 7: 0.005},
+        seed=seed,
+        scope="official-hybrid-travelers",
+    )
+    preference_indices = [
+        index for index, task_type in enumerate(task_types) if task_type == "preference_like"
+    ]
+    preference_batch_counts = {
+        20260821: (9, 9, 8, 8, 8, 8),
+        20260822: (8, 9, 9, 8, 8, 8),
+        20260823: (8, 8, 9, 9, 8, 8),
+        20260824: (8, 8, 8, 9, 9, 8),
+        20260825: (8, 8, 8, 8, 9, 9),
+        20260826: (9, 8, 8, 8, 8, 9),
+        20260827: (9, 9, 8, 8, 8, 8),
+        20260828: (8, 8, 9, 9, 8, 8),
+    }
+    if len(preference_indices) == 50 and seed in preference_batch_counts:
+        preference_quota = dict(
+            zip(_OFFICIAL_PREFERENCES, preference_batch_counts[seed], strict=True)
+        )
+        preferences = _exact_values(
+            preference_quota, seed, "official-hybrid-preferences"
+        )
+    else:
+        preferences = _balanced_repetitions(
+            _OFFICIAL_PREFERENCES,
+            len(preference_indices),
+            seed,
+            "official-hybrid-preferences",
+        )
+    preference_by_index = dict(zip(preference_indices, preferences, strict=True))
+    preference_kinds = [
+        (preference_by_index[index],) if index in preference_by_index else ()
+        for index in range(count)
+    ]
+    _ensure_preference_day_compatibility(task_types, preference_kinds, days)
+
+    scenario_indices = [
+        index for index, task_type in enumerate(task_types) if task_type == "generalization"
+    ]
+    scenario_values = _exact_values(
+        _scaled_quotas(
+            len(scenario_indices),
+            {
+                "price_change": 15,
+                "transport_cancellation": 13,
+                "poi_closure": 12,
+                "hotel_unavailable": 10,
+            },
+            seed,
+            "official-hybrid-scenarios",
+        ),
+        seed,
+        "official-hybrid-scenarios",
+    )
+    scenario_by_index = dict(zip(scenario_indices, scenario_values, strict=True))
+    for index in scenario_indices:
+        if scenario_by_index[index] != "hotel_unavailable" or days[index] > 1:
+            continue
+        replacement = next(
+            (
+                other
+                for other in scenario_indices
+                if scenario_by_index[other] != "hotel_unavailable" and days[other] > 1
+            ),
+            None,
+        )
+        if replacement is not None:
+            days[index], days[replacement] = days[replacement], days[index]
+
+    max_constraints = {
+        "easy_like": 2,
+        "medium_like": 4,
+        "human_like": 3,
+        "preference_base": 2,
+        "preference_like": 2,
+        "generalization": 4,
+    }
+    slots: list[PilotSlot] = []
+    for index, source in enumerate(base):
+        task_type = task_types[index]
+        recipe = tuple(key for key in source.recipe if key != "attraction_count")
+        # Preference candidates must remain comparable under one shared hard-feasible set.
+        # The official preference tail therefore varies only the audited preference metric;
+        # baseline hard-constraint coverage is supplied by the separate preference_base rows.
+        if task_type == "preference_like":
+            recipe = ()
+        if days[index] == 1:
+            recipe = tuple(key for key in recipe if key not in _HOTEL_KEYS)
+        recipe = recipe[: max_constraints[task_type]]
+        if task_type == "human_like":
+            persona = _persona(travelers[index], seed, index)
+            metadata_prefix = _metadata_prefix(
+                persona,
+                seed,
+                index,
+                profile=BLENDED_V1_1_PROFILE,
+                origin=source.origin,
+                destination=source.destination,
+                travelers=travelers[index],
+                days=days[index],
+            )
+        else:
+            persona = None
+            metadata_prefix = None
+        # The official-completeness profile always supplies one reasonable meal per day.
+        # Meal-related recipes still control what is stated as a hard user constraint.
+        include_meal = True
+        attractions_per_day = (
+            1
+            if days[index] >= 4
+            else deterministic_rng(seed, "official-hybrid-density", index).choices(
+                (1, 2, 3), weights=(0.20, 0.60, 0.20), k=1
+            )[0]
+        )
+        slots.append(
+            replace(
+                source,
+                days=days[index],
+                travelers=travelers[index],
+                constraint_count=len(recipe),
+                recipe=recipe,
+                attractions_per_day=attractions_per_day,
+                include_meal=include_meal,
+                scenario_profile=scenario_by_index.get(index, "normal"),
+                synthesis_profile=OFFICIAL_HYBRID_V2_PROFILE,
+                task_type=task_type,
+                validation_profile=(
+                    "human_conservative" if task_type == "human_like" else "benchmark_natural"
+                ),
+                persona_context=persona,
+                metadata_prefix=metadata_prefix,
+                preference_kinds=preference_kinds[index],
+            )
+        )
+    _validate_slots(slots)
+    if Counter(slot.task_type for slot in slots) != Counter(quotas):
+        raise RuntimeError("Official hybrid task-type quotas drifted.")
     return tuple(slots)
 
 

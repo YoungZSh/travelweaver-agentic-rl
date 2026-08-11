@@ -17,8 +17,10 @@ from ..paths import project_root
 from .catalog import (
     BLENDED_PROFILE,
     BLENDED_V1_1_PROFILE,
+    OFFICIAL_HYBRID_V2_PROFILE,
     blended_scenario_quotas,
     blended_task_type_quotas,
+    build_pilot_slots,
 )
 from .models import ARTIFACT_VERSION, PROMPT_VERSION, PilotSlot
 
@@ -168,6 +170,7 @@ class ArtifactStore:
         if self.config.get("profile") in {
             "chinatravel_blended_v1",
             "chinatravel_blended_v1_1",
+            "chinatravel_official_hybrid_v2",
         } and not all(alignment["checks"].values()):
             failed = [key for key, value in alignment["checks"].items() if not value]
             raise SynthesisError(f"Blended synthesis acceptance checks failed: {failed}")
@@ -190,7 +193,22 @@ class ArtifactStore:
                 manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError as error:
                 raise SynthesisError("Existing synthesis manifest is invalid JSON.") from error
-            if manifest.get("config") != self.config:
+            stored_config = manifest.get("config")
+            if (
+                isinstance(stored_config, dict)
+                and "llm_concurrency" not in stored_config
+                and "llm_concurrency" in self.config
+            ):
+                migrated_config = {
+                    **stored_config,
+                    "llm_concurrency": self.config["llm_concurrency"],
+                }
+                if migrated_config == self.config:
+                    manifest["config"] = migrated_config
+                    manifest["updated_at"] = _now()
+                    _atomic_json(self.manifest_path, manifest)
+                    stored_config = migrated_config
+            if stored_config != self.config:
                 raise SynthesisError(
                     "Output directory belongs to a different synthesis configuration; "
                     "choose a new directory or restore the matching arguments."
@@ -388,11 +406,10 @@ def _surface_quality(records: list[dict[str, Any]]) -> dict[str, Any]:
         row for row in records if row["slot"].get("task_type") == "human_like"
     ]
     repeated_personas = sum(
-        bool(row["slot"].get("metadata_prefix"))
-        and str(row["slot"].get("persona_context", ""))
-        in str(row["surface"]["public_query"])[
-            len(str(row["slot"].get("metadata_prefix", ""))) :
-        ]
+        bool(str(row["slot"].get("persona_context", "")))
+        and str(row["surface"]["public_query"]).count(
+            str(row["slot"].get("persona_context", ""))
+        ) > 1
         for row in human_rows
     )
     template_terms = ("硬性条件", "必须满足以下要求")
@@ -432,7 +449,7 @@ def _surface_quality(records: list[dict[str, Any]]) -> dict[str, Any]:
             if human_queries
             else 0.0
         ),
-        "human_metadata_persona_repetitions": repeated_personas,
+        "human_persona_repetitions": repeated_personas,
     }
 
 
@@ -455,6 +472,7 @@ def _alignment(
     actual_types = dict(distributions["task_types"])
     actual_scenarios = dict(distributions["scenario_profiles"])
     is_blended = config.get("profile") in {BLENDED_PROFILE, BLENDED_V1_1_PROFILE}
+    is_official_hybrid = config.get("profile") == OFFICIAL_HYBRID_V2_PROFILE
     expected_types = (
         {
             key: value
@@ -473,6 +491,12 @@ def _alignment(
         if is_blended
         else None
     )
+    if is_official_hybrid:
+        expected_slots = build_pilot_slots(requested_count, seed, OFFICIAL_HYBRID_V2_PROFILE)
+        expected_types = dict(sorted(Counter(slot.task_type for slot in expected_slots).items()))
+        expected_scenarios = dict(
+            sorted(Counter(slot.scenario_profile for slot in expected_slots).items())
+        )
     checks = {
         "requested_count": len(records) == requested_count,
         "hard_reward_100_percent": hard_passes == len(records),
@@ -485,7 +509,7 @@ def _alignment(
             quality["human_max_opening_share"] <= 0.1
         ),
     }
-    if is_blended:
+    if is_blended or is_official_hybrid:
         assert expected_types is not None
         assert expected_scenarios is not None
         checks["task_type_quotas"] = actual_types == expected_types
@@ -493,16 +517,14 @@ def _alignment(
         checks["preference_audit_count"] = sum(
             row.get("preference_audit") is not None for row in records
         ) == expected_types.get("preference_like", 0)
-    if config.get("profile") == BLENDED_V1_1_PROFILE:
+    if config.get("profile") in {BLENDED_V1_1_PROFILE, OFFICIAL_HYBRID_V2_PROFILE}:
         audits = [
             row["preference_audit"]
             for row in records
             if row.get("preference_audit") is not None
         ]
         if config.get("validation_policy") != "minimal_semantic":
-            checks["human_metadata_persona_not_repeated"] = (
-                quality["human_metadata_persona_repetitions"] == 0
-            )
+            checks["human_persona_not_repeated"] = quality["human_persona_repetitions"] == 0
         checks["preference_metrics_discriminate"] = all(
             len({candidate["metric_value"] for candidate in audit["candidates"]}) >= 2
             for audit in audits
