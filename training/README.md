@@ -161,6 +161,34 @@ run name `qwen3.5-4b-multiturn-sft-v2-natural-633-a800x2-seed20260809`. Its loca
 live under the experiment output directory, and a persisted W&B run ID allows checkpoint-based
 launcher restarts to resume the same dashboard run.
 
+For a reproducible train/validation split, use the audited splitter instead of randomly partitioning
+Parquet rows. It stratifies task type, Scenario profile, trajectory family, and trip length; it also
+rejects reused Blueprint semantic hashes and writes the exact assignments beside both Parquets:
+
+```bash
+uv run --project training python training/scripts/split_qwen_sft.py \
+  --input-parquet data/sft/<batch>/all.parquet \
+  --input-audit data/sft/<batch>/audit.jsonl \
+  --output-dir data/sft/<batch>-split-v1 \
+  --validation-count 300 \
+  --seed 20260811
+```
+
+Pass the resulting validation file with `VAL_FILE`. The launcher uses veRL's regular
+`trainer.test_freq` path (configured by `VALIDATION_FREQ`) and records `val/loss`, perplexity, and
+teacher-forced `val/token_accuracy`. The accuracy only covers tokens selected by the explicit SFT
+loss mask, so user text, tool observations, masked recovery context, and Qwen thinking scaffolding
+cannot inflate it. Validation includes its final partial batch. This is an in-distribution training
+diagnostic; the pinned ChinaTravel benchmark remains the only final blind evaluation.
+
+```bash
+TRAIN_FILE=data/sft/<batch>-split-v1/train.parquet \
+VAL_FILE=data/sft/<batch>-split-v1/validation.parquet \
+VALIDATION_FREQ=25 \
+GPU_HOLD_HANDOFF=1 \
+bash training/scripts/run_qwen3_5_4b_multiturn_sft.sh
+```
+
 The local training entry point also passes `trainer.seed` to veRL's shuffled
 `DistributedSampler`. Model initialization, stochastic training operations, and the per-epoch data
 permutation therefore share the configured experiment seed instead of the PyTorch sampler default.

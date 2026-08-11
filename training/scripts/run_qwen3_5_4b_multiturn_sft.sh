@@ -6,6 +6,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 TRAIN_FILE="${TRAIN_FILE:-data/sft/chinatravel-qwen3.5-4b-action-633-sft-v2-natural/all.parquet}"
+VAL_FILE="${VAL_FILE:-}"
 MODEL_PATH="${MODEL_PATH:-ckpts/Qwen3.5-4B}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 NUM_GPUS=2
@@ -30,6 +31,7 @@ CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RUN_DIR}/checkpoints}"
 LOG_DIR="${LOG_DIR:-${RUN_DIR}/logs}"
 WANDB_DIR="${WANDB_DIR:-${RUN_DIR}/wandb}"
 SAVE_FREQ="${SAVE_FREQ:-10}"
+VALIDATION_FREQ="${VALIDATION_FREQ:-25}"
 MAX_CKPT_TO_KEEP="${MAX_CKPT_TO_KEEP:-1}"
 RESUME_MODE="${RESUME_MODE:-auto}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -46,6 +48,10 @@ if [[ ! -x training/.venv/bin/torchrun ]]; then
 fi
 if [[ ! -f "${TRAIN_FILE}" ]]; then
     echo "SFT Parquet does not exist: ${TRAIN_FILE}" >&2
+    exit 1
+fi
+if [[ -n "${VAL_FILE}" && ! -f "${VAL_FILE}" ]]; then
+    echo "Validation SFT Parquet does not exist: ${VAL_FILE}" >&2
     exit 1
 fi
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
@@ -72,6 +78,10 @@ if [[ ! "${SAVE_FREQ}" =~ ^[1-9][0-9]*$ ]]; then
     echo "SAVE_FREQ=${SAVE_FREQ} must be a positive integer." >&2
     exit 1
 fi
+if [[ -n "${VAL_FILE}" && ! "${VALIDATION_FREQ}" =~ ^[1-9][0-9]*$ && "${VALIDATION_FREQ}" != "after_each_epoch" ]]; then
+    echo "VALIDATION_FREQ must be a positive integer or after_each_epoch when VAL_FILE is set." >&2
+    exit 1
+fi
 if [[ ! "${MAX_CKPT_TO_KEEP}" =~ ^[1-9][0-9]*$ ]]; then
     echo "MAX_CKPT_TO_KEEP=${MAX_CKPT_TO_KEEP} must be a positive integer." >&2
     exit 1
@@ -84,6 +94,13 @@ if (( TRAIN_BATCH_SIZE % DP_SIZE != 0 )); then
 fi
 
 TRAIN_FILE="$(realpath "${TRAIN_FILE}")"
+if [[ -n "${VAL_FILE}" ]]; then
+    VAL_FILE="$(realpath "${VAL_FILE}")"
+    TEST_FREQ="${VALIDATION_FREQ}"
+else
+    VAL_FILE="null"
+    TEST_FREQ="-1"
+fi
 MODEL_PATH="$(realpath "${MODEL_PATH}")"
 RUN_DIR="$(realpath -m "${RUN_DIR}")"
 CHECKPOINT_DIR="$(realpath -m "${CHECKPOINT_DIR}")"
@@ -104,7 +121,7 @@ export WANDB_JOB_TYPE="${WANDB_JOB_TYPE:-sft}"
 
 if [[ "${SKIP_PREFLIGHT}" != "1" ]]; then
     training/.venv/bin/python - \
-        "${TRAIN_FILE}" "${MODEL_PATH}" "${MAX_LENGTH}" "${MAX_TOKEN_LEN_PER_GPU}" \
+        "${TRAIN_FILE}" "${VAL_FILE}" "${MODEL_PATH}" "${MAX_LENGTH}" "${MAX_TOKEN_LEN_PER_GPU}" \
         "${SP_SIZE}" "${NUM_GPUS}" "${TRAIN_BATCH_SIZE}" <<'PY'
 import hashlib
 import inspect
@@ -119,8 +136,10 @@ from transformers import AutoConfig
 from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 
 train_file = Path(sys.argv[1])
-model_path = Path(sys.argv[2])
-max_length, token_budget, sp_size, num_gpus, train_batch_size = map(int, sys.argv[3:])
+raw_val_file = sys.argv[2]
+val_file = None if raw_val_file == "null" else Path(raw_val_file)
+model_path = Path(sys.argv[3])
+max_length, token_budget, sp_size, num_gpus, train_batch_size = map(int, sys.argv[4:])
 
 required = {
     "sample_id",
@@ -129,42 +148,63 @@ required = {
     "tools_json",
     "enable_thinking",
 }
-frame = pd.read_parquet(train_file)
-missing = required - set(frame.columns)
-if missing:
-    raise SystemExit(f"SFT Parquet is missing columns: {sorted(missing)}")
-if frame.empty:
-    raise SystemExit("SFT Parquet is empty.")
-if frame["sample_id"].duplicated().any():
-    raise SystemExit("SFT Parquet contains duplicate sample_id values.")
-if bool(frame["enable_thinking"].any()):
-    raise SystemExit("All Qwen3.5 SFT rows must set enable_thinking=false.")
+def validate_parquet(path: Path, *, role: str) -> tuple[pd.DataFrame, int | None]:
+    frame = pd.read_parquet(path)
+    missing = required - set(frame.columns)
+    if missing:
+        raise SystemExit(f"{role} SFT Parquet is missing columns: {sorted(missing)}")
+    if frame.empty:
+        raise SystemExit(f"{role} SFT Parquet is empty.")
+    if frame["sample_id"].duplicated().any():
+        raise SystemExit(f"{role} SFT Parquet contains duplicate sample_id values.")
+    if bool(frame["enable_thinking"].any()):
+        raise SystemExit(f"All {role} Qwen3.5 SFT rows must set enable_thinking=false.")
 
-manifest_path = train_file.parent / "manifest.json"
-sequence_max = None
-if manifest_path.exists():
+    manifest_path = path.parent / "manifest.json"
+    sequence_max = None
+    if not manifest_path.exists():
+        return frame, sequence_max
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("format_version") == "travelweaver-sft-v4":
         if "assistant_loss_mask_json" not in frame.columns:
-            raise SystemExit("SFT V4 Parquet is missing assistant_loss_mask_json.")
+            raise SystemExit(f"{role} SFT V4 Parquet is missing assistant_loss_mask_json.")
         if frame["assistant_loss_mask_json"].isna().any():
-            raise SystemExit("SFT V4 Parquet contains a null assistant loss mask.")
+            raise SystemExit(f"{role} SFT V4 Parquet contains a null assistant loss mask.")
     adapter = manifest.get("qwen_adapter", {})
     expected_digest = adapter.get("parquet_sha256")
+    split_descriptors = adapter.get("parquet_splits", {})
+    for descriptor in split_descriptors.values() if isinstance(split_descriptors, dict) else []:
+        if not isinstance(descriptor, dict):
+            continue
+        descriptor_path = descriptor.get("path")
+        if descriptor_path and Path(str(descriptor_path)).resolve() == path.resolve():
+            expected_digest = descriptor.get("sha256")
+            break
     if expected_digest:
-        digest = hashlib.sha256(train_file.read_bytes()).hexdigest()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if digest != expected_digest:
-            raise SystemExit("SFT Parquet SHA-256 does not match its manifest.")
+            raise SystemExit(f"{role} SFT Parquet SHA-256 does not match its manifest.")
     sequence_max = adapter.get("sequence_tokens", {}).get("max")
     if sequence_max is not None and int(sequence_max) > max_length:
         raise SystemExit(
-            f"Dataset max sequence {sequence_max} exceeds MAX_LENGTH={max_length}."
+            f"{role} dataset max sequence {sequence_max} exceeds MAX_LENGTH={max_length}."
         )
     if sequence_max is not None and int(sequence_max) > token_budget * sp_size:
         raise SystemExit(
-            f"Dataset max sequence {sequence_max} exceeds the SP token budget "
+            f"{role} dataset max sequence {sequence_max} exceeds the SP token budget "
             f"{token_budget * sp_size}."
         )
+    return frame, sequence_max
+
+
+train_frame, sequence_max = validate_parquet(train_file, role="Training")
+val_frame = None
+if val_file is not None:
+    val_frame, val_sequence_max = validate_parquet(val_file, role="Validation")
+    if set(train_frame["sample_id"]) & set(val_frame["sample_id"]):
+        raise SystemExit("Training and validation SFT Parquet files overlap on sample_id.")
+    known_sequence_maxima = [value for value in (sequence_max, val_sequence_max) if value is not None]
+    sequence_max = max(known_sequence_maxima) if known_sequence_maxima else None
 
 config = AutoConfig.from_pretrained(model_path, local_files_only=True)
 if config.model_type != "qwen3_5":
@@ -187,7 +227,8 @@ print(
     json.dumps(
         {
             "event": "sft_preflight_ok",
-            "samples": len(frame),
+            "train_samples": len(train_frame),
+            "validation_samples": 0 if val_frame is None else len(val_frame),
             "sequence_max": sequence_max,
             "num_gpus": num_gpus,
             "sp_size": sp_size,
@@ -209,7 +250,7 @@ fi
 
 OVERRIDES=(
     "data.train_files=${TRAIN_FILE}"
-    "data.val_files=null"
+    "data.val_files=${VAL_FILE}"
     "data.train_batch_size=${TRAIN_BATCH_SIZE}"
     "data.micro_batch_size_per_gpu=1"
     "data.max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU}"
@@ -256,7 +297,7 @@ OVERRIDES=(
     "trainer.total_epochs=${TOTAL_EPOCHS}"
     "trainer.total_training_steps=null"
     "trainer.save_freq=${SAVE_FREQ}"
-    "trainer.test_freq=-1"
+    "trainer.test_freq=${TEST_FREQ}"
     "trainer.logger=[console,wandb]"
     "trainer.seed=${SEED}"
     "trainer.resume_mode=${RESUME_MODE}"
