@@ -10,7 +10,7 @@ witness，不做 Agent rollout、RFT 轨迹筛选、SFT/GRPO 训练或 MCP。
 - 模型可见的自然语言 query；
 - 模型不可见的类型化 `TravelTaskSpec`；
 - 明确物化、可审计的 `ScenarioSpec`；
-- 由现有 13 个工具实际执行、可重放的 witness plan 和 evidence；
+- 由当前公开工具实际执行、可重放的 witness plan 和 evidence；
 - 对该 witness 为 `reward=1.0`、`all_hard_pass=true` 的确定性证明。
 
 正确性来自「先 Scenario、再 witness、后约束」。DeepSeek 只润色中文表述，不产生或

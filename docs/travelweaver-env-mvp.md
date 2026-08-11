@@ -7,24 +7,24 @@
 MVP 将 ChinaTravel 的固定数据快照包装为一个可回放的进程内 Python 环境：
 
 ```text
-reset(task) -> 查询证据 -> 管理候选 -> submit_plan / finish_without_plan -> terminal
+reset(task) -> 查询证据 -> 管理候选 -> submit_plan -> terminal
 ```
 
-环境已经包含完整的 13 工具状态闭环、确定性 Demo Agent、OpenAI-compatible
+环境已经包含完整的 17 工具状态闭环、确定性 Demo Agent、OpenAI-compatible
 function-calling rollout、通用 TravelTaskSpec、终局 TravelReward 和严格 RFT 过滤。
-普通查询动作 Reward 为 `0.0`，只有提交、退出或截断产生终局 Reward。SFT 数据加工与
-veRL/GRPO 训练循环暂不实现，项目不引入 MCP。
+普通查询动作 Reward 为 `0.0`，只有提交或截断产生终局 Reward。SFT 数据加工和训练循环位于
+隔离的 `training/` 项目中；根目录环境不引入 GPU 依赖，项目不引入 MCP。
 
 版本基线：
 
 - Python `3.10.19`，项目约束 `>=3.10,<3.11`；
 - ChinaTravel submodule commit `456b60a28ce0626875a968666c07094e3c90520e`；
-- 后续训练使用独立 Linux/CUDA 环境和 `verl==0.8.0`；
-- 环境、Observation、工具协议分别为 `travelweaver-environment-v0.3`、
-  `travelweaver-observation-v3`、`travelweaver-tools-v2-agent`；
-- TaskSpec、Reward 和轨迹协议分别为 `travelweaver-task-spec-v1`、
-  `travelweaver-reward-v1`、`travelweaver-trajectory-v6`；模型可见工具返回协议为
-  `travelweaver-model-tool-response-v1`。
+- 训练使用独立 Linux/CUDA 环境和固定 commit 的 `verl==0.9.0.dev`；
+- 环境、Observation、工具协议分别为 `travelweaver-environment-v0.5`、
+  `travelweaver-observation-v4`、`travelweaver-tools-v4-agent`；
+- TaskSpec、Reward 和轨迹协议分别为 `travelweaver-task-spec-v2`、
+  `travelweaver-reward-v2`、`travelweaver-trajectory-v8`；模型可见工具返回协议为
+  `travelweaver-model-tool-response-v3`。
 
 ## 2. 安装与数据准备
 
@@ -93,19 +93,23 @@ env.close()
 
 | 工具 | 用途 |
 |---|---|
+| `list_attraction_categories` | 列出指定城市在当前 Scenario 中真实可用的景点类别 |
 | `search_attractions` | 搜索景点及开放时间、票价、建议游玩时长 |
+| `list_restaurant_cuisines` | 列出指定城市在当前 Scenario 中真实可用的餐厅菜系 |
 | `search_restaurants` | 搜索餐厅、菜系、推荐菜、营业时间和人均价格 |
+| `search_restaurants_by_food` | 按推荐菜名查询餐厅，保留官方菜品检索的独立语义 |
+| `list_hotel_features` | 列出指定城市真实可用的酒店特色和房型床位数 |
 | `search_hotels` | 搜索酒店特色、床位数和价格 |
 | `search_intercity_transport` | 查询火车或航班快照 |
 | `search_nearby` | 在已见地点附近按类别搜索 |
 | `inspect_place` | 查看已见地点的完整规范化证据 |
+| `check_place_open` | 核验已见景点或餐厅在给定时刻是否开放 |
 | `get_route` | 查询两个同城已见地点的步行、出租车或地铁路线 |
 | `next_page` | 使用一次性 cursor 获取下一页 |
 | `save_candidate` | 保存已见地点或城际交通及其快照证据 |
 | `list_candidates` | 查看当前 episode 的候选集 |
 | `remove_candidate` | 删除候选 |
 | `submit_plan` | 提交引用已保存候选的结构化多日行程并终止 |
-| `finish_without_plan` | 无法形成方案时说明原因并终止 |
 
 每页默认 10 条。Cursor 与 episode、查询和偏移绑定，使用一次后失效，不能跨轨迹复用。`inspect_place`、`search_nearby`、`get_route` 只接受本 episode 已经展示过的 `place_id`；`save_candidate` 也只能保存本 episode 已见的地点或交通 ID。
 
@@ -113,7 +117,8 @@ env.close()
 活动的 `route_from_previous_id` 中引用该路线；城际活动时间必须与车次/航班证据一致。
 住宿活动显式提交 `rooms` 和 `room_type`，门票、车票和出租车数量由环境按人数推导。
 
-`submit_plan` 验证任务元数据、天数、活动时序、候选和路线引用、营业时间、往返城际
+`submit_plan` 是唯一终局工具。schema 合法的提交无论验证成功或失败都会立即终止 episode，
+不允许提交失败后二次修改。它验证任务元数据、天数、活动时序、候选和路线引用、营业时间、往返城际
 交通、景点、多日住宿及房间容量。环境重新计算所有单价、数量和总费用，并生成
 `PlanSnapshot` 与 `EvidenceBundle` 后调用确定性 Reward。
 
@@ -147,7 +152,7 @@ uv run travelweaver smoke-env --task-id e20241028160248698752
 uv run travelweaver run-agent --task-id e20241028160248698752
 ```
 
-`smoke-env` 检查真实查询，`run-agent` 使用只调用公开工具的确定性策略跑通查询、候选管理和计划提交，并输出终局方案。测试套件覆盖全部 13 个工具、稳定 ID、过滤排序、无结果、分页、候选隔离、提交校验、两种终止路径、跨 episode 越权、连续非法动作、动作上限、任务 public/oracle 隔离和数据库清单。
+`smoke-env` 检查真实查询，`run-agent` 使用只调用公开工具的确定性策略跑通查询、候选管理和计划提交，并输出终局方案。测试套件覆盖全部 17 个工具、稳定 ID、过滤排序、无结果、分页、候选隔离、提交校验、单次最终提交、跨 episode 越权、连续非法动作、动作上限、任务 public/oracle 隔离和数据库清单。
 
 使用官方 DeepSeek API 运行一条真实模型轨迹：
 
@@ -188,4 +193,4 @@ Rubric 和轨迹指标作为三个独立面板输出，不合成总分。
 
 ChinaTravel 上游源码以 Git submodule 引用，不复制到 TravelWeaver 包内。官方旅行数据不会由本项目重新分发；ChinaTravel 数据集卡标注为 CC BY-NC-SA 4.0，商业使用或再分发前需要单独检查授权。
 
-`verl==0.8.0`、PyTorch、vLLM、Ray 和 CUDA 不属于查询 MVP 的本地依赖。后续训练镜像仍使用 Python 3.10，但应维护单独的 Linux/CUDA 锁文件，避免把 GPU 依赖带入 macOS/CPU 环境。
+`verl==0.9.0.dev`、PyTorch、vLLM、Ray 和 CUDA 不属于查询 MVP 的本地依赖。训练环境仍使用 Python 3.10，并维护独立的 Linux/CUDA 锁文件，避免把 GPU 依赖带入 macOS/CPU 环境。
