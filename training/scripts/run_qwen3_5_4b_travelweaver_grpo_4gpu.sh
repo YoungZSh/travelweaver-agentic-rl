@@ -4,6 +4,10 @@ set -Eeuo pipefail
 
 # Four-A800 profile for g0008. Two colocated TP=2 vLLM replicas increase
 # rollout concurrency while FSDP uses SP=2 and DP=2 across all four GPUs.
+# This single-node host's ib0 only has a link-local IPv6 address, which stalls
+# NCCL bootstrap. Keep collectives on NVLink and use loopback for OOB setup.
+export NCCL_IB_DISABLE="1"
+export NCCL_SOCKET_IFNAME="lo"
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
 export NUM_GPUS="4"
 export GROUP_SIZE="8"

@@ -288,6 +288,8 @@ def test_four_gpu_launcher_preserves_two_gpu_training_semantics() -> None:
         training_root / "scripts" / "run_qwen3_5_4b_travelweaver_grpo_4gpu.sh"
     ).read_text(encoding="utf-8")
     expected_exports = {
+        'export NCCL_IB_DISABLE="1"',
+        'export NCCL_SOCKET_IFNAME="lo"',
         'export CUDA_VISIBLE_DEVICES="0,1,2,3"',
         'export NUM_GPUS="4"',
         'export GROUP_SIZE="8"',
@@ -323,6 +325,8 @@ def test_four_gpu_launcher_preserves_two_gpu_training_semantics() -> None:
     assert "trainer.rollout_data_dir=${ROLLOUT_DATA_DIR}" in base_launcher
     assert "trainer.validation_data_dir=${VALIDATION_DATA_DIR}" in base_launcher
     assert 'export TRAVELWEAVER_ROLLOUT_TRACE_DIR="${ALL_ROLLOUT_TRACE_DIR}"' in base_launcher
+    assert "runtime_env.env_vars.NCCL_IB_DISABLE" in base_launcher
+    assert "runtime_env.env_vars.NCCL_SOCKET_IFNAME" in base_launcher
 
 
 def test_agent_loop_writes_complete_rollout_trace(

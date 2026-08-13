@@ -471,6 +471,17 @@ OVERRIDES=(
     "+ray_kwargs.ray_init.runtime_env.env_vars.TORCH_ALLOW_TF32_CUBLAS_OVERRIDE='1'"
 )
 
+if [[ -n "${NCCL_IB_DISABLE:-}" ]]; then
+    export NCCL_IB_DISABLE
+    OVERRIDES+=("+ray_kwargs.ray_init.runtime_env.env_vars.NCCL_IB_DISABLE='${NCCL_IB_DISABLE}'")
+fi
+if [[ -n "${NCCL_SOCKET_IFNAME:-}" ]]; then
+    export NCCL_SOCKET_IFNAME
+    OVERRIDES+=(
+        "+ray_kwargs.ray_init.runtime_env.env_vars.NCCL_SOCKET_IFNAME='${NCCL_SOCKET_IFNAME}'"
+    )
+fi
+
 if [[ "${DRY_RUN}" == "1" ]]; then
     training/.venv/bin/python training/scripts/run_travelweaver_grpo.py \
         --cfg job --resolve "${OVERRIDES[@]}" "$@"
