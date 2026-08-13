@@ -20,6 +20,8 @@ def classify_reward_group(
 
     if len(reward_infos) != group_size:
         return "invalid", None
+    if any(bool(float(info.get("trajectory_length_exceeded", 0.0))) for info in reward_infos):
+        return "length_exceeded", None
     if any(
         "travelweaver_reward" not in info
         or "reward_valid" not in info
@@ -63,6 +65,8 @@ class TravelWeaverReplayBuffer(ReplayBuffer):
             str(sampler_kwargs.get("state_path", "training/outputs/grpo-sampler-state.json"))
         )
         self._classification: dict[str, dict[str, tuple[str, float | None]]] = defaultdict(dict)
+        self._length_diagnostics: dict[str, dict[str, tuple[int, float]]] = defaultdict(dict)
+        self._length_max_since_sample = 0.0
         self.consecutive_no_signal = 0
         self.no_signal_history: list[dict[str, Any]] = []
         self._load_state()
@@ -81,8 +85,10 @@ class TravelWeaverReplayBuffer(ReplayBuffer):
             return set(), Counter()
         finished_uids = self.finished_keys[partition_id]
         cache = self._classification[partition_id]
+        length_diagnostics = self._length_diagnostics[partition_id]
         for uid in set(cache) - finished_uids:
             del cache[uid]
+            length_diagnostics.pop(uid, None)
         new_uids = finished_uids - cache.keys()
         trajectory_keys = [
             key for key in self.partitions[partition_id] if key.split("_")[0] in new_uids
@@ -118,6 +124,16 @@ class TravelWeaverReplayBuffer(ReplayBuffer):
                 tolerance=self.zero_variance_tolerance,
             )
             cache[uid] = (classification, shared)
+            length_diagnostics[uid] = (
+                sum(
+                    bool(float(info.get("trajectory_length_exceeded", 0.0)))
+                    for info in reward_infos
+                ),
+                max(
+                    (float(info.get("sequence_tokens", 0.0)) for info in reward_infos),
+                    default=0.0,
+                ),
+            )
             self._record_signal_result(
                 uid,
                 classification,
@@ -128,7 +144,7 @@ class TravelWeaverReplayBuffer(ReplayBuffer):
         filtered = {
             uid
             for uid, (classification, _) in cache.items()
-            if classification in {"zero_variance", "invalid"}
+            if classification in {"zero_variance", "invalid", "length_exceeded"}
         }
         counts = Counter(
             shared
@@ -136,6 +152,58 @@ class TravelWeaverReplayBuffer(ReplayBuffer):
             if classification == "zero_variance" and shared is not None
         )
         return filtered, counts
+
+    def _evict_terminal_groups(
+        self,
+        global_steps: int,
+        partition_id: str,
+        eviction_reasons: tuple[set[str], set[str], set[str], Counter],
+    ) -> tuple[set[str], int, int, dict]:
+        length_uids = {
+            uid
+            for uid in eviction_reasons[1]
+            if self._classification[partition_id].get(uid, (None, None))[0]
+            == "length_exceeded"
+        }
+        length_diagnostics = self._length_diagnostics[partition_id]
+        overflow_trajectories = sum(length_diagnostics.get(uid, (0, 0.0))[0] for uid in length_uids)
+        max_observed = max(
+            (length_diagnostics.get(uid, (0, 0.0))[1] for uid in length_uids),
+            default=0.0,
+        )
+        self._length_max_since_sample = max(self._length_max_since_sample, max_observed)
+        evicted, stale_count, dapo_count, metrics = super()._evict_terminal_groups(
+            global_steps,
+            partition_id,
+            eviction_reasons,
+        )
+        if length_uids:
+            prefix = self._metrics_prefix(partition_id)
+            metrics.update(
+                {
+                    f"{prefix}/trajectory_length/overflow_groups": len(length_uids),
+                    f"{prefix}/trajectory_length/overflow_trajectories": overflow_trajectories,
+                    f"{prefix}/trajectory_length/refill_groups": len(length_uids),
+                }
+            )
+        return evicted, stale_count, dapo_count, metrics
+
+    def sample(
+        self, global_steps: int, partition_id: str, batch_size: int
+    ) -> tuple[Any, dict[str, Any]]:
+        self._length_max_since_sample = 0.0
+        batch, metrics = super().sample(global_steps, partition_id, batch_size)
+        selected_lengths = [
+            float(tag["seq_len"])
+            for tag in batch.tags
+            if "seq_len" in tag and not tag.get("is_padding", False)
+        ]
+        max_selected = max(selected_lengths, default=0.0)
+        prefix = self._metrics_prefix(partition_id)
+        metrics[f"{prefix}/trajectory_length/max_observed_tokens"] = max(
+            max_selected, self._length_max_since_sample
+        )
+        return batch, metrics
 
     def _record_signal_result(
         self,
@@ -145,7 +213,7 @@ class TravelWeaverReplayBuffer(ReplayBuffer):
         reward_infos: list[dict[str, Any]],
         global_step: int | None,
     ) -> None:
-        if classification == "invalid":
+        if classification in {"invalid", "length_exceeded"}:
             return
         if classification == "usable":
             self.consecutive_no_signal = 0

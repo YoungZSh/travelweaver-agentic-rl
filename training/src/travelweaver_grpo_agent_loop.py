@@ -55,6 +55,9 @@ class TravelWeaverAgentLoop(ToolAgentLoop):
     """Run one complete function-calling trajectory and attach Reward v4."""
 
     def __init__(self, *args: Any, **kwargs: Any):
+        self.trajectory_max_tokens = int(kwargs.pop("trajectory_max_tokens", 32768))
+        if self.trajectory_max_tokens <= 0:
+            raise ValueError("trajectory_max_tokens must be positive.")
         super().__init__(*args, **kwargs)
         schemas = TravelWeaverEnv.tool_schemas()
         proxies = [_ToolProxy(schema) for schema in schemas]
@@ -64,6 +67,57 @@ class TravelWeaverAgentLoop(ToolAgentLoop):
         self._terminal_result: Any | None = None
         self._task_id: str | None = None
         self._audit_steps: list[dict[str, Any]] = []
+        self._trajectory_length_exceeded = False
+
+    def _mark_trajectory_length_exceeded(self) -> None:
+        self._trajectory_length_exceeded = True
+
+    async def _handle_pending_state(
+        self, agent_data: AgentData, sampling_params: dict[str, Any]
+    ) -> AgentState:
+        state = await super()._handle_pending_state(agent_data, sampling_params)
+        remaining = trajectory_response_budget(
+            initial_prompt_tokens=len(agent_data.prompt_ids),
+            configured_response_tokens=self.response_length,
+            trajectory_max_tokens=self.trajectory_max_tokens,
+        )
+        if remaining <= 0:
+            self._mark_trajectory_length_exceeded()
+            return AgentState.TERMINATED
+        self.response_length = remaining
+        return state
+
+    async def _handle_generating_state(
+        self,
+        agent_data: AgentData,
+        sampling_params: dict[str, Any],
+        ignore_termination: bool = False,
+    ) -> AgentState:
+        remaining = self.response_length - len(agent_data.response_mask)
+        if remaining <= 0:
+            self._mark_trajectory_length_exceeded()
+            return AgentState.TERMINATED
+
+        per_turn_sampling_params = dict(sampling_params)
+        configured_limit = per_turn_sampling_params.pop("max_new_tokens", None)
+        if configured_limit is None:
+            configured_limit = per_turn_sampling_params.get("max_tokens")
+        per_turn_sampling_params["max_tokens"] = min(
+            remaining,
+            int(configured_limit) if configured_limit is not None else remaining,
+        )
+        state = await super()._handle_generating_state(
+            agent_data,
+            per_turn_sampling_params,
+            ignore_termination=ignore_termination,
+        )
+        if (
+            not ignore_termination
+            and self._terminal_result is None
+            and len(agent_data.response_mask) >= self.response_length
+        ):
+            self._mark_trajectory_length_exceeded()
+        return state
 
     async def run(self, sampling_params: dict[str, Any], **kwargs: Any) -> AgentLoopOutput:
         task_id = str(kwargs["task_id"])
@@ -79,6 +133,36 @@ class TravelWeaverAgentLoop(ToolAgentLoop):
         self._task_id = task_id
         try:
             output = await super().run(sampling_params, **kwargs)
+            sequence_tokens = len(output.prompt_ids) + len(output.response_ids)
+            if sequence_tokens > self.trajectory_max_tokens:
+                self._mark_trajectory_length_exceeded()
+            length_info = {
+                "trajectory_valid": float(not self._trajectory_length_exceeded),
+                "trajectory_length_exceeded": float(self._trajectory_length_exceeded),
+                "sequence_tokens": float(sequence_tokens),
+                "trajectory_max_tokens": float(self.trajectory_max_tokens),
+            }
+            if self._trajectory_length_exceeded:
+                output.reward_score = 0.0
+                output.extra_fields["reward_extra_info"] = {
+                    "travelweaver_reward": 0.0,
+                    "reward_valid": 0.0,
+                    "all_hard_pass": 0.0,
+                    "artifact_score": 0.0,
+                    "validity_score": 0.0,
+                    "goal_score": 0.0,
+                    **length_info,
+                }
+                output.extra_fields["travelweaver_audit"] = {
+                    "task_id": task_id,
+                    "termination_reason": "trajectory_length_exceeded",
+                    "discard_reason": "trajectory_length_exceeded",
+                    "reward_detail": None,
+                    "steps": self._audit_steps,
+                    "sequence_tokens": sequence_tokens,
+                    "trajectory_max_tokens": self.trajectory_max_tokens,
+                }
+                return output
             if self._terminal_result is None:
                 reason = "model_stopped_without_terminal_action"
                 reward_result = self._env.reward_evaluator.no_plan(reason)
@@ -104,6 +188,7 @@ class TravelWeaverAgentLoop(ToolAgentLoop):
                 "artifact_score": float(dimensions.get("artifact_conformance", 0.0)),
                 "validity_score": float(dimensions.get("environment_validity", 0.0)),
                 "goal_score": float(dimensions.get("goal_satisfaction", 0.0)),
+                **length_info,
             }
             output.extra_fields["travelweaver_audit"] = {
                 "task_id": task_id,
@@ -155,7 +240,24 @@ class TravelWeaverAgentLoop(ToolAgentLoop):
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         state = await super()._handle_processing_tools_state(agent_data)
-        return AgentState.TERMINATED if self._terminal_result is not None else state
+        if self._terminal_result is not None:
+            return AgentState.TERMINATED
+        if state == AgentState.TERMINATED:
+            self._mark_trajectory_length_exceeded()
+        return state
+
+
+def trajectory_response_budget(
+    *,
+    initial_prompt_tokens: int,
+    configured_response_tokens: int,
+    trajectory_max_tokens: int,
+) -> int:
+    """Return the response-side budget under a strict total-sequence cap."""
+
+    if min(initial_prompt_tokens, configured_response_tokens, trajectory_max_tokens) < 0:
+        raise ValueError("Trajectory token counts must be non-negative.")
+    return min(configured_response_tokens, trajectory_max_tokens - initial_prompt_tokens)
 
 
 def build_prompt(task: dict[str, Any], *, max_valid_steps: int = 50) -> list[dict[str, str]]:

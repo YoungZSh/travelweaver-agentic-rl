@@ -77,6 +77,8 @@ def _reward_info(reward: float, *, valid: bool = True) -> dict[str, float]:
         "artifact_score": 0.75,
         "validity_score": 0.5,
         "goal_score": 0.25,
+        "trajectory_length_exceeded": 0.0,
+        "sequence_tokens": 1024.0,
     }
 
 
@@ -98,6 +100,45 @@ def test_group_filter_rejects_every_constant_reward_level() -> None:
         group_size=8,
         tolerance=1e-8,
     ) == ("invalid", None)
+
+
+def test_group_filter_rejects_whole_group_when_one_trajectory_reaches_length_cap() -> None:
+    module = _load_sampler_module()
+    infos = [_reward_info(0.0) for _ in range(8)]
+    infos[3]["trajectory_length_exceeded"] = 1.0
+    infos[3]["sequence_tokens"] = 32768.0
+
+    assert module.classify_reward_group(
+        infos, group_size=8, tolerance=1e-8
+    ) == ("length_exceeded", None)
+
+
+def test_length_exceeded_group_does_not_change_no_signal_streak() -> None:
+    module = _load_sampler_module()
+    sampler = module.TravelWeaverReplayBuffer.__new__(module.TravelWeaverReplayBuffer)
+    sampler.consecutive_no_signal = 4
+    sampler.no_signal_history = [{"prompt_uid": "prior"}]
+    sampler._save_state = lambda: None
+
+    sampler._record_signal_result("overlong", "length_exceeded", None, [], 5)
+
+    assert sampler.consecutive_no_signal == 4
+    assert sampler.no_signal_history == [{"prompt_uid": "prior"}]
+
+
+def test_trajectory_response_budget_applies_strict_total_sequence_cap() -> None:
+    module = _load_agent_loop_module()
+
+    assert module.trajectory_response_budget(
+        initial_prompt_tokens=922,
+        configured_response_tokens=32768,
+        trajectory_max_tokens=32768,
+    ) == 31846
+    assert module.trajectory_response_budget(
+        initial_prompt_tokens=922,
+        configured_response_tokens=4096,
+        trajectory_max_tokens=32768,
+    ) == 4096
 
 
 def test_ten_consecutive_no_signal_groups_stop_and_usable_group_resets() -> None:

@@ -16,6 +16,21 @@ from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.logging_utils import configure_verl_logging
 
 
+def configure_tf32() -> dict[str, bool | str]:
+    """Enable the same TF32 policy used by the SFT launcher."""
+
+    import torch
+
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    return {
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+    }
+
+
 @ray.remote
 class TravelWeaverTaskRunner:
     def __init__(self):
@@ -43,6 +58,7 @@ class TravelWeaverTaskRunner:
 
     def run(self, config: DictConfig):
         configure_verl_logging()
+        pprint({"event": "grpo_tf32_configured", **configure_tf32()})
         from travelweaver_grpo_trainer import TravelWeaverPPOTrainerSync
 
         del TravelWeaverPPOTrainerSync

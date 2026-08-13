@@ -125,7 +125,8 @@ Qwen3.5-4B 的本地双 A800 profile 固定使用：
 - `algorithm.adv_estimator=grpo`；
 - `algorithm.norm_adv_by_std_in_grpo=false`，保留组内中心化但不除以标准差；
 - vLLM rollout TP=2，FSDP2 actor/ref，Ulysses SP=2；
-- 65,536 总序列上限：8,192 prompt + 57,344 response；
+- 32,768 总序列硬上限，包含初始 prompt、assistant 输出和序列化工具 observation；初始
+  prompt tokenize 后按样本动态计算剩余 response budget；
 - 多轮 AgentLoop 最多 60 个 assistant/user turn，环境仍最多 50 个有效工具动作；
 - 使用 Qwen3.5 官方 chat template 和 `qwen3_coder` XML tool parser，不手工拼接工具协议；
 - online AgentLoop 直接把 `TravelReward` 标量写入 `reward_score`，不启用 learned RM。
@@ -133,6 +134,10 @@ Qwen3.5-4B 的本地双 A800 profile 固定使用：
 自定义 replay buffer 过滤所有零方差组，而不只过滤全 0 或全 1：`[c,c,...,c]` 对任意
 `c` 都没有 GRPO 排序信号。`reward_valid=false` 或不完整的组也不会训练，但不计入“连续无
 信号”次数。
+
+任一 rollout 因达到 32K 上限而终止时，该轨迹标记为 infrastructure-invalid，不调用任务
+Reward；其所在的整个 8-rollout group 被丢弃并补采。长度超限组不计入连续无信号次数。
+Validation 不从分母删除超限样本，而是按失败计分并单独记录超限率，避免指标虚高。
 
 若连续 10 个完整、Reward 有效的 group 都是零方差，且中间没有任何可用 group，训练会：
 

@@ -1,2 +1,3 @@
 - name: travelweaver_agent
   _target_: travelweaver_grpo_agent_loop.TravelWeaverAgentLoop
+  trajectory_max_tokens: ${oc.env:TRAVELWEAVER_TRAJECTORY_MAX_TOKENS,32768}

@@ -239,13 +239,18 @@ PYTHONPATH=training/src:src uv run --project training python \
 The two-A800 launcher fixes `rollout.n=8`, disables GRPO standard-deviation normalization, and
 filters every constant-reward group, including constant negative groups. It safely checkpoints and
 stops after ten consecutive valid constant-reward groups; any usable group resets the streak.
-The default response cap is 32,768 tokens and the actor/ref dynamic token budget is 12,288 tokens
-per GPU, which avoids the full-vocabulary-logit peak observed with a 32K per-GPU micro-batch.
+The strict trajectory cap is 32,768 total tokens, including the initial prompt, assistant output,
+and serialized tool observations. The AgentLoop derives each sample's response budget after prompt
+tokenization. A trajectory terminated by the cap invalidates its whole eight-rollout group, which is
+discarded and refilled without affecting the consecutive no-signal counter. Validation keeps capped
+samples in its denominator and reports them as failures plus a separate overflow rate.
 The 1,000-task pilot uses a deterministic 900/100 train/validation split, keeps actor/reference
 parameter, optimizer, and activation offload disabled, and reserves 80% of GPU memory for
-colocated vLLM. The default actor/ref dynamic token cap is 8192 per GPU to leave headroom for
-full-vocabulary logits. Validation runs once before training and again at the final step; both metrics
-and ten sampled validation generations are logged to W&B.
+colocated vLLM. With Ulysses SP=2, the actor/ref dynamic token cap is 16,384 per GPU, giving a 32K
+effective sequence budget. Liger, veRL's Triton fused log-prob/cross-entropy path, fused AdamW, and
+TF32 reduce memory and compute overhead without enabling CPU offload. Validation runs once before
+training and again at the final step; both metrics and ten sampled validation generations are logged
+to W&B.
 
 The 1K-prompt profile uses eight prompt groups per global step and eight rollouts per group, for
 64 real trajectories per step. veRL v1 interprets `ppo_mini_batch_size` in prompt-group units and
@@ -264,7 +269,7 @@ GPU_HOLD_HANDOFF=1 \
 bash training/scripts/run_qwen3_5_4b_travelweaver_grpo.sh
 ```
 
-The default profile uses vLLM TP=2, FSDP2 plus Ulysses SP=2, and a 65,536-token total context.
+The default profile uses vLLM TP=2, FSDP2 plus Ulysses SP=2, and a strict 32,768-token trajectory cap.
 The prompt manifest and launcher preflight reject witness/Reward leakage, hash mismatches, wrong
 model families, incompatible veRL hooks, or a group size other than eight. See
 [`docs/outcome-reward-shaping-v4.md`](../docs/outcome-reward-shaping-v4.md) for the exact A/V/G

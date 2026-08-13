@@ -17,11 +17,11 @@ PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-4}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
 
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-8192}"
-MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-32768}"
-# Full-vocabulary logits dominate the actor-update peak for Qwen3.5. Keep the
-# dynamic actor/ref batches conservative because rollout reserves 80% of each
-# GPU and all model/optimizer state remains on GPU.
-MAX_TOKEN_LEN_PER_GPU="${MAX_TOKEN_LEN_PER_GPU:-8192}"
+TRAJECTORY_MAX_TOKENS="${TRAJECTORY_MAX_TOKENS:-32768}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-${TRAJECTORY_MAX_TOKENS}}"
+# SP=2 turns this per-GPU budget into the same strict 32K total-sequence cap.
+# Fused log-prob kernels avoid materializing the full [tokens, vocabulary] logits.
+MAX_TOKEN_LEN_PER_GPU="${MAX_TOKEN_LEN_PER_GPU:-16384}"
 TOTAL_STEPS="${TOTAL_STEPS:-112}"
 ACTOR_LR="${ACTOR_LR:-1e-6}"
 TEMPERATURE="${TEMPERATURE:-0.8}"
@@ -83,12 +83,26 @@ if [[ "${GPU_MEMORY_UTILIZATION}" != "0.8" ]]; then
 fi
 for value in \
     "${TRAIN_BATCH_SIZE}" "${PPO_MINI_BATCH_SIZE}" "${PPO_EPOCHS}" \
-    "${TOTAL_STEPS}" "${SAVE_FREQ}" "${TEST_FREQ}" "${MAX_ACTOR_CKPT_TO_KEEP}"; do
+    "${TOTAL_STEPS}" "${SAVE_FREQ}" "${TEST_FREQ}" "${MAX_ACTOR_CKPT_TO_KEEP}" \
+    "${MAX_PROMPT_LENGTH}" "${MAX_RESPONSE_LENGTH}" "${TRAJECTORY_MAX_TOKENS}" \
+    "${MAX_TOKEN_LEN_PER_GPU}"; do
     if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
         echo "Batch, step, checkpoint, and validation settings must be positive integers." >&2
         exit 1
     fi
 done
+if (( MAX_PROMPT_LENGTH >= TRAJECTORY_MAX_TOKENS )); then
+    echo "MAX_PROMPT_LENGTH must be smaller than TRAJECTORY_MAX_TOKENS." >&2
+    exit 1
+fi
+if (( MAX_RESPONSE_LENGTH > TRAJECTORY_MAX_TOKENS )); then
+    echo "MAX_RESPONSE_LENGTH cannot exceed TRAJECTORY_MAX_TOKENS." >&2
+    exit 1
+fi
+if (( MAX_TOKEN_LEN_PER_GPU * SP_SIZE < TRAJECTORY_MAX_TOKENS )); then
+    echo "The actor/ref SP token budget must cover TRAJECTORY_MAX_TOKENS." >&2
+    exit 1
+fi
 if (( TRAIN_BATCH_SIZE % PPO_MINI_BATCH_SIZE != 0 )); then
     echo "TRAIN_BATCH_SIZE must be divisible by PPO_MINI_BATCH_SIZE." >&2
     exit 1
@@ -125,11 +139,13 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export PYTHONPATH="${PROJECT_ROOT}/training/src:${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_JOB_TYPE="${WANDB_JOB_TYPE:-grpo}"
+export TRAVELWEAVER_TRAJECTORY_MAX_TOKENS="${TRAJECTORY_MAX_TOKENS}"
 
 if [[ "${SKIP_PREFLIGHT}" != "1" ]]; then
     training/.venv/bin/python - \
         "${TRAIN_FILE}" "${VAL_FILE}" "${MODEL_PATH}" "${GROUP_SIZE}" \
         "${NUM_GPUS}" "${SP_SIZE}" "${MAX_PROMPT_LENGTH}" "${MAX_RESPONSE_LENGTH}" \
+        "${TRAJECTORY_MAX_TOKENS}" "${MAX_TOKEN_LEN_PER_GPU}" \
         "${TRAIN_BATCH_SIZE}" "${PPO_MINI_BATCH_SIZE}" "${PPO_EPOCHS}" <<'PY'
 import hashlib
 import importlib.metadata
@@ -139,10 +155,13 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+from torch.optim import AdamW
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 from transformers import AutoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer
+from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 
 from travelweaver.env import TravelWeaverEnv
 
@@ -153,6 +172,8 @@ train_file, val_file, model_path = map(Path, sys.argv[1:4])
     sp_size,
     max_prompt,
     max_response,
+    trajectory_max_tokens,
+    max_token_len_per_gpu,
     train_batch_size,
     ppo_mini_batch_size,
     ppo_epochs,
@@ -197,8 +218,21 @@ if len(train_ids) != 900 or len(validation_ids) != 100:
 config = AutoConfig.from_pretrained(model_path, local_files_only=True)
 if config.model_type != "qwen3_5":
     raise SystemExit(f"Expected qwen3_5 checkpoint, found {config.model_type!r}.")
-if max_prompt + max_response > int(getattr(config, "max_position_embeddings", 65536)):
-    raise SystemExit("Prompt plus response length exceeds the checkpoint context window.")
+if trajectory_max_tokens > int(getattr(config, "max_position_embeddings", 65536)):
+    raise SystemExit("Trajectory token cap exceeds the checkpoint context window.")
+if max_prompt >= trajectory_max_tokens or max_response > trajectory_max_tokens:
+    raise SystemExit("Prompt/response configuration is incompatible with the trajectory cap.")
+if max_token_len_per_gpu * sp_size < trajectory_max_tokens:
+    raise SystemExit("Actor/ref SP token budget is smaller than the trajectory cap.")
+text_config = getattr(config, "text_config", config)
+if int(text_config.num_attention_heads) % sp_size != 0:
+    raise SystemExit("Qwen attention heads must be divisible by the SP size.")
+if sp_size > 1 and "cp_context" not in inspect.signature(chunk_gated_delta_rule).parameters:
+    raise SystemExit("Installed FLA does not support Qwen3.5 Ulysses sequence parallelism.")
+if "fused" not in inspect.signature(AdamW).parameters:
+    raise SystemExit("Installed PyTorch AdamW does not expose the fused CUDA implementation.")
+if not callable(linear_cross_entropy):
+    raise SystemExit("veRL's fused linear cross-entropy kernel is unavailable.")
 signature = inspect.signature(core_algos.compute_grpo_outcome_advantage)
 if "norm_adv_by_std_in_grpo" not in signature.parameters:
     raise SystemExit("Pinned veRL no longer exposes GRPO std-normalization control.")
@@ -227,7 +261,13 @@ print(
             "sequence_parallel_size": sp_size,
             "train_rows": len(train_ids),
             "validation_rows": len(validation_ids),
-            "max_sequence_length": max_prompt + max_response,
+            "max_sequence_length": trajectory_max_tokens,
+            "max_response_length": max_response,
+            "token_budget_per_gpu": max_token_len_per_gpu,
+            "fused_adamw": True,
+            "fused_linear_cross_entropy": True,
+            "liger": True,
+            "tf32": True,
             "gpu_memory_utilization": 0.8,
             "training_offload": False,
             "norm_adv_by_std": False,
@@ -263,8 +303,12 @@ OVERRIDES=(
     "actor_rollout_ref.model.use_remove_padding=true"
     "actor_rollout_ref.model.enable_gradient_checkpointing=true"
     "actor_rollout_ref.model.enable_activation_offload=false"
+    "actor_rollout_ref.model.use_liger=true"
+    "actor_rollout_ref.model.use_fused_kernels=true"
+    "actor_rollout_ref.model.fused_kernel_options.impl_backend=triton"
     "actor_rollout_ref.actor.strategy=fsdp2"
     "actor_rollout_ref.actor.optim.lr=${ACTOR_LR}"
+    "actor_rollout_ref.actor.optim.override_optimizer_config={fused:true}"
     "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}"
     "actor_rollout_ref.actor.ppo_epochs=${PPO_EPOCHS}"
     "actor_rollout_ref.actor.use_dynamic_bsz=true"
@@ -277,6 +321,7 @@ OVERRIDES=(
     "actor_rollout_ref.actor.fsdp_config.param_offload=false"
     "actor_rollout_ref.actor.fsdp_config.optimizer_offload=false"
     "actor_rollout_ref.actor.fsdp_config.offload_policy=false"
+    "actor_rollout_ref.actor.fsdp_config.reshard_after_forward=true"
     "actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=${SP_SIZE}"
     "actor_rollout_ref.ref.strategy=fsdp2"
     "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true"
@@ -284,6 +329,7 @@ OVERRIDES=(
     "actor_rollout_ref.ref.fsdp_config.param_offload=false"
     "actor_rollout_ref.ref.fsdp_config.optimizer_offload=false"
     "actor_rollout_ref.ref.fsdp_config.offload_policy=false"
+    "actor_rollout_ref.ref.fsdp_config.reshard_after_forward=true"
     "actor_rollout_ref.ref.fsdp_config.ulysses_sequence_parallel_size=${SP_SIZE}"
     "actor_rollout_ref.rollout.name=vllm"
     "actor_rollout_ref.rollout.mode=async"
@@ -339,6 +385,7 @@ OVERRIDES=(
     "trainer.log_val_generations=${LOG_VAL_GENERATIONS}"
     "trainer.logger=[console,wandb]"
     "trainer.resume_mode=${RESUME_MODE}"
+    "+ray_kwargs.ray_init.runtime_env.env_vars.TORCH_ALLOW_TF32_CUBLAS_OVERRIDE='1'"
 )
 
 if [[ "${DRY_RUN}" == "1" ]]; then
