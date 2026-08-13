@@ -83,8 +83,16 @@ if [[ "${GPU_HOLD_HANDOFF}" != "0" && "${GPU_HOLD_HANDOFF}" != "1" ]]; then
     echo "GPU_HOLD_HANDOFF must be 0 or 1." >&2
     exit 1
 fi
-if [[ "${GPU_MEMORY_UTILIZATION}" != "0.65" ]]; then
-    echo "This experiment requires GPU_MEMORY_UTILIZATION=0.65." >&2
+case "${NUM_GPUS}" in
+    2) EXPECTED_GPU_MEMORY_UTILIZATION="0.65" ;;
+    4) EXPECTED_GPU_MEMORY_UTILIZATION="0.75" ;;
+    *)
+        echo "TravelWeaver GRPO supports only the audited 2-GPU and 4-GPU profiles." >&2
+        exit 1
+        ;;
+esac
+if [[ "${GPU_MEMORY_UTILIZATION}" != "${EXPECTED_GPU_MEMORY_UTILIZATION}" ]]; then
+    echo "The ${NUM_GPUS}-GPU profile requires GPU_MEMORY_UTILIZATION=${EXPECTED_GPU_MEMORY_UTILIZATION}." >&2
     exit 1
 fi
 for value in \
@@ -333,7 +341,7 @@ print(
             "fused_linear_cross_entropy": True,
             "liger": True,
             "tf32": True,
-            "gpu_memory_utilization": 0.65,
+            "gpu_memory_utilization": 0.65 if num_gpus == 2 else 0.75,
             "training_offload": False,
             "norm_adv_by_std": False,
             "zero_variance_filter": "all_constant_reward_levels",

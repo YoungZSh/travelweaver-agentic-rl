@@ -245,8 +245,8 @@ tokenization. A trajectory terminated by the cap invalidates its whole eight-rol
 discarded and refilled without affecting the consecutive no-signal counter. Validation keeps capped
 samples in its denominator and reports them as failures plus a separate overflow rate.
 The 1,000-task pilot uses a deterministic 900/100 train/validation split, keeps actor/reference
-parameter, optimizer, and activation offload disabled. The colocated vLLM memory fraction is capped
-at 65%; 80% cannot remap the KV cache after a GPU-only actor update. With Ulysses SP=2, the actor/ref
+parameter, optimizer, and activation offload disabled. The two-GPU baseline caps colocated vLLM at
+65%; 80% cannot remap the KV cache after a GPU-only actor update. With Ulysses SP=2, its actor/ref
 dynamic token cap is 16,384 per GPU, giving a 32K effective sequence budget. Liger, veRL's Triton
 fused log-prob/cross-entropy path, fused AdamW, and TF32 reduce memory and compute overhead without
 enabling CPU offload. Validation runs once before training and again at the final step; both metrics
@@ -272,8 +272,9 @@ bash training/scripts/run_qwen3_5_4b_travelweaver_grpo.sh
 On the eight-A800 `g0008` host, the four-GPU profile uses GPUs 0-3. It preserves the baseline's
 eight prompt groups, eight rollouts per group, PPO mini-batch of four, two actor updates per global
 step, 112 steps, and 7,168 total training trajectories. The extra GPUs provide two colocated TP=2
-vLLM replicas with 16 AgentLoop workers; FSDP uses SP=2 and DP=2. A real launch refuses to start if
-any selected GPU has a compute process. A CPU-only dry-run remains safe while GPUs are occupied.
+vLLM replicas with 16 AgentLoop workers; FSDP uses SP=2 and DP=2. Its per-GPU dynamic token cap is
+24,576 and its vLLM memory fraction is 75%. A real launch refuses to start if any selected GPU has a
+compute process. A CPU-only dry-run remains safe while GPUs are occupied.
 
 ```bash
 TRAIN_FILE=/ssd/home/zc/travelweaver-agentic-rl/data/grpo/chinatravel-grpo-v4-1000-split90-10-zca800/train.parquet \

@@ -300,6 +300,8 @@ def test_four_gpu_launcher_preserves_two_gpu_training_semantics() -> None:
         'export ROLLOUT_MAX_NUM_SEQS="8"',
         'export AGENT_NUM_WORKERS="16"',
         'export DATALOADER_NUM_WORKERS="4"',
+        'export MAX_TOKEN_LEN_PER_GPU="24576"',
+        'export GPU_MEMORY_UTILIZATION="0.75"',
     }
     assert all(export in wrapper for export in expected_exports)
 
