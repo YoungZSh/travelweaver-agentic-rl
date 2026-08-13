@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from travelweaver.data import JsonlTaskStore
-from travelweaver.errors import TaskSpecError
+from travelweaver.errors import DataUnavailableError, TaskSpecError
 from travelweaver.tasks import (
     ChinaTravelOracleAdapter,
     LLMTaskSpecCompiler,
@@ -135,7 +135,10 @@ def test_llm_compiler_rejects_malformed_supported_constraint_values() -> None:
 
 
 def test_chinatravel_adapter_maps_all_654_pinned_tasks_without_exec() -> None:
-    store = JsonlTaskStore.default(split="benchmark")
+    try:
+        store = JsonlTaskStore.default(split="benchmark")
+    except DataUnavailableError:
+        pytest.skip("local benchmark snapshot is not imported")
     adapter = ChinaTravelOracleAdapter()
 
     results = [

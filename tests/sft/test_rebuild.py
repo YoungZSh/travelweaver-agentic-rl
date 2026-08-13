@@ -3,17 +3,45 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from travelweaver.env import ScenarioBackend, ScenarioSpec, TravelWeaverEnv
+from travelweaver.errors import SFTRebuildError
 from travelweaver.rollout import MODEL_TOOL_RESPONSE_VERSION, DemoTravelAgent
 from travelweaver.rollout.api_agent import SYSTEM_PROMPT, render_system_prompt
 from travelweaver.sft.ordering import order_tool_arguments
 from travelweaver.sft.rebuild import (
     SFTSource,
     _is_accepted,
+    _load_official_commonsense_passes,
     _mode_exclusion_reason,
     _PreparedTask,
+    _react_source_context,
     _rebuild_one,
 )
+
+
+def test_official_commonsense_gate_requires_a_complete_passing_audit(tmp_path: Path) -> None:
+    task_dir = tmp_path / "generated"
+    task_dir.mkdir()
+    audit_path = task_dir / "official-audit.jsonl"
+    audit_path.write_text(
+        "\n".join(
+            (
+                json.dumps({"uid": "pass", "schema_passed": True, "commonsense_passed": True}),
+                json.dumps({"uid": "fail", "schema_passed": True, "commonsense_passed": False}),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert _load_official_commonsense_passes(
+        task_dir, expected_task_ids={"pass", "fail"}
+    ) == {"pass"}
+
+    with pytest.raises(SFTRebuildError, match="does not align"):
+        _load_official_commonsense_passes(task_dir, expected_task_ids={"pass"})
 
 
 def test_sft_acceptance_explicitly_supports_v3_and_v4_trajectories() -> None:
@@ -29,6 +57,19 @@ def test_sft_acceptance_explicitly_supports_v3_and_v4_trajectories() -> None:
     assert _is_accepted({**base, "trajectory_version": "travelweaver-trajectory-v5"})
     assert _is_accepted({**base, "trajectory_version": "travelweaver-trajectory-v6"})
     assert not _is_accepted({**base, "trajectory_version": "travelweaver-trajectory-v2"})
+
+
+def test_rebuild_rejects_the_retired_100_step_source_prompt() -> None:
+    row = {
+        "task_id": "legacy-100",
+        "messages": [
+            {"role": "system", "content": render_system_prompt(100)},
+            {"role": "user", "content": "请安排一次旅行。"},
+        ],
+    }
+
+    with pytest.raises(SFTRebuildError, match="different system prompt"):
+        _react_source_context(row)
 
 
 def test_rebuild_skips_invalid_turn_and_replays_reward_one(backend, task_store) -> None:

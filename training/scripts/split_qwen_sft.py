@@ -13,7 +13,8 @@ from typing import Any
 
 import pandas as pd
 
-SPLIT_VERSION = "travelweaver-qwen-sft-split-v1"
+SPLIT_VERSION = "travelweaver-qwen-sft-split-v2"
+HOLDOUT_NAMES = ("validation", "test")
 STRATIFICATION_FIELDS = (
     "task_type",
     "scenario_profile",
@@ -85,10 +86,18 @@ def split_records(
 
 
 def create_split(
-    *, input_parquet: Path, input_audit: Path, output_dir: Path, validation_count: int, seed: int
+    *,
+    input_parquet: Path,
+    input_audit: Path,
+    output_dir: Path,
+    validation_count: int,
+    seed: int,
+    holdout_name: str = "validation",
 ) -> dict[str, Any]:
-    """Write a non-overlapping train/validation pair and an auditable split manifest."""
+    """Write a non-overlapping train/holdout pair and an auditable split manifest."""
 
+    if holdout_name not in HOLDOUT_NAMES:
+        raise ValueError(f"holdout_name must be one of {HOLDOUT_NAMES}.")
     if output_dir.exists():
         raise FileExistsError(f"Refusing to overwrite existing split directory: {output_dir}")
     frame = pd.read_parquet(input_parquet)
@@ -125,24 +134,24 @@ def create_split(
 
     output_dir.mkdir(parents=True, exist_ok=False)
     train_path = output_dir / "train.parquet"
-    validation_path = output_dir / "validation.parquet"
+    validation_path = output_dir / f"{holdout_name}.parquet"
     _atomic_parquet(train_frame, train_path)
     _atomic_parquet(validation_frame, validation_path)
 
     assignments = []
     validation_set = set(validation_ids)
     for record in sorted(records, key=lambda item: item.sample_id):
-        assignment = "validation" if record.sample_id in validation_set else "train"
+        assignment = holdout_name if record.sample_id in validation_set else "train"
         assignments.append({**asdict(record), "split": assignment})
     _atomic_jsonl(output_dir / "assignments.jsonl", assignments)
 
     report = {
         "samples": len(records),
         "train_samples": len(train_frame),
-        "validation_samples": len(validation_frame),
+        f"{holdout_name}_samples": len(validation_frame),
         "stratification_fields": list(STRATIFICATION_FIELDS),
         "train_distribution": _distribution(assignments, "train"),
-        "validation_distribution": _distribution(assignments, "validation"),
+        f"{holdout_name}_distribution": _distribution(assignments, holdout_name),
         "stratum_validation_quotas": {
             "|".join(map(str, key)): value for key, value in sorted(quotas.items())
         },
@@ -154,7 +163,7 @@ def create_split(
     source_adapter.pop("parquet_sha256", None)
     source_adapter["parquet_splits"] = {
         "train": _parquet_descriptor(train_path, len(train_frame)),
-        "validation": _parquet_descriptor(validation_path, len(validation_frame)),
+        holdout_name: _parquet_descriptor(validation_path, len(validation_frame)),
     }
     manifest = {
         "format_version": SPLIT_VERSION,
@@ -169,8 +178,9 @@ def create_split(
         },
         "split": {
             "seed": seed,
-            "validation_count": validation_count,
-            "validation_ratio": round(validation_count / len(frame), 8),
+            "holdout_count": validation_count,
+            "holdout_ratio": round(validation_count / len(frame), 8),
+            "holdout_name": holdout_name,
             "stratification_fields": list(STRATIFICATION_FIELDS),
         },
         "qwen_adapter": source_adapter,
@@ -354,6 +364,12 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--validation-count", type=int, required=True)
     parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument(
+        "--holdout-name",
+        choices=HOLDOUT_NAMES,
+        default="validation",
+        help="Name the held-out split and Parquet file (default: validation).",
+    )
     args = parser.parse_args()
     manifest = create_split(
         input_parquet=args.input_parquet,
@@ -361,6 +377,7 @@ def main() -> None:
         output_dir=args.output_dir,
         validation_count=args.validation_count,
         seed=args.seed,
+        holdout_name=args.holdout_name,
     )
     print(json.dumps(manifest["report"], ensure_ascii=False, indent=2, sort_keys=True))
 

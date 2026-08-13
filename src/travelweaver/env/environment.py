@@ -21,9 +21,9 @@ from .ids import make_route_id
 from .models import EvidenceBundle, Observation, PlanSnapshot, StepResult
 from .tool_schemas import parameter_schema, tool_schemas
 
-ENVIRONMENT_VERSION = "travelweaver-environment-v0.5"
+ENVIRONMENT_VERSION = "travelweaver-environment-v0.6"
 OBSERVATION_VERSION = "travelweaver-observation-v4"
-TOOLS_VERSION = "travelweaver-tools-v4-agent"
+TOOLS_VERSION = "travelweaver-tools-v5-agent"
 PLAN_SNAPSHOT_VERSION = "travelweaver-plan-snapshot-v2"
 EVIDENCE_BUNDLE_VERSION = "travelweaver-evidence-v2"
 QUANTITY_RULES_VERSION = "travelweaver-quantity-rules-v1"
@@ -434,6 +434,13 @@ class TravelWeaverEnv:
                 activity_type = activity["type"]
                 self._validate_candidate_type(candidate, activity_type)
                 evidence = dict(candidate["evidence"])
+                self._validate_candidate_purpose(
+                    candidate,
+                    activity_type,
+                    evidence,
+                    start_city=str(self._task["start_city"]),
+                    target_city=str(self._task["target_city"]),
+                )
                 used_entities[candidate_id] = evidence
 
                 start = self._plan_minutes(activity["start_time"], allow_24=False)
@@ -797,6 +804,56 @@ class TravelWeaverEnv:
             raise ValueError(
                 f"Candidate {candidate['candidate_id']} has type {actual!r}, "
                 f"not {expected!r} required by activity {activity_type!r}."
+            )
+
+    @staticmethod
+    def _validate_candidate_purpose(
+        candidate: Mapping[str, Any],
+        activity_type: str,
+        evidence: Mapping[str, Any],
+        *,
+        start_city: str,
+        target_city: str,
+    ) -> None:
+        """Require the saved intent to agree with how the plan consumes the candidate."""
+
+        if activity_type == "attraction":
+            allowed = {"attraction"}
+        elif activity_type in {"lunch", "dinner"}:
+            allowed = {"meal"}
+        elif activity_type == "breakfast":
+            # One hotel candidate may ground both the overnight stay and its free
+            # breakfast. Candidates are keyed by entity id, so it cannot hold two
+            # simultaneous purpose labels.
+            allowed = (
+                {"hotel", "meal"}
+                if evidence.get("entity_type") == "hotel"
+                else {"meal"}
+            )
+        elif activity_type == "accommodation":
+            allowed = {"hotel"}
+        elif activity_type in {"train", "airplane"}:
+            direction = (
+                str(evidence.get("origin_city")),
+                str(evidence.get("destination_city")),
+            )
+            if direction == (start_city, target_city):
+                allowed = {"outbound_transport"}
+            elif direction == (target_city, start_city):
+                allowed = {"return_transport"}
+            else:
+                raise ValueError(
+                    f"Intercity candidate {candidate['candidate_id']} has direction "
+                    f"{direction[0]}->{direction[1]}, outside the requested trip."
+                )
+        else:  # The tool schema rejects unknown activity types before this point.
+            raise ValueError(f"Unknown activity type for candidate purpose: {activity_type}")
+
+        actual = candidate.get("purpose")
+        if actual not in allowed:
+            raise ValueError(
+                f"Candidate {candidate['candidate_id']} was saved for purpose {actual!r}, "
+                f"not {sorted(allowed)!r} allowed by activity {activity_type!r}."
             )
 
     @staticmethod

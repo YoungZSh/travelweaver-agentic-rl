@@ -10,12 +10,10 @@ def test_tool_schema_names_and_defensive_copy() -> None:
         "search_attractions",
         "list_restaurant_cuisines",
         "search_restaurants",
-        "search_restaurants_by_food",
         "list_hotel_features",
         "search_hotels",
         "search_intercity_transport",
         "search_nearby",
-        "inspect_place",
         "check_place_open",
         "get_route",
         "next_page",
@@ -26,4 +24,11 @@ def test_tool_schema_names_and_defensive_copy() -> None:
     ]
     schemas[0]["function"]["name"] = "changed"
     assert tool_schemas()[0]["function"]["name"] == "list_attraction_categories"
+    public_save = next(
+        item for item in tool_schemas() if item["function"]["name"] == "save_candidate"
+    )
+    assert "note" not in public_save["function"]["parameters"]["properties"]
+    assert "note" in parameter_schema("save_candidate")["properties"]
+    assert parameter_schema("search_restaurants_by_food") is not None
+    assert parameter_schema("inspect_place") is not None
     assert parameter_schema("missing") is None

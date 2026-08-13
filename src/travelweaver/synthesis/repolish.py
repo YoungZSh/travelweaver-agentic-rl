@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
@@ -32,6 +33,7 @@ class RepolishConfig:
     max_api_calls: int = 400
     validation_policy: str = "minimal_semantic"
     canonical_only: bool = False
+    allow_partial_input: bool = False
 
     def __post_init__(self) -> None:
         if self.llm_concurrency <= 0:
@@ -88,14 +90,18 @@ class SurfaceRepolishPipeline:
         source_records = _read_records(self.config.input_dir / "records")
         if not source_records:
             raise SynthesisError("Repolish input directory has no synthesis records.")
-        if (
-            not self.config.canonical_only
-            and self.config.max_api_calls < len(source_records) * self.polisher.max_attempts
+        source_config = dict(source_manifest.get("config", {}))
+        source_expected = int(source_config.get("count", len(source_records)))
+        source_completed = int(source_manifest.get("completed", len(source_records)))
+        if not self.config.allow_partial_input and (
+            source_manifest.get("status") != "complete"
+            or source_completed != source_expected
+            or len(source_records) != source_expected
         ):
             raise SynthesisError(
-                "API budget must cover every record at the configured maximum polish attempts."
+                "Repolish input batch is incomplete; finish synthesis first or explicitly "
+                "use allow_partial_input."
             )
-        source_config = dict(source_manifest.get("config", {}))
         count = len(source_records)
         profile = str(source_config.get("profile", "pilot_v2_1"))
         seed = int(source_config.get("seed", 0))
@@ -115,38 +121,124 @@ class SurfaceRepolishPipeline:
                 "world_snapshot_version": WORLD_SNAPSHOT_VERSION,
                 "operation": "surface_repolish",
                 "source_dir": str(self.config.input_dir.resolve()),
+                "source_identity": _source_identity(source_manifest, source_records),
                 "llm_concurrency": self.config.llm_concurrency,
                 "validation_policy": self.config.validation_policy,
                 "canonical_only": self.config.canonical_only,
+                "allow_partial_input": self.config.allow_partial_input,
             },
         )
         completed = store.completed_indices()
-        if completed:
-            expected = {int(record["slot"]["index"]) for record in source_records}
-            if completed != expected:
-                raise SynthesisError(
-                    "Repolish output directory contains only a partial record set."
-                )
-            existing = {int(row["slot"]["index"]): row for row in store.records()}
+        expected = {int(record["slot"]["index"]) for record in source_records}
+        unexpected = completed - expected
+        if unexpected:
+            raise SynthesisError(
+                "Repolish output contains slots absent from its source: "
+                + ", ".join(str(index) for index in sorted(unexpected)[:5])
+            )
+        existing = {int(row["slot"]["index"]): row for row in store.records()}
+        if completed == expected:
             return self._finalize(store, existing, api_calls=store.api_calls)
 
-        rewritten: dict[int, dict[str, Any]] = {}
+        pending_records = [
+            record
+            for record in source_records
+            if int(record["slot"]["index"]) not in completed
+        ]
+        remaining_budget = self.config.max_api_calls - store.api_calls
+        required_budget = (
+            0
+            if self.config.canonical_only
+            else len(pending_records) * self.polisher.max_attempts
+        )
+        if remaining_budget < required_budget:
+            raise SynthesisError(
+                "API budget cannot fund every pending repolish slot at the maximum attempts: "
+                f"need {required_budget}, have {remaining_budget}."
+            )
+        rewritten = dict(existing)
+        surface_ids = {
+            str(row["surface"]["surface_id"]) for row in rewritten.values()
+        }
+        starting_api_calls = store.api_calls
+        store.record_progress(
+            {
+                "event": "repolish_resumed" if completed else "repolish_started",
+                "requested": count,
+                "completed": len(completed),
+                "pending": len(pending_records),
+            }
+        )
+        failures: list[tuple[int, Exception]] = []
         with ThreadPoolExecutor(max_workers=self.config.llm_concurrency) as executor:
             futures = {
                 executor.submit(self._rewrite_record, record): int(record["slot"]["index"])
-                for record in source_records
+                for record in pending_records
             }
             for future in as_completed(futures):
                 index = futures[future]
-                rewritten[index] = future.result()
+                total_api_calls = starting_api_calls + self.polisher.api_calls
+                try:
+                    record = future.result()
+                    surface_id = str(record["surface"]["surface_id"])
+                    if surface_id in surface_ids:
+                        raise SynthesisError(
+                            "Concurrent repolish produced a duplicate surface."
+                        )
+                    store.save_record(index, record, api_calls=total_api_calls)
+                    rewritten[index] = record
+                    surface_ids.add(surface_id)
+                    completed_count = len(store.completed_indices())
+                    store.record_progress(
+                        {
+                            "event": "repolish_slot_completed",
+                            "slot_index": index,
+                            "requested": count,
+                            "completed": completed_count,
+                            "pending": count - completed_count,
+                            "percent": round(completed_count * 100 / count, 2),
+                        }
+                    )
+                except Exception as error:
+                    store.quarantine(
+                        {
+                            "operation": "surface_repolish",
+                            "slot_index": index,
+                            "stage_error": f"{type(error).__name__}: {error}",
+                        },
+                        api_calls=total_api_calls,
+                    )
+                    store.record_progress(
+                        {
+                            "event": "repolish_slot_failed",
+                            "slot_index": index,
+                            "requested": count,
+                            "completed": len(store.completed_indices()),
+                            "error": f"{type(error).__name__}: {error}",
+                        }
+                    )
+                    failures.append((index, error))
+        if failures:
+            detail = " | ".join(
+                f"slot {index}: {type(error).__name__}: {error}"
+                for index, error in failures[-5:]
+            )
+            raise SynthesisError(
+                f"{len(failures)} repolish slot(s) failed after successful results were "
+                f"persisted: {detail}"
+            )
 
-        surface_ids = [row["surface"]["surface_id"] for row in rewritten.values()]
-        if len(surface_ids) != len(set(surface_ids)):
-            raise SynthesisError("Concurrent repolish produced duplicate surfaces.")
-        for index in sorted(rewritten):
-            store.save_record(index, rewritten[index], api_calls=self.polisher.api_calls)
-
-        return self._finalize(store, rewritten, api_calls=self.polisher.api_calls)
+        total_api_calls = starting_api_calls + self.polisher.api_calls
+        store.record_progress(
+            {
+                "event": "repolish_completed",
+                "requested": count,
+                "completed": count,
+                "pending": 0,
+                "percent": 100.0,
+            }
+        )
+        return self._finalize(store, rewritten, api_calls=total_api_calls)
 
     def _finalize(
         self,
@@ -221,6 +313,7 @@ class SurfaceRepolishPipeline:
             preference_audit=deepcopy(source.get("preference_audit")),
             polish_audit=list(polish_audit),
             candidate_attempt=int(source.get("candidate_attempt", 1)),
+            trajectory_policy=deepcopy(source.get("trajectory_policy")),
         )
 
 
@@ -238,6 +331,26 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise SynthesisError(f"Synthesis JSON must contain an object: {path}")
     return payload
+
+
+def _source_identity(
+    manifest: dict[str, Any], records: list[dict[str, Any]]
+) -> str:
+    material = {
+        "artifact_version": manifest.get("artifact_version"),
+        "generator_version": dict(manifest.get("config", {})).get("generator_version"),
+        "records": [
+            {
+                "slot_index": int(record["slot"]["index"]),
+                "task_id": str(record["task_spec"]["task_id"]),
+                "blueprint_id": str(record["blueprint"]["blueprint_id"]),
+                "surface_id": str(record["surface"]["surface_id"]),
+            }
+            for record in records
+        ],
+    }
+    payload = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _slot_from_dict(payload: dict[str, Any]) -> PilotSlot:

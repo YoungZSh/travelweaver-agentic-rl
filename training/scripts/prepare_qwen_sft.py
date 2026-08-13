@@ -329,6 +329,7 @@ def _distribution(values: list[int]) -> dict[str, int]:
 
     return {
         "min": ordered[0],
+        "p20": percentile(0.20),
         "p50": percentile(0.50),
         "p90": percentile(0.90),
         "p95": percentile(0.95),

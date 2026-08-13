@@ -5,17 +5,23 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import tempfile
 from collections import Counter
-from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..env import ChinaTravelBackend, ScenarioBackend, ScenarioSpec, TravelWeaverEnv
+from ..env import (
+    DEFAULT_MAX_VALID_STEPS,
+    ChinaTravelBackend,
+    ScenarioBackend,
+    ScenarioSpec,
+    TravelWeaverEnv,
+)
 from ..errors import SFTRebuildError
 from ..rollout.api_agent import (
     TRAJECTORY_VERSION,
@@ -24,11 +30,61 @@ from ..rollout.api_agent import (
     render_task_user_content,
 )
 from ..rollout.tool_response import MODEL_TOOL_RESPONSE_VERSION, serialize_model_tool_response
+from ..synthesis.trajectory_policy import (
+    MAX_CONSECUTIVE_TOOL_CALLS,
+    MAX_SYNTHESIS_VALID_STEPS,
+    TRAJECTORY_POLICY_VERSION,
+)
 from .ordering import order_tool_arguments, order_tool_schemas
 from .rebuild import _SingleTaskStore
 
-PROGRAMMATIC_POLICY_VERSION = "travelweaver-programmatic-policy-v12"
-SAMPLE_FAMILIES = ("efficient_success", "loop_recovery", "evidence_ready_submit")
+PROGRAMMATIC_POLICY_VERSION = "travelweaver-programmatic-policy-v28"
+PROGRAMMATIC_ARTIFACT_VERSION = "travelweaver-programmatic-artifacts-v2"
+SAMPLE_FAMILIES = ("efficient_success",)
+_EVIDENCE_PATH_KINDS = (
+    "nearby_discovery",
+    "candidate_comparison",
+    "opening_verification",
+)
+_EVIDENCE_PATH_EXTRA_ACTIONS = {
+    "nearby_discovery": 0,
+    "candidate_comparison": 3,
+    "opening_verification": 1,
+}
+_SPATIAL_PREFERENCE_KINDS = {
+    "less_innercity_time",
+    "less_walking",
+    "near_poi",
+    "shorter_meal_transfer",
+    "shorter_total_travel_time",
+}
+
+
+def minimum_tool_coverage_samples(count: int) -> int:
+    """Return the recommended ten-percent sample coverage for each public tool."""
+
+    if count <= 0:
+        raise ValueError("Tool coverage requires a positive batch size.")
+    return max(1, (count + 9) // 10)
+
+
+def _longest_tool_run(tools: list[str]) -> tuple[str | None, int]:
+    """Return the tool and length of the longest contiguous run."""
+
+    longest_tool: str | None = None
+    longest = 0
+    current_tool: str | None = None
+    current = 0
+    for tool in tools:
+        if tool == current_tool:
+            current += 1
+        else:
+            current_tool = tool
+            current = 1
+        if current > longest:
+            longest_tool = tool
+            longest = current
+    return longest_tool, longest
 
 
 @dataclass(frozen=True)
@@ -38,21 +94,224 @@ class ProgrammaticBuildConfig:
     audit_path: Path
     seed: int
     concurrency: int = min(32, os.cpu_count() or 1)
+    work_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if self.concurrency <= 0:
             raise ValueError("Programmatic trajectory concurrency must be positive.")
+
+    @property
+    def resolved_work_dir(self) -> Path:
+        return self.work_dir or self.output_path.with_name(
+            f"{self.output_path.stem}.work"
+        )
+
+
+_PROGRAMMATIC_WORKER_BACKEND: ChinaTravelBackend | None = None
+
+
+def _initialize_programmatic_worker() -> None:
+    global _PROGRAMMATIC_WORKER_BACKEND
+    _PROGRAMMATIC_WORKER_BACKEND = ChinaTravelBackend()
+
+
+def _worker_backend() -> ChinaTravelBackend:
+    if _PROGRAMMATIC_WORKER_BACKEND is None:
+        raise RuntimeError("Programmatic CPU worker was not initialized.")
+    return _PROGRAMMATIC_WORKER_BACKEND
+
+
+def _compute_capability_in_worker(
+    index: int,
+    record: dict[str, Any],
+    public_task: dict[str, Any],
+) -> tuple[int, dict[str, dict[str, Any]]]:
+    return index, _evidence_path_capabilities(record, public_task, _worker_backend())
+
+
+def _build_one_in_worker(
+    index: int,
+    record: dict[str, Any],
+    public_task: dict[str, Any],
+    oracle_task: dict[str, Any],
+    evidence_paths: tuple[dict[str, Any], ...],
+    seed: int,
+    source_question_batch: str,
+) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    return (
+        index,
+        *_build_one(
+            record,
+            public_task,
+            oracle_task,
+            _worker_backend(),
+            family="efficient_success",
+            evidence_paths=evidence_paths,
+            seed=seed,
+            source_question_batch=source_question_batch,
+        ),
+    )
+
+
+class _ProgrammaticArtifactStore:
+    """Main-process-only checkpoints for two-stage CPU trajectory synthesis."""
+
+    def __init__(
+        self,
+        config: ProgrammaticBuildConfig,
+        *,
+        source_identity: str,
+        total: int,
+    ) -> None:
+        self.config = config
+        self.work_dir = config.resolved_work_dir
+        self.capabilities_dir = self.work_dir / "capabilities"
+        self.records_dir = self.work_dir / "records"
+        self.manifest_path = self.work_dir / "manifest.json"
+        self.progress_path = self.work_dir / "progress.jsonl"
+        manifest_existed = self.manifest_path.exists()
+        if (
+            (config.output_path.exists() or config.audit_path.exists())
+            and not manifest_existed
+        ):
+            raise SFTRebuildError(
+                "Programmatic aggregate outputs exist without their recovery manifest."
+            )
+        self.capabilities_dir.mkdir(parents=True, exist_ok=True)
+        self.records_dir.mkdir(parents=True, exist_ok=True)
+        identity = {
+            "artifact_version": PROGRAMMATIC_ARTIFACT_VERSION,
+            "programmatic_policy_version": PROGRAMMATIC_POLICY_VERSION,
+            "task_dir": str(config.task_dir.resolve()),
+            "output_path": str(config.output_path.resolve()),
+            "audit_path": str(config.audit_path.resolve()),
+            "source_identity": source_identity,
+            "seed": config.seed,
+            "total": total,
+        }
+        if manifest_existed:
+            manifest = _read_json(self.manifest_path)
+            if manifest.get("config") != identity:
+                raise SFTRebuildError(
+                    "Programmatic work directory belongs to a different configuration."
+                )
+            self.manifest = manifest
+        else:
+            self.manifest = {
+                "artifact_version": PROGRAMMATIC_ARTIFACT_VERSION,
+                "status": "in_progress",
+                "config": identity,
+                "capabilities_completed": 0,
+                "trajectories_completed": 0,
+                "created_at": _now(),
+                "updated_at": _now(),
+            }
+            _atomic_json(self.manifest_path, self.manifest)
+        self._reconcile_manifest()
+
+    def capability_indices(self) -> set[int]:
+        return _numbered_json_indices(self.capabilities_dir)
+
+    def record_indices(self) -> set[int]:
+        return _numbered_json_indices(self.records_dir)
+
+    def capabilities(self) -> dict[int, dict[str, dict[str, Any]]]:
+        return {
+            int(path.stem): dict(_read_json(path)["capabilities"])
+            for path in _numbered_json_paths(self.capabilities_dir)
+        }
+
+    def records(self) -> list[dict[str, Any]]:
+        return [_read_json(path) for path in _numbered_json_paths(self.records_dir)]
+
+    def save_capability(
+        self,
+        index: int,
+        task_id: str,
+        capabilities: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        path = self.capabilities_dir / f"{index:06d}.json"
+        if path.exists():
+            raise SFTRebuildError(f"Capability slot {index} is already complete.")
+        _atomic_json(
+            path,
+            {
+                "index": index,
+                "task_id": task_id,
+                "capabilities": capabilities,
+            },
+        )
+        self._reconcile_manifest()
+
+    def save_record(
+        self,
+        index: int,
+        task_id: str,
+        trajectory: Mapping[str, Any],
+        audit: Mapping[str, Any],
+        evidence_paths: tuple[dict[str, Any], ...],
+    ) -> None:
+        path = self.records_dir / f"{index:06d}.json"
+        if path.exists():
+            raise SFTRebuildError(f"Programmatic trajectory slot {index} is already complete.")
+        _atomic_json(
+            path,
+            {
+                "index": index,
+                "task_id": task_id,
+                "evidence_paths": evidence_paths,
+                "trajectory": trajectory,
+                "audit": audit,
+            },
+        )
+        self._reconcile_manifest()
+
+    def progress(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        payload = {**event, "timestamp": _now()}
+        with self.progress_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        self.manifest["last_event"] = payload
+        self.manifest["updated_at"] = payload["timestamp"]
+        _atomic_json(self.manifest_path, self.manifest)
+        return payload
+
+    def finalize(self, report: Mapping[str, Any]) -> None:
+        self.manifest.update(
+            {
+                "status": "complete",
+                "report": report,
+                "updated_at": _now(),
+            }
+        )
+        _atomic_json(self.manifest_path, self.manifest)
+
+    def mark_failed(self, error: BaseException) -> None:
+        self.manifest.update(
+            {
+                "status": "failed",
+                "error": f"{type(error).__name__}: {error}",
+                "updated_at": _now(),
+            }
+        )
+        _atomic_json(self.manifest_path, self.manifest)
+
+    def _reconcile_manifest(self) -> None:
+        self.manifest["capabilities_completed"] = len(self.capability_indices())
+        self.manifest["trajectories_completed"] = len(self.record_indices())
+        self.manifest["updated_at"] = _now()
+        _atomic_json(self.manifest_path, self.manifest)
 
 
 def build_programmatic_trajectories(
     config: ProgrammaticBuildConfig,
     *,
     base_backend: Any | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Build one deterministic policy trajectory for every synthesis record."""
+    """Build resumable trajectories with process workers and per-task checkpoints."""
 
-    if config.output_path.exists() or config.audit_path.exists():
-        raise SFTRebuildError("Refusing to overwrite programmatic trajectory artifacts.")
     public = _read_jsonl_index(config.task_dir / "tasks.public.jsonl")
     oracle = _read_jsonl_index(config.task_dir / "tasks.oracle.jsonl")
     records = [
@@ -61,94 +320,836 @@ def build_programmatic_trajectories(
     ]
     if not records:
         raise SFTRebuildError("Synthesis directory has no records.")
-    families = _assign_families(records, config.seed)
-    backend = base_backend if base_backend is not None else ChinaTravelBackend()
+    source_identity = _programmatic_source_identity(records)
+    store = _ProgrammaticArtifactStore(
+        config,
+        source_identity=source_identity,
+        total=len(records),
+    )
 
-    def build(item: tuple[int, dict[str, Any]]) -> tuple[int, dict[str, Any], dict[str, Any]]:
-        index, record = item
-        task_id = str(record["task_spec"]["task_id"])
-        return (
-            index,
-            *_build_one(
-                record,
-                public[task_id],
-                oracle[task_id],
-                backend,
-                family=families[index],
-                seed=config.seed,
-                source_question_batch=config.task_dir.name,
-            ),
+    def emit(**event: Any) -> None:
+        payload = store.progress(event)
+        if progress is not None:
+            progress(payload)
+
+    completed_records = store.record_indices()
+    completed_capabilities = store.capability_indices()
+    needs_cpu_work = (
+        len(completed_capabilities) != len(records)
+        or len(completed_records) != len(records)
+    )
+    start_event = (
+        "programmatic_synthesis_resumed"
+        if completed_records
+        else "programmatic_synthesis_started"
+    )
+    emit(
+        event=start_event,
+        total=len(records),
+        capabilities_completed=len(completed_capabilities),
+        trajectories_completed=len(completed_records),
+        pending=len(records) - len(completed_records),
+        concurrency=config.concurrency,
+        executor=(
+            "process"
+            if needs_cpu_work and base_backend is None and config.concurrency > 1
+            else "inline"
+        ),
+    )
+    executor = (
+        ProcessPoolExecutor(
+            max_workers=min(config.concurrency, len(records)),
+            initializer=_initialize_programmatic_worker,
         )
+        if needs_cpu_work and base_backend is None and config.concurrency > 1
+        else None
+    )
+    inline_backend = base_backend
+    if needs_cpu_work and executor is None and inline_backend is None:
+        inline_backend = ChinaTravelBackend()
+    try:
+        missing_capabilities = [
+            index
+            for index in range(len(records))
+            if index not in store.capability_indices()
+        ]
+        capability_futures: dict[
+            Future[tuple[int, dict[str, dict[str, Any]]]], int
+        ] = {}
+        capability_failures: list[str] = []
+        if executor is not None:
+            for index in missing_capabilities:
+                task_id = str(records[index]["task_spec"]["task_id"])
+                capability_futures[
+                    executor.submit(
+                        _compute_capability_in_worker,
+                        index,
+                        records[index],
+                        public[task_id],
+                    )
+                ] = index
+            capability_items: Any = (
+                (capability_futures[future], future)
+                for future in as_completed(capability_futures)
+            )
+        else:
+            capability_items = ((index, None) for index in missing_capabilities)
+        for submitted_index, capability_future in capability_items:
+            try:
+                if capability_future is None:
+                    index = submitted_index
+                    assert inline_backend is not None
+                    capabilities = _evidence_path_capabilities(
+                        records[index],
+                        public[str(records[index]["task_spec"]["task_id"])],
+                        inline_backend,
+                    )
+                else:
+                    index, capabilities = capability_future.result()
+            except Exception as error:  # noqa: BLE001 - persist all other slots.
+                task_id = str(records[submitted_index]["task_spec"]["task_id"])
+                message = f"{type(error).__name__}: {error}"
+                capability_failures.append(f"slot {submitted_index}: {message}")
+                emit(
+                    event="capability_failed",
+                    slot_index=submitted_index,
+                    task_id=task_id,
+                    error=message,
+                    completed=len(store.capability_indices()),
+                    total=len(records),
+                )
+                continue
+            task_id = str(records[index]["task_spec"]["task_id"])
+            store.save_capability(index, task_id, capabilities)
+            emit(
+                event="capability_completed",
+                slot_index=index,
+                task_id=task_id,
+                completed=len(store.capability_indices()),
+                total=len(records),
+            )
+        if capability_failures:
+            raise SFTRebuildError(
+                "Programmatic capability phase failed: "
+                + " | ".join(capability_failures[:3])
+            )
 
-    with ThreadPoolExecutor(max_workers=config.concurrency) as executor:
-        built = list(executor.map(build, enumerate(records)))
-    built.sort(key=lambda item: item[0])
-    trajectories = [item[1] for item in built]
-    audits = [item[2] for item in built]
-    _atomic_jsonl(config.output_path, trajectories)
-    _atomic_jsonl(config.audit_path, audits)
+        capabilities = store.capabilities()
+        if len(capabilities) != len(records):
+            raise SFTRebuildError("Programmatic capability phase is incomplete.")
+        evidence_paths = _select_natural_evidence_paths(records, public, capabilities)
+        missing_records = [
+            index for index in range(len(records)) if index not in store.record_indices()
+        ]
+        build_futures: dict[
+            Future[tuple[int, dict[str, Any], dict[str, Any]]], int
+        ] = {}
+        build_failures: list[str] = []
+        if executor is not None:
+            for index in missing_records:
+                task_id = str(records[index]["task_spec"]["task_id"])
+                build_futures[
+                    executor.submit(
+                        _build_one_in_worker,
+                        index,
+                        records[index],
+                        public[task_id],
+                        oracle[task_id],
+                        evidence_paths.get(index, ()),
+                        config.seed,
+                        config.task_dir.name,
+                    )
+                ] = index
+            build_items: Any = (
+                (build_futures[future], future)
+                for future in as_completed(build_futures)
+            )
+        else:
+            build_items = ((index, None) for index in missing_records)
+        for submitted_index, build_future in build_items:
+            try:
+                if build_future is None:
+                    index = submitted_index
+                    assert inline_backend is not None
+                    trajectory, audit = _build_one(
+                        records[index],
+                        public[str(records[index]["task_spec"]["task_id"])],
+                        oracle[str(records[index]["task_spec"]["task_id"])],
+                        inline_backend,
+                        family="efficient_success",
+                        evidence_paths=evidence_paths.get(index, ()),
+                        seed=config.seed,
+                        source_question_batch=config.task_dir.name,
+                    )
+                else:
+                    index, trajectory, audit = build_future.result()
+            except Exception as error:  # noqa: BLE001 - persist all other slots.
+                task_id = str(records[submitted_index]["task_spec"]["task_id"])
+                message = f"{type(error).__name__}: {error}"
+                build_failures.append(f"slot {submitted_index}: {message}")
+                emit(
+                    event="trajectory_failed",
+                    slot_index=submitted_index,
+                    task_id=task_id,
+                    error=message,
+                    completed=len(store.record_indices()),
+                    total=len(records),
+                )
+                continue
+            task_id = str(records[index]["task_spec"]["task_id"])
+            store.save_record(
+                index,
+                task_id,
+                trajectory,
+                audit,
+                evidence_paths.get(index, ()),
+            )
+            emit(
+                event="trajectory_completed",
+                slot_index=index,
+                task_id=task_id,
+                completed=len(store.record_indices()),
+                total=len(records),
+                pending=len(records) - len(store.record_indices()),
+            )
+        if build_failures:
+            raise SFTRebuildError(
+                "Programmatic trajectory phase failed: "
+                + " | ".join(build_failures[:3])
+            )
+    except BaseException as error:
+        store.mark_failed(error)
+        emit(
+            event="programmatic_synthesis_failed",
+            error=f"{type(error).__name__}: {error}",
+            completed=len(store.record_indices()),
+            total=len(records),
+        )
+        raise
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    bundles = store.records()
+    if len(bundles) != len(records):
+        raise SFTRebuildError("Programmatic trajectory phase is incomplete.")
+    trajectories = [dict(bundle["trajectory"]) for bundle in bundles]
+    audits = [dict(bundle["audit"]) for bundle in bundles]
     family_counts = Counter(row["sample_family"] for row in audits)
+    evidence_path_counts = Counter(
+        str(path["kind"])
+        for row in audits
+        for path in row.get("evidence_paths", [])
+    )
+    evidence_selection_counts = Counter(
+        str(path["selection_reason"])
+        for row in audits
+        for path in row.get("evidence_paths", [])
+    )
     tool_counts = Counter(
         turn["tool"] for row in audits for turn in row.get("turns", [])
     )
-    return {
+    tool_sample_counts = _tool_sample_counts(trajectories)
+    public_tools = {
+        str(tool["function"]["name"])
+        for tool in trajectories[0]["tools"]
+    }
+    minimum_coverage = minimum_tool_coverage_samples(len(records))
+    undercovered = {
+        tool: tool_sample_counts[tool]
+        for tool in sorted(public_tools)
+        if tool_sample_counts[tool] < minimum_coverage
+    }
+    if undercovered:
+        emit(
+            event="tool_coverage_warning",
+            recommended_minimum_samples=minimum_coverage,
+            undercovered_tools=undercovered,
+        )
+    _atomic_jsonl(config.output_path, trajectories)
+    _atomic_jsonl(config.audit_path, audits)
+    report = {
         "programmatic_policy_version": PROGRAMMATIC_POLICY_VERSION,
+        "programmatic_artifact_version": PROGRAMMATIC_ARTIFACT_VERSION,
         "samples": len(trajectories),
         "families": dict(sorted(family_counts.items())),
+        "evidence_paths": dict(sorted(evidence_path_counts.items())),
+        "evidence_path_selection": dict(sorted(evidence_selection_counts.items())),
+        "minimum_tool_coverage_samples": minimum_coverage,
+        "tool_coverage_recommendation_met": not undercovered,
+        "tool_coverage_warnings": undercovered,
         "tool_calls": dict(sorted(tool_counts.items())),
+        "tool_sample_counts": dict(sorted(tool_sample_counts.items())),
         "concurrency": config.concurrency,
         "all_reward_one": all(row["replay_reward"] == 1.0 for row in audits),
         "all_hard_pass": all(row["all_hard_pass"] is True for row in audits),
+        "work_dir": str(config.resolved_work_dir.resolve()),
     }
+    store.finalize(report)
+    emit(
+        event="programmatic_synthesis_completed",
+        completed=len(records),
+        total=len(records),
+    )
+    return report
 
 
-def _assign_families(records: list[dict[str, Any]], seed: int) -> dict[int, str]:
-    loop_count = len(records) // 10
-    submit_count = len(records) // 10
-    by_type: dict[str, list[int]] = {}
+def _assign_families(
+    records: list[dict[str, Any]],
+    seed: int,
+    *,
+    coverage_plans: Mapping[int, Mapping[str, Any]] | None = None,
+) -> dict[int, str]:
+    """Compatibility helper: every released trajectory is a clean success family."""
+
+    del seed, coverage_plans
+    return {index: "efficient_success" for index in range(len(records))}
+
+
+def _select_natural_evidence_paths(
+    records: list[dict[str, Any]],
+    public: Mapping[str, Mapping[str, Any]],
+    capabilities: Mapping[int, Mapping[str, Mapping[str, Any]]],
+) -> dict[int, tuple[dict[str, Any], ...]]:
+    """Select evidence paths justified by task semantics, without a coverage quota."""
+
+    assignments: dict[int, tuple[dict[str, Any], ...]] = {}
     for index, record in enumerate(records):
-        by_type.setdefault(str(record["slot"]["task_type"]), []).append(index)
-    loop_quotas = _proportional_quotas(by_type, loop_count, seed, "loop")
-    submit_quotas = _proportional_quotas(by_type, submit_count, seed, "submit")
-    assignments = {index: "efficient_success" for index in range(len(records))}
-    for task_type, indices in sorted(by_type.items()):
-        ordered = sorted(
-            indices,
-            key=lambda index: hashlib.sha256(
-                (
-                    f"{seed}:family:{task_type}:"
-                    f"{records[index]['slot']['days']}:"
-                    f"{records[index]['slot']['scenario_profile']}:"
-                    f"{records[index]['task_spec']['task_id']}"
-                ).encode()
-            ).hexdigest(),
-        )
-        loop_end = loop_quotas[task_type]
-        submit_end = loop_end + submit_quotas[task_type]
-        for index in ordered[:loop_end]:
-            assignments[index] = "loop_recovery"
-        for index in ordered[loop_end:submit_end]:
-            assignments[index] = "evidence_ready_submit"
+        task_id = str(record["task_spec"]["task_id"])
+        selected: list[dict[str, Any]] = []
+        for kind in _natural_evidence_path_kinds(
+            record,
+            public[task_id],
+            capabilities[index],
+        ):
+            if not _evidence_paths_fit(record, public[task_id], selected, kind):
+                continue
+            selected.append(
+                {
+                    "kind": kind,
+                    "selection_reason": "natural_main_graph",
+                    **capabilities[index][kind],
+                }
+            )
+        if selected:
+            assignments[index] = tuple(
+                sorted(selected, key=lambda path: str(path["kind"]))
+            )
     return assignments
 
 
-def _proportional_quotas(
-    groups: Mapping[str, list[int]], total: int, seed: int, scope: str
-) -> dict[str, int]:
-    population = sum(len(indices) for indices in groups.values())
-    exact = {key: total * len(indices) / population for key, indices in groups.items()}
-    quotas = {key: int(value) for key, value in exact.items()}
-    remainder = total - sum(quotas.values())
-    order = sorted(
-        groups,
-        key=lambda key: (
-            -(exact[key] - quotas[key]),
-            hashlib.sha256(f"{seed}:{scope}:{key}".encode()).hexdigest(),
+def _natural_evidence_path_kinds(
+    record: Mapping[str, Any],
+    public: Mapping[str, Any],
+    capabilities: Mapping[str, Mapping[str, Any]],
+) -> tuple[str, ...]:
+    preferences = {
+        str(item.get("kind"))
+        for item in record.get("blueprint", {}).get("preferences", [])
+        if isinstance(item, Mapping)
+    }
+    selected: list[str] = []
+    opening = capabilities.get("opening_verification")
+    if opening is not None:
+        entity = record["witness"]["evidence_bundle"]["entities"][
+            str(opening["candidate_id"])
+        ]
+        if _entity_name(entity) in str(public["query"]):
+            selected.append("opening_verification")
+    if "nearby_discovery" in capabilities and (
+        preferences & _SPATIAL_PREFERENCE_KINDS or "附近" in str(public["query"])
+    ):
+        selected.append("nearby_discovery")
+    comparison = capabilities.get("candidate_comparison")
+    if comparison is not None:
+        target = record["witness"]["evidence_bundle"]["entities"][
+            str(comparison["candidate_id"])
+        ]
+        if _entity_type(target) in _comparison_semantic_entity_types(record):
+            selected.append("candidate_comparison")
+    return tuple(selected)
+
+
+def _comparison_semantic_entity_types(record: Mapping[str, Any]) -> set[str]:
+    """Return local entity types for which the task makes price comparison useful."""
+
+    preferences = {
+        str(item.get("kind"))
+        for item in record.get("blueprint", {}).get("preferences", [])
+        if isinstance(item, Mapping)
+    }
+    entity_types: set[str] = set()
+    if "lower_total_cost" in preferences:
+        entity_types.update({"attraction", "restaurant", "hotel"})
+    if "lower_lodging_share" in preferences:
+        entity_types.add("hotel")
+    constraints = record.get("task_spec", {}).get("constraints", [])
+    for constraint in constraints if isinstance(constraints, list) else []:
+        if not isinstance(constraint, Mapping):
+            continue
+        kind = str(constraint.get("kind"))
+        scope = str(constraint.get("scope"))
+        if kind == "total_budget" and scope == "trip":
+            entity_types.update({"attraction", "restaurant", "hotel"})
+    return entity_types
+
+
+def _hard_unit_price_limit(
+    record: Mapping[str, Any], entity_type: str
+) -> float | None:
+    """Return a directly comparable per-entity hard price ceiling, if present."""
+
+    expected_scope = {
+        "restaurant": "restaurant",
+        "hotel": "accommodation",
+    }.get(entity_type)
+    if expected_scope is None:
+        return None
+    constraints = record.get("task_spec", {}).get("constraints", [])
+    limits: list[float] = []
+    for constraint in constraints if isinstance(constraints, list) else []:
+        if not isinstance(constraint, Mapping):
+            continue
+        if (
+            constraint.get("kind") != "category_budget"
+            or constraint.get("scope") != expected_scope
+            or constraint.get("operator") != "lte"
+        ):
+            continue
+        value = constraint.get("value")
+        if not isinstance(value, Mapping):
+            continue
+        amount = _numeric_price(value.get("amount"))
+        if amount is not None:
+            limits.append(amount)
+    return min(limits) if limits else None
+
+
+def _passes_hard_unit_price_limit(
+    record: Mapping[str, Any], entity: Mapping[str, Any], entity_type: str
+) -> bool:
+    limit = _hard_unit_price_limit(record, entity_type)
+    price = _comparable_unit_price(record, entity, entity_type)
+    return limit is None or (price is not None and price <= limit)
+
+
+def _comparable_unit_price(
+    record: Mapping[str, Any], entity: Mapping[str, Any], entity_type: str
+) -> float | None:
+    """Normalize visible prices to the basis used by category-budget checks."""
+
+    price = _numeric_price(entity.get("price"))
+    if price is None or entity_type != "hotel":
+        return price
+    travelers = int(record.get("task_spec", {}).get("trip", {}).get("travelers", 0))
+    room_type = entity.get("room_type")
+    if travelers <= 0 or not isinstance(room_type, int) or room_type <= 0:
+        return None
+    constraints = record.get("task_spec", {}).get("constraints", [])
+    explicit_rooms = next(
+        (
+            int(value["count"])
+            for constraint in constraints if isinstance(constraints, list)
+            if isinstance(constraint, Mapping)
+            and constraint.get("kind") == "room_count"
+            and constraint.get("scope") == "accommodation"
+            and isinstance((value := constraint.get("value")), Mapping)
+            and isinstance(value.get("count"), int)
+            and int(value["count"]) > 0
         ),
+        None,
     )
-    for key in order[:remainder]:
-        quotas[key] += 1
-    return quotas
+    rooms = explicit_rooms or (travelers + room_type - 1) // room_type
+    return price * rooms / travelers
+
+
+def _opening_verification_capability(
+    local_ids: list[str],
+    entities: Mapping[str, Mapping[str, Any]],
+    candidates_by_id: Mapping[str, Mapping[str, Any]],
+    public_query: str,
+    backend: Any,
+) -> dict[str, Any] | None:
+    """Prefer a named scheduled place when selecting one useful opening check."""
+
+    candidates: list[dict[str, Any]] = []
+    for candidate_id in local_ids:
+        entity = entities[candidate_id]
+        entity_type = _entity_type(entity)
+        at_time = str(candidates_by_id[candidate_id]["start_time"])
+        if entity_type not in {"attraction", "restaurant"} or at_time == "24:00":
+            continue
+        try:
+            check = backend.check_place_open(candidate_id, at_time)
+        except Exception:
+            continue
+        if check.get("is_open") is True:
+            candidates.append({"candidate_id": candidate_id, "at_time": at_time})
+    if not candidates:
+        return None
+    return next(
+        (
+            item
+            for item in candidates
+            if _entity_name(entities[str(item["candidate_id"])]) in public_query
+        ),
+        candidates[0],
+    )
+
+
+def _catalog_requirement(
+    record: Mapping[str, Any],
+    entity: Mapping[str, Any],
+    entity_type: str,
+) -> str | None:
+    """Return the task-grounded facet that justifies a catalog lookup."""
+
+    constraints = record.get("task_spec", {}).get("constraints", [])
+    for constraint in constraints if isinstance(constraints, list) else []:
+        if not isinstance(constraint, Mapping):
+            continue
+        kind = str(constraint.get("kind"))
+        scope = str(constraint.get("scope"))
+        value = constraint.get("value")
+        if not isinstance(value, Mapping):
+            continue
+        if (
+            entity_type == "attraction"
+            and kind == "entity_category"
+            and scope == "attraction"
+        ):
+            actual = str(entity.get("category") or "")
+            if actual and actual in _constraint_string_values(value, "values"):
+                return actual
+        if (
+            entity_type == "restaurant"
+            and kind == "entity_category"
+            and scope == "restaurant"
+        ):
+            actual = str(entity.get("cuisine") or "")
+            if actual and actual in _constraint_string_values(value, "values"):
+                return actual
+        if entity_type != "hotel" or scope != "accommodation":
+            continue
+        if kind == "entity_attribute":
+            actual = str(entity.get("hotel_type") or "")
+            for required in _constraint_string_values(value, "values"):
+                if required and required in actual:
+                    return required
+        if kind == "room_type" and entity.get("room_type") == value.get("room_type"):
+            return f"每间{value['room_type']}个床位的房型"
+    return None
+
+
+def _constraint_string_values(value: Mapping[str, Any], key: str) -> set[str]:
+    any_of = value.get("any_of")
+    groups = any_of if isinstance(any_of, list) else [value.get(key, [])]
+    return {
+        str(item)
+        for group in groups
+        if isinstance(group, list)
+        for item in group
+        if str(item).strip()
+    }
+
+
+def _pagination_is_task_grounded(
+    *,
+    name_grounded: bool,
+    search_tool: str = "search_attractions",
+    planned_candidate_count: int = 1,
+    visible_planned_count: int = 0,
+    required_candidate_count: int = 0,
+    resolved_candidate_count: int = 0,
+) -> bool:
+    """Require a visible unresolved predicate before consuming a cursor."""
+
+    if name_grounded:
+        return True
+    if search_tool == "search_nearby":
+        return False
+    planned_gap = (
+        planned_candidate_count > 1
+        and 0 < visible_planned_count < planned_candidate_count
+    )
+    task_count_gap = (
+        required_candidate_count > 1
+        and 0 < resolved_candidate_count < required_candidate_count
+    )
+    return planned_gap or task_count_gap
+
+
+def _required_activity_count(record: Mapping[str, Any], entity_type: str) -> int:
+    """Return a public hard quantity requirement for one searchable entity type."""
+
+    if entity_type != "attraction":
+        return 0
+    constraints = record.get("task_spec", {}).get("constraints", [])
+    required = 0
+    for constraint in constraints if isinstance(constraints, list) else []:
+        if not isinstance(constraint, Mapping):
+            continue
+        if (
+            constraint.get("kind") != "activity_count"
+            or constraint.get("scope") != "attraction"
+            or constraint.get("operator") not in {"eq", "gte"}
+        ):
+            continue
+        value = constraint.get("value")
+        if (
+            isinstance(value, Mapping)
+            and value.get("activity_type") == "attraction"
+            and isinstance(value.get("count"), int)
+            and not isinstance(value.get("count"), bool)
+        ):
+            required = max(required, int(value["count"]))
+    return required
+
+
+def _evidence_paths_fit(
+    record: Mapping[str, Any],
+    public: Mapping[str, Any],
+    existing: list[dict[str, Any]],
+    kind: str,
+) -> bool:
+    return (
+        _teacher_action_upper_bound(record, public)
+        + sum(
+            _EVIDENCE_PATH_EXTRA_ACTIONS[str(path["kind"])]
+            for path in existing
+        )
+        + _EVIDENCE_PATH_EXTRA_ACTIONS[kind]
+        <= MAX_SYNTHESIS_VALID_STEPS
+    )
+
+
+def _tool_sample_counts(trajectories: list[dict[str, Any]]) -> Counter[str]:
+    return Counter(
+        tool
+        for trajectory in trajectories
+        for tool in {
+            str(step["action"]["tool"])
+            for step in trajectory.get("steps", [])
+        }
+    )
+
+
+def _evidence_path_capabilities(
+    record: Mapping[str, Any],
+    public: Mapping[str, Any],
+    base_backend: Any,
+) -> dict[str, dict[str, Any]]:
+    """Find witness-grounded parameters for optional public-tool demonstrations."""
+
+    scenario = ScenarioSpec.from_dict(record["scenario"])
+    backend = ScenarioBackend(base_backend, scenario)
+    activities = sorted(
+        record["witness"]["plan_snapshot"]["activities"],
+        key=lambda item: (item["day"], item["activity_index"]),
+    )
+    entities = record["witness"]["evidence_bundle"]["entities"]
+    candidate_order = list(dict.fromkeys(str(item["candidate_id"]) for item in activities))
+    planned_ids = set(candidate_order)
+    candidates_by_id = {
+        str(item["candidate_id"]): item for item in activities
+    }
+    local_ids = [
+        candidate_id
+        for candidate_id in candidate_order
+        if _entity_type(entities[candidate_id]) in {"attraction", "restaurant", "hotel"}
+    ]
+    capabilities: dict[str, dict[str, Any]] = {}
+
+    opening = _opening_verification_capability(
+        local_ids,
+        entities,
+        candidates_by_id,
+        str(public["query"]),
+        backend,
+    )
+    if opening is not None:
+        capabilities["opening_verification"] = opening
+
+    anchors: list[tuple[str, str]] = []
+    for candidate_id in candidate_order:
+        entity = entities[candidate_id]
+        entity_type = _entity_type(entity)
+        if (
+            entity_type in {"train", "airplane"}
+            and entity.get("origin_city") == public["start_city"]
+        ):
+            anchor_id = entity.get("destination_anchor_id")
+            if isinstance(anchor_id, str):
+                anchors.append((anchor_id, "route_anchor"))
+            continue
+        if entity_type not in {"attraction", "restaurant", "hotel"}:
+            continue
+        for anchor_id, anchor_type in anchors:
+            # If the anchor uses the same search family, its own broad discovery
+            # may expose the target before the nearby path becomes executable.
+            if anchor_type == entity_type:
+                continue
+            for radius in (2, 5, 10, 20, 50):
+                try:
+                    nearby = backend.search_nearby(
+                        place_id=anchor_id,
+                        category=entity_type,
+                        radius_km=radius,
+                        top_k=40,
+                    )
+                except Exception:
+                    continue
+                if any(
+                    str(item.get("place_id")) == candidate_id
+                    for item in nearby[:10]
+                ):
+                    capabilities["nearby_discovery"] = {
+                        "anchor_id": anchor_id,
+                        "candidate_id": candidate_id,
+                        "radius_km": radius,
+                    }
+                    break
+            if "nearby_discovery" in capabilities:
+                break
+        if "nearby_discovery" in capabilities:
+            break
+        anchors.append((candidate_id, entity_type))
+
+    public_query = str(public["query"])
+    comparison_entity_types = _comparison_semantic_entity_types(record)
+    for candidate_id in local_ids:
+        entity = entities[candidate_id]
+        entity_type = _entity_type(entity)
+        if entity_type not in comparison_entity_types:
+            continue
+        if _entity_name(entity) in public_query:
+            continue
+        target_price = _comparable_unit_price(record, entity, entity_type)
+        if target_price is None:
+            continue
+        action = _task_grounded_search_action(record, entity, entity_type)
+        try:
+            alternatives = getattr(backend, str(action["tool"]))(**action["arguments"])
+        except Exception:
+            continue
+        alternative_ids = [
+            str(item.get("place_id"))
+            for item in alternatives[:10]
+            if isinstance(item, Mapping)
+            and isinstance(item.get("place_id"), str)
+            and str(item["place_id"]) not in planned_ids
+            and _entity_type(item) == entity_type
+            and (_comparable_unit_price(record, item, entity_type) or -1) > target_price
+            and _passes_hard_unit_price_limit(record, item, entity_type)
+        ]
+        if alternative_ids:
+            capabilities["candidate_comparison"] = {
+                "candidate_id": candidate_id,
+                "alternative_id": alternative_ids[0],
+            }
+            break
+    return capabilities
+
+
+def _teacher_action_upper_bound(record: Mapping[str, Any], public: Mapping[str, Any]) -> int:
+    """Conservative clean-teacher length bound used before assigning coverage extras."""
+
+    activities = record["witness"]["plan_snapshot"]["activities"]
+    entities = record["witness"]["evidence_bundle"]["entities"]
+    candidate_order = list(dict.fromkeys(str(item["candidate_id"]) for item in activities))
+    catalog_types = {
+        _entity_type(entities[candidate_id])
+        for candidate_id in candidate_order
+        if _entity_type(entities[candidate_id]) in {"attraction", "restaurant", "hotel"}
+        and _entity_name(entities[candidate_id]) not in str(public["query"])
+    }
+    route_count = len(
+        {
+            str(item["route_from_previous_id"])
+            for item in activities
+            if item.get("route_from_previous_id") is not None
+        }
+    )
+    return 2 * len(candidate_order) + len(catalog_types) + route_count + 3 + 1
+
+
+def _entity_type(entity: Mapping[str, Any]) -> str:
+    return str(entity.get("entity_type") or entity.get("mode"))
+
+
+def _task_grounded_search_action(
+    record: Mapping[str, Any],
+    entity: Mapping[str, Any],
+    entity_type: str,
+) -> dict[str, Any]:
+    """Build a search using only filters stated by the task, never hidden witness facets."""
+
+    arguments: dict[str, Any] = {"city": entity["city"]}
+    preferences = record.get("blueprint", {}).get("preferences", [])
+    if any(
+        isinstance(preference, Mapping)
+        and preference.get("kind") == "lower_total_cost"
+        for preference in preferences if isinstance(preferences, list)
+    ):
+        arguments["sort_by"] = "price"
+    constraints = record.get("task_spec", {}).get("constraints", [])
+    for constraint in constraints if isinstance(constraints, list) else []:
+        if not isinstance(constraint, Mapping):
+            continue
+        kind = str(constraint.get("kind"))
+        scope = str(constraint.get("scope"))
+        value = constraint.get("value")
+        if not isinstance(value, Mapping):
+            continue
+        if (
+            entity_type == "attraction"
+            and kind == "entity_category"
+            and scope == "attraction"
+            and str(entity.get("category"))
+            in _constraint_string_values(value, "values")
+        ):
+            arguments["category"] = entity["category"]
+        elif (
+            entity_type == "restaurant"
+            and kind == "entity_category"
+            and scope == "restaurant"
+            and str(entity.get("cuisine"))
+            in _constraint_string_values(value, "values")
+        ):
+            arguments["cuisine"] = entity["cuisine"]
+        elif entity_type == "hotel" and scope == "accommodation":
+            if kind == "entity_attribute":
+                actual = str(entity.get("hotel_type") or "")
+                required = next(
+                    (
+                        str(item)
+                        for item in _constraint_string_values(value, "values")
+                        if str(item) and str(item) in actual
+                    ),
+                    None,
+                )
+                if required is not None:
+                    arguments["hotel_type"] = required
+            elif kind == "room_type" and entity.get("room_type") == value.get("room_type"):
+                arguments["room_type"] = int(value["room_type"])
+    return {
+        "tool": {
+            "attraction": "search_attractions",
+            "restaurant": "search_restaurants",
+            "hotel": "search_hotels",
+        }[entity_type],
+        "arguments": arguments,
+    }
+
+
+def _numeric_price(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _format_price(value: float) -> str:
+    return str(int(value)) if value.is_integer() else f"{value:.2f}".rstrip("0")
 
 
 def _build_one(
@@ -158,20 +1159,40 @@ def _build_one(
     base_backend: Any,
     *,
     family: str,
+    evidence_paths: tuple[Mapping[str, Any], ...] = (),
     seed: int,
     source_question_batch: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if family not in SAMPLE_FAMILIES:
         raise ValueError(f"Unknown sample family: {family}")
+    path_by_kind = {str(path.get("kind")): dict(path) for path in evidence_paths}
+    if len(path_by_kind) != len(evidence_paths) or not set(path_by_kind) <= set(
+        _EVIDENCE_PATH_KINDS
+    ):
+        raise SFTRebuildError(
+            f"Programmatic evidence paths are invalid for {public.get('uid')}: "
+            f"{evidence_paths!r}."
+        )
+    policy = record.get("trajectory_policy")
+    if not isinstance(policy, Mapping):
+        raise SFTRebuildError(
+            "Programmatic short-trajectory teacher requires a trajectory_policy artifact."
+        )
+    if (
+        policy.get("policy_version") != TRAJECTORY_POLICY_VERSION
+        or policy.get("max_valid_steps") != DEFAULT_MAX_VALID_STEPS
+        or policy.get("max_consecutive_tool_calls") != MAX_CONSECUTIVE_TOOL_CALLS
+    ):
+        raise SFTRebuildError(
+            "Programmatic teacher requires the current 50-step/three-consecutive policy."
+        )
     task_id = str(public["uid"])
     scenario = ScenarioSpec.from_dict(record["scenario"])
+    runtime_backend = ScenarioBackend(base_backend, scenario)
     env = TravelWeaverEnv(
-        ScenarioBackend(base_backend, scenario),
+        runtime_backend,
         _SingleTaskStore(public, oracle),  # type: ignore[arg-type]
-        # Programmatic teachers may need more than the interactive default of
-        # 50 steps to collect evidence for a multi-day plan, but must stay
-        # within the already-versioned ReAct/SFT 100-step context contract.
-        max_valid_steps=100,
+        max_valid_steps=DEFAULT_MAX_VALID_STEPS,
     )
     reset = env.reset(task_id=task_id, seed=0)
     tools = order_tool_schemas(env.tool_schemas())
@@ -184,8 +1205,6 @@ def _build_one(
     masks: list[bool] = []
     mask_reasons: list[str] = []
     rationale_specs: list[dict[str, Any]] = []
-    loop_injected = False
-    pending_recovery = False
     witness = record["witness"]
     plan = deepcopy(witness["plan"])
     evidence = witness["evidence_bundle"]
@@ -195,32 +1214,75 @@ def _build_one(
         key=lambda item: (item["day"], item["activity_index"]),
     )
     candidate_order = list(dict.fromkeys(str(item["candidate_id"]) for item in activities))
-    activity_by_candidate = {
-        str(item["candidate_id"]): item for item in activities
+    nearby_path = path_by_kind.get("nearby_discovery")
+    if nearby_path is not None:
+        nearby_target = str(nearby_path["candidate_id"])
+        nearby_anchor = str(nearby_path["anchor_id"])
+        candidate_order.remove(nearby_target)
+        if nearby_anchor in candidate_order:
+            # Make the selected nearby path the first discovery path for this
+            # target. Otherwise an earlier broad search for the same entity type
+            # could expose it before the anchor is available.
+            candidate_order.remove(nearby_anchor)
+            outbound_position = next(
+                (
+                    index
+                    for index, candidate_id in enumerate(candidate_order)
+                    if _entity_type(entities[candidate_id]) in {"train", "airplane"}
+                    and entities[candidate_id].get("origin_city") == public["start_city"]
+                ),
+                -1,
+            )
+            candidate_order.insert(outbound_position + 1, nearby_anchor)
+            candidate_order.insert(outbound_position + 2, nearby_target)
+            nearby_anchor = ""
+        anchor_position = next(
+            (
+                index
+                for index, candidate_id in enumerate(candidate_order)
+                if candidate_id == nearby_anchor
+                or str(entities[candidate_id].get("destination_anchor_id"))
+                == nearby_anchor
+            ),
+            None,
+        )
+        if nearby_anchor and anchor_position is None:
+            raise SFTRebuildError(
+                f"Nearby evidence path has no candidate-visible anchor for {public['uid']}: "
+                f"{nearby_anchor}"
+            )
+        if nearby_anchor:
+            assert anchor_position is not None
+            candidate_order.insert(anchor_position + 1, nearby_target)
+    candidate_ids = set(candidate_order)
+    route_anchor_by_candidate = {
+        str(item["candidate_id"]): str(
+            evidence["routes"][str(item["route_from_previous_id"])]["origin_place_id"]
+        )
+        for item in activities
+        if item.get("route_from_previous_id") is not None
+        and str(item["route_from_previous_id"]) in evidence["routes"]
     }
-    loop_candidates = [
-        candidate_id
-        for candidate_id in candidate_order
-        if entities[candidate_id].get("entity_type") in {"attraction", "restaurant", "hotel"}
-    ]
-    loop_target = (
-        loop_candidates[
-            int(hashlib.sha256(f"{seed}:{task_id}:loop".encode()).hexdigest(), 16)
-            % len(loop_candidates)
-        ]
-        if family == "loop_recovery" and loop_candidates
-        else None
-    )
-    loop_count = 1 + (
-        int(hashlib.sha256(f"{seed}:{task_id}:loop-count".encode()).hexdigest(), 16) % 3
+    itinerary_anchor_ids = {
+        str(route[key])
+        for route in evidence["routes"].values()
+        for key in ("origin_place_id", "destination_place_id")
+    }
+    route_order = list(
+        dict.fromkeys(
+            str(item["route_from_previous_id"])
+            for item in activities
+            if item.get("route_from_previous_id") is not None
+        )
     )
     catalogued_types: set[str] = set()
     visible_entities: dict[str, dict[str, Any]] = {}
-    last_visible_place_id: str | None = None
-    removed_alternative = False
-    food_search_used = False
-    nearby_search_used = False
     active_candidates: dict[str, str] = {}
+    executed_routes: set[str] = set()
+    executed_actions: set[str] = set()
+    search_sessions: dict[str, tuple[Any, int]] = {}
+    next_page_calls = 0
+    completed_paths: set[str] = set()
 
     def candidate_context() -> tuple[int, tuple[str, ...]]:
         """Summarize evidence that has already been made visible by candidate actions."""
@@ -253,6 +1315,13 @@ def _build_one(
             )
         ordered_arguments = order_tool_arguments(action["tool"], action["arguments"], tools)
         output_action = {"tool": action["tool"], "arguments": ordered_arguments}
+        action_fingerprint = _action_fingerprint(output_action)
+        if action_fingerprint in executed_actions:
+            raise SFTRebuildError(
+                f"Programmatic policy repeated an identical action for {task_id}: "
+                f"{output_action}"
+            )
+        executed_actions.add(action_fingerprint)
         call_id = f"call_programmatic_{len(steps):04d}"
         tool_call = {
             "id": call_id,
@@ -327,12 +1396,13 @@ def _build_one(
             )
         return result
 
+    def _action_fingerprint(action: Mapping[str, Any]) -> str:
+        return json.dumps(action, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
     def base_supervision() -> tuple[bool, str]:
-        if family == "evidence_ready_submit":
-            return False, "teacher_forced_evidence_prefix"
         return True, "supervised_correct_action"
 
-    def execute_catalog(tool: str, city: str, label: str) -> None:
+    def execute_catalog(tool: str, city: str, label: str, required_facet: str) -> None:
         supervised, reason = base_supervision()
         candidate_count, candidate_purposes = candidate_context()
         execute(
@@ -346,48 +1416,35 @@ def _build_one(
                 city=city,
                 label=label,
                 tool=tool,
+                required_facet=required_facet,
                 candidate_count=candidate_count,
                 candidate_purposes=candidate_purposes,
             ),
             rationale_kind="discover_catalog_facets",
-            protected_literals=(city, label),
+            protected_literals=(city, label, required_facet),
         )
 
-    def maybe_catalog(entity: Mapping[str, Any], entity_type: str) -> None:
+    def maybe_catalog(entity: Mapping[str, Any], entity_type: str) -> bool:
         if entity_type in catalogued_types:
-            return
+            return True
+        required_facet = _catalog_requirement(record, entity, entity_type)
+        if required_facet is None:
+            return False
         catalogued_types.add(entity_type)
         city = str(entity["city"])
         if entity_type == "attraction":
-            execute_catalog("list_attraction_categories", city, "景点类别")
+            execute_catalog(
+                "list_attraction_categories", city, "景点类别", required_facet
+            )
         elif entity_type == "restaurant":
-            execute_catalog("list_restaurant_cuisines", city, "餐厅菜系")
+            execute_catalog(
+                "list_restaurant_cuisines", city, "餐厅菜系", required_facet
+            )
         elif entity_type == "hotel":
-            execute_catalog("list_hotel_features", city, "酒店特色和房型")
-
-    def broad_search(entity: Mapping[str, Any], entity_type: str) -> dict[str, Any]:
-        arguments: dict[str, Any] = {"city": entity["city"]}
-        if entity_type == "attraction" and entity.get("category"):
-            arguments["category"] = entity["category"]
-        elif entity_type == "restaurant" and entity.get("cuisine"):
-            arguments["cuisine"] = entity["cuisine"]
-        elif entity_type == "hotel" and entity.get("hotel_type"):
-            arguments["hotel_type"] = entity["hotel_type"]
-            if entity.get("room_type") is not None:
-                arguments["room_type"] = int(entity["room_type"])
-        return {
-            "tool": {
-                "attraction": "search_attractions",
-                "restaurant": "search_restaurants",
-                "hotel": "search_hotels",
-            }[entity_type],
-            "arguments": arguments,
-        }
-
-    def preview(action: Mapping[str, Any]) -> list[dict[str, Any]]:
-        method = getattr(env.backend, str(action["tool"]))
-        raw = method(**dict(action["arguments"]))
-        return [dict(item) for item in raw] if isinstance(raw, list) else []
+            execute_catalog(
+                "list_hotel_features", city, "酒店特色和房型", required_facet
+            )
+        return True
 
     def search_strategy(
         candidate_id: str,
@@ -418,6 +1475,36 @@ def _build_one(
                 False,
             )
 
+        nearby_path = path_by_kind.get("nearby_discovery")
+        if nearby_path is not None and candidate_id == nearby_path.get("candidate_id"):
+            anchor_id = str(nearby_path["anchor_id"])
+            if anchor_id not in visible_entities:
+                raise SFTRebuildError(
+                    f"Nearby evidence-path anchor is not visible for {task_id}: {anchor_id}"
+                )
+            anchor_name = _entity_name(visible_entities[anchor_id])
+            noun = {"attraction": "景点", "restaurant": "餐厅", "hotel": "酒店"}[
+                entity_type
+            ]
+            radius = nearby_path["radius_km"]
+            return (
+                {
+                    "tool": "search_nearby",
+                    "arguments": {
+                        "place_id": anchor_id,
+                        "category": entity_type,
+                        "radius_km": radius,
+                        "top_k": 40,
+                    },
+                },
+                (
+                    f"已确定{anchor_name}的位置，下一段需要安排附近{noun}；"
+                    f"先在{radius}公里内查看可衔接的候选。"
+                ),
+                (anchor_name, noun, str(radius)),
+                False,
+            )
+
         entity_name = _entity_name(entity)
         if entity_name in str(public["query"]):
             action = {
@@ -441,67 +1528,71 @@ def _build_one(
                 True,
             )
 
-        maybe_catalog(entity, entity_type)
-        broad = broad_search(entity, entity_type)
-        facet_key = {
-            "attraction": "category",
-            "restaurant": "cuisine",
-            "hotel": "hotel_type",
-        }[entity_type]
-        facet = str(broad["arguments"].get(facet_key) or "当前条件")
+        catalog_seen = maybe_catalog(entity, entity_type)
+        broad = _task_grounded_search_action(record, entity, entity_type)
+        facet_key = {"attraction": "category", "restaurant": "cuisine"}.get(entity_type)
+        if entity_type == "hotel":
+            facet = str(broad["arguments"].get("hotel_type") or "")
+            if not facet and broad["arguments"].get("room_type") is not None:
+                facet = f"每间{broad['arguments']['room_type']}个床位的房型"
+        else:
+            facet = str(broad["arguments"].get(facet_key) or "")
+        hard_price_limit = _hard_unit_price_limit(record, entity_type)
         noun = {"attraction": "景点", "restaurant": "餐厅", "hotel": "酒店"}[
             entity_type
         ]
         return (
             broad,
-            _facet_search_rationale(
-                seed,
-                task_id,
-                position=len(steps),
-                city=str(entity["city"]),
-                facet=facet,
-                noun=noun,
-                entity_type=entity_type,
+            (
+                _averaged_budget_search_rationale(
+                    city=str(entity["city"]),
+                    noun=noun,
+                    max_price=hard_price_limit,
+                    facet=facet,
+                )
+                if entity_type in {"restaurant", "hotel"}
+                and hard_price_limit is not None
+                else _facet_search_rationale(
+                    seed,
+                    task_id,
+                    position=len(steps),
+                    city=str(entity["city"]),
+                    facet=facet,
+                    noun=noun,
+                    entity_type=entity_type,
+                )
+                if catalog_seen and facet
+                else _cost_search_rationale(
+                    city=str(entity["city"]),
+                    noun=noun,
+                )
+                if broad["arguments"].get("sort_by") == "price"
+                else _unfiltered_search_rationale(
+                    seed,
+                    task_id,
+                    position=len(steps),
+                    city=str(entity["city"]),
+                    noun=noun,
+                    entity_type=entity_type,
+                )
             ),
-            (str(entity["city"]), facet, noun),
+            tuple(
+                item
+                for item in (
+                    str(entity["city"]),
+                    facet,
+                    noun,
+                    (
+                        _format_price(hard_price_limit)
+                        if entity_type in {"restaurant", "hotel"}
+                        and hard_price_limit is not None
+                        else ""
+                    ),
+                )
+                if item
+            ),
             False,
         )
-
-    def grouped_broad_search_candidates(
-        candidate_id: str,
-        entity_type: str,
-        action: Mapping[str, Any],
-    ) -> set[str]:
-        """Return future plan candidates exposed by this already-grounded search.
-
-        A facet catalog is a public source of a broad local search condition.  Once
-        that condition has been selected, paging through it again for every later
-        itinerary item is both unnatural and needlessly expensive.  The teacher
-        therefore keeps collecting the *same visible result stream* until all
-        later plan slots with the identical public search condition have appeared.
-        No name, ID, food, price, or other hidden witness value is sent to a tool.
-        """
-
-        if entity_type not in {"attraction", "restaurant", "hotel"}:
-            return {candidate_id}
-        if "query" in action["arguments"]:
-            return {candidate_id}
-        grouped: set[str] = set()
-        expected = {
-            "tool": str(action["tool"]),
-            "arguments": dict(action["arguments"]),
-        }
-        for other_id in candidate_order:
-            if other_id in visible_entities:
-                continue
-            other = entities[other_id]
-            other_type = str(other.get("entity_type") or other.get("mode"))
-            if other_type != entity_type or _entity_name(other) in str(public["query"]):
-                continue
-            other_action = broad_search(other, entity_type)
-            if other_action == expected:
-                grouped.add(other_id)
-        return grouped or {candidate_id}
 
     def public_search_scope(action: Mapping[str, Any], entity_type: str) -> str:
         """Describe a query using only parameters available in the current turn."""
@@ -515,180 +1606,164 @@ def _build_one(
         city = str(arguments.get("city", "当地"))
         if isinstance(arguments.get("query"), str):
             return str(arguments["query"])
-        facet_key = {
-            "attraction": "category",
-            "restaurant": "cuisine",
-            "hotel": "hotel_type",
-        }.get(entity_type)
-        facet = str(arguments.get(facet_key, "")) if facet_key is not None else ""
+        facet_key = {"attraction": "category", "restaurant": "cuisine"}.get(entity_type)
+        if entity_type == "hotel":
+            facet = str(arguments.get("hotel_type") or "")
+            if not facet and arguments.get("room_type") is not None:
+                facet = f"每间{arguments['room_type']}个床位的房型"
+        else:
+            facet = str(arguments.get(facet_key, "")) if facet_key is not None else ""
         noun = {"attraction": "景点", "restaurant": "餐厅", "hotel": "酒店"}.get(
             entity_type, "候选"
         )
-        return f"{city}的{facet}{noun}" if facet else f"{city}的{noun}"
+        price = _numeric_price(arguments.get("max_price"))
+        price_text = f"价格不超过{_format_price(price)}元的" if price is not None else ""
+        scope = (
+            f"{city}的{price_text}{facet}{noun}"
+            if facet
+            else f"{city}的{price_text}{noun}"
+        )
+        return f"按价格排序的{scope}" if arguments.get("sort_by") == "price" else scope
 
-    def try_nearby_discovery(
+    def route_grounded_nearby_search(
+        candidate_id: str,
+        entity_type: str,
+    ) -> tuple[dict[str, Any], str, tuple[str, ...]] | None:
+        """Use an established itinerary anchor only when the target is on page one."""
+
+        if entity_type not in {"attraction", "restaurant", "hotel"}:
+            return None
+        route_anchor_id = route_anchor_by_candidate.get(candidate_id)
+        established_ids = [
+            entity_id
+            for entity_id in visible_entities
+            if entity_id in itinerary_anchor_ids
+            and (entity_id not in candidate_ids or entity_id in active_candidates)
+        ]
+        anchor_ids = list(
+            dict.fromkeys(
+                item
+                for item in (route_anchor_id, *established_ids)
+                if item is not None and item in visible_entities
+            )
+        )
+        for anchor_id in anchor_ids:
+            for radius in (2, 5, 10, 20, 50):
+                nearby = runtime_backend.search_nearby(
+                    place_id=anchor_id,
+                    category=entity_type,
+                    radius_km=radius,
+                    top_k=40,
+                )
+                if any(
+                    str(item.get("place_id")) == candidate_id
+                    for item in nearby[:10]
+                ):
+                    break
+            else:
+                continue
+            anchor_name = _entity_name(visible_entities[anchor_id])
+            noun = {
+                "attraction": "景点",
+                "restaurant": "餐厅",
+                "hotel": "酒店",
+            }[entity_type]
+            return (
+                {
+                    "tool": "search_nearby",
+                    "arguments": {
+                        "place_id": anchor_id,
+                        "category": entity_type,
+                        "radius_km": radius,
+                        "top_k": 40,
+                    },
+                },
+                (
+                    f"上一轮城市级{noun}结果没有提供候选相对{anchor_name}的距离，"
+                    f"无法据此判断下一段是否便于衔接；当前已确定{anchor_name}，"
+                    f"因此改查其{radius}公里内的{noun}。"
+                ),
+                (anchor_name, str(radius), noun),
+            )
+        return None
+
+    def complete_evidence_paths_before_save(
         candidate_id: str,
         entity: Mapping[str, Any],
         entity_type: str,
-    ) -> bool:
-        nonlocal nearby_search_used
-        if (
-            nearby_search_used
-            or last_visible_place_id is None
-            or candidate_id == loop_target
-            or _bucket(seed, task_id, "nearby-discovery", 4) != 0
-            or entity_type
-            != ("attraction", "restaurant", "hotel")[
-                _bucket(seed, task_id, "nearby-category", 3)
-            ]
-        ):
-            return False
-        radii = (2, 5, 10, 20, 50)
-        eligible_radius: int | None = None
-        for radius in radii:
-            action = {
-                "tool": "search_nearby",
-                "arguments": {
-                    "place_id": last_visible_place_id,
-                    "category": entity_type,
-                    "radius_km": radius,
-                    "top_k": 40,
-                },
-            }
-            target_index = _item_index(preview(action), candidate_id)
-            if 0 <= target_index < 40:
-                eligible_radius = radius
-                break
-        if eligible_radius is None:
-            return False
-        nearby_search_used = True
-        supervised, reason = base_supervision()
-        anchor_name = _entity_name(visible_entities[last_visible_place_id])
-        noun = {"attraction": "景点", "restaurant": "餐厅", "hotel": "酒店"}[
-            entity_type
-        ]
-        for radius in radii:
-            action = {
-                "tool": "search_nearby",
-                "arguments": {
-                    "place_id": last_visible_place_id,
-                    "category": entity_type,
-                    "radius_km": radius,
-                    "top_k": 40,
-                },
-            }
-            result = execute(
-                action,
-                supervised=supervised,
-                reason=reason,
-                content=f"从{anchor_name}周边{radius}公里开始查看{noun}候选，优先寻找衔接方便的选择。",
-                rationale_kind="search_nearby_evidence",
-                protected_literals=(anchor_name, noun, str(radius)),
-            )
-            nearby_page_number = 1
-            while candidate_id not in result.observation.visible_entity_ids:
-                cursor = (result.observation.tool_result or {}).get("page", {}).get(
-                    "next_cursor"
-                )
-                if not isinstance(cursor, str):
-                    break
-                result = execute(
-                    {"tool": "next_page", "arguments": {"cursor": cursor}},
-                    supervised=supervised,
-                    reason=reason,
-                    content=_nearby_page_rationale(
-                        seed,
-                        task_id,
-                        position=len(steps),
-                        anchor_name=anchor_name,
-                        radius_km=radius,
-                        noun=noun,
-                        page_number=nearby_page_number + 1,
-                    ),
-                    rationale_kind="continue_nearby_search",
-                    protected_literals=(anchor_name, str(radius), noun),
-                )
-                nearby_page_number += 1
-            if candidate_id in result.observation.visible_entity_ids:
-                return True
-            if radius == eligible_radius:
-                break
-        return False
+    ) -> None:
+        """Execute validation gates that causally precede candidate adoption."""
 
-    def maybe_food_comparison(candidate_id: str, entity_type: str) -> None:
-        nonlocal food_search_used
-        if (
-            food_search_used
-            or entity_type != "restaurant"
-            or _bucket(seed, task_id, "food-comparison", 5) != 0
-        ):
-            return
-        visible = visible_entities.get(candidate_id, {})
-        food = _first_facet(str(visible.get("recommended_food") or ""))
-        if not food:
+        del entity, entity_type
+        path = path_by_kind.get("opening_verification")
+        if path is None or candidate_id != path.get("candidate_id"):
             return
         supervised, reason = base_supervision()
-        execute(
+        entity_name = _entity_name(visible_entities[candidate_id])
+        at_time = str(path["at_time"])
+        opening = execute(
             {
-                "tool": "search_restaurants_by_food",
-                "arguments": {"city": visible["city"], "food": food},
+                "tool": "check_place_open",
+                "arguments": {"place_id": candidate_id, "at_time": at_time},
             },
             supervised=supervised,
             reason=reason,
-            content=(
-                f"刚才的候选信息显示{_entity_name(visible)}推荐{food}，"
-                "再按这道菜查看同城餐厅，比较是否有更合适的选择。"
-            ),
-            rationale_kind="compare_restaurants_by_visible_food",
-            protected_literals=(_entity_name(visible), food, str(visible["city"])),
+            content=f"计划在{at_time}安排{entity_name}，现在核对该时刻是否开放。",
+            rationale_kind="verify_scheduled_place_open",
+            protected_literals=(entity_name, at_time),
         )
-        food_search_used = True
+        if (opening.observation.tool_result or {}).get("is_open") is not True:
+            raise SFTRebuildError(
+                f"Opening evidence path unexpectedly failed for {task_id}: {candidate_id}"
+            )
+        completed_paths.add("opening_verification")
 
-    def maybe_compare_and_remove(
+    def complete_evidence_paths_after_save(
         candidate_id: str,
-        entity_type: str,
         purpose: str,
     ) -> None:
-        nonlocal removed_alternative
-        if (
-            removed_alternative
-            or entity_type not in {"attraction", "restaurant", "hotel"}
-            or _bucket(seed, task_id, "candidate-comparison", 6) != 0
-        ):
+        """Execute a preselected, price-grounded candidate-comparison subgraph."""
+
+        path = path_by_kind.get("candidate_comparison")
+        if path is None or candidate_id != path.get("candidate_id"):
             return
-        target = visible_entities.get(candidate_id, {})
-        target_price = _numeric_price(target.get("price"))
-        if target_price is None:
-            return
-        alternatives = [
-            item
-            for item_id, item in visible_entities.items()
-            if item_id not in candidate_order
-            and item.get("entity_type") == entity_type
-            and (price := _numeric_price(item.get("price"))) is not None
-            and price > target_price
-        ]
-        if not alternatives:
-            return
-        alternative = max(
-            alternatives,
-            key=lambda item: (
-                _numeric_price(item.get("price")) or 0,
-                str(item.get("place_id", "")),
-            ),
-        )
-        alternative_id = str(alternative["place_id"])
-        alternative_name = _entity_name(alternative)
-        alternative_price = _numeric_price(alternative["price"])
-        assert alternative_price is not None
+        target = visible_entities[candidate_id]
+        alternative_id = str(path["alternative_id"])
+        if alternative_id not in visible_entities:
+            entity_type = _entity_type(target)
+            noun = {"attraction": "景点", "restaurant": "餐厅", "hotel": "酒店"}[entity_type]
+            execute(
+                _task_grounded_search_action(record, target, entity_type),
+                supervised=True,
+                reason="supervised_correct_action",
+                content=(
+                    f"{_entity_name(target)}的类别和价格已可见，"
+                    f"再按同一条件查看{target['city']}的{noun}，收集可比较的备选。"
+                ),
+                rationale_kind="search_price_comparable_alternatives",
+                protected_literals=(_entity_name(target), str(target["city"]), noun),
+            )
+        if alternative_id not in visible_entities:
+            raise SFTRebuildError(
+                f"Comparison-path alternative was not visible for {task_id}: {alternative_id}"
+            )
+        alternative = visible_entities[alternative_id]
+        entity_type = _entity_type(target)
+        target_price = _comparable_unit_price(record, target, entity_type)
+        alternative_price = _comparable_unit_price(record, alternative, entity_type)
+        if target_price is None or alternative_price is None or alternative_price <= target_price:
+            raise SFTRebuildError(
+                f"Comparison path has no valid price ordering for {task_id}."
+            )
         supervised, reason = base_supervision()
-        execute(
-            {"tool": "inspect_place", "arguments": {"place_id": alternative_id}},
-            supervised=supervised,
-            reason=reason,
-            content=f"先查看备选{alternative_name}的完整信息，再决定是否纳入行程。",
-            rationale_kind="inspect_alternative",
-            protected_literals=(alternative_name,),
+        target_name = _entity_name(target)
+        alternative_name = _entity_name(alternative)
+        price_limit = _hard_unit_price_limit(record, entity_type)
+        price_basis = "人均可比价格" if entity_type in {"restaurant", "hotel"} else "价格"
+        hard_limit_text = (
+            f"，且都未超过题面{_format_price(price_limit)}元的硬上限"
+            if price_limit is not None
+            else ""
         )
         execute(
             {
@@ -698,54 +1773,106 @@ def _build_one(
             supervised=supervised,
             reason=reason,
             content=(
-                f"{alternative_name}和已保存的{_entity_name(target)}属于同类候选，"
-                f"先作为{_purpose_label(purpose)}备选保存，随后统一比较。"
+                f"{alternative_name}{price_basis}为{_format_price(alternative_price)}元，"
+                f"{target_name}为{_format_price(target_price)}元；两者属于同类候选"
+                f"{hard_limit_text}，因此先保存前者作为{_purpose_label(purpose)}备选，"
+                "再比较成本。"
             ),
-            rationale_kind="save_alternative",
-            protected_literals=(
-                alternative_name,
-                _entity_name(target),
-                _purpose_label(purpose),
-            ),
+            rationale_kind="save_price_alternative",
+            protected_literals=(alternative_name, target_name, _purpose_label(purpose)),
         )
-        candidate_count, candidate_purposes = candidate_context()
         execute(
             {"tool": "list_candidates", "arguments": {}},
             supervised=supervised,
             reason=reason,
-            content=_candidate_review_rationale(
-                seed,
-                task_id,
-                position=len(steps),
-                review_kind="compare",
-                candidate_count=candidate_count,
-                candidate_purposes=candidate_purposes,
-                comparison_names=(alternative_name, _entity_name(target)),
+            content=(
+                f"现在已保存的{target_name}和{alternative_name}都满足当前硬条件；"
+                "调用候选清单核对二者的价格和用途，再决定保留哪一个。"
             ),
-            rationale_kind="review_candidates",
-            protected_literals=(alternative_name, _entity_name(target)),
+            rationale_kind="review_price_alternatives",
+            protected_literals=(target_name, alternative_name),
         )
         execute(
             {"tool": "remove_candidate", "arguments": {"candidate_id": alternative_id}},
             supervised=supervised,
             reason=reason,
             content=(
-                f"清单显示{alternative_name}价格为{_format_price(alternative_price)}元，"
-                f"高于{_entity_name(target)}的{_format_price(target_price)}元；"
-                "在同类候选中没有成本优势，因此将它移除。"
+                f"{alternative_name}{price_basis}为{_format_price(alternative_price)}元，"
+                f"高于{target_name}的{_format_price(target_price)}元，"
+                "同类比较中没有成本优势，因此移除该备选。"
             ),
-            rationale_kind="remove_alternative",
+            rationale_kind="remove_more_expensive_alternative",
             protected_literals=(
                 alternative_name,
-                _entity_name(target),
+                target_name,
                 _format_price(alternative_price),
                 _format_price(target_price),
             ),
         )
-        removed_alternative = True
+        completed_paths.add("candidate_comparison")
+
+    def execute_route(route_id: str) -> None:
+        """Query one necessary route as soon as both of its endpoints are usable."""
+
+        route = evidence["routes"][route_id]
+        first_segment = route["segments"][0]
+        supervised, reason = base_supervision()
+        execute(
+            {
+                "tool": "get_route",
+                "arguments": {
+                    "origin_place_id": route["origin_place_id"],
+                    "destination_place_id": route["destination_place_id"],
+                    "mode": route["mode"],
+                    "start_time": first_segment["start_time"],
+                },
+            },
+            supervised=supervised,
+            reason=reason,
+            content=_route_rationale(
+                seed,
+                task_id,
+                position=len(steps),
+                origin_name=str(first_segment["start"]),
+                destination_name=str(route["segments"][-1]["end"]),
+                mode=str(route["mode"]),
+                start_time=str(first_segment["start_time"]),
+            ),
+            rationale_kind="complete_route_evidence",
+            protected_literals=(
+                str(first_segment["start"]),
+                str(route["segments"][-1]["end"]),
+                _route_mode_label(str(route["mode"])),
+                str(first_segment["start_time"]),
+            ),
+        )
+        executed_routes.add(route_id)
+
+    def route_endpoint_ready(entity_id: str) -> bool:
+        if entity_id not in visible_entities:
+            return False
+        return entity_id not in candidate_ids or entity_id in active_candidates
+
+    def drain_ready_routes() -> int:
+        """Interleave newly available routes instead of batching them before submit."""
+
+        executed = 0
+        for route_id in route_order:
+            if route_id in executed_routes:
+                continue
+            route = evidence["routes"][route_id]
+            if not route_endpoint_ready(str(route["origin_place_id"])):
+                continue
+            if not route_endpoint_ready(str(route["destination_place_id"])):
+                continue
+            execute_route(route_id)
+            executed += 1
+        return executed
 
     def reveal_and_save(candidate_id: str) -> None:
-        nonlocal loop_injected, pending_recovery, last_visible_place_id
+        """Collect only the evidence needed by the fixed, already-feasible plan."""
+
+        nonlocal next_page_calls
         entity = entities[candidate_id]
         entity_type = str(entity.get("entity_type") or entity.get("mode"))
         if entity_type in {"train", "airplane"}:
@@ -760,240 +1887,200 @@ def _build_one(
             ]
         supervised, reason = base_supervision()
         entity_name = _entity_name(entity)
-        discovered_nearby = False
-        if entity_type in {"attraction", "restaurant", "hotel"} and (
-            candidate_id not in visible_entities
-        ):
-            discovered_nearby = try_nearby_discovery(
-                candidate_id, entity, entity_type
-            )
-        if not discovered_nearby and (
-            candidate_id not in visible_entities
-            or (candidate_id == loop_target and not loop_injected)
-        ):
+        if candidate_id not in visible_entities:
             search, search_content, search_literals, name_grounded = search_strategy(
                 candidate_id, entity, entity_type
             )
-            result = execute(
-                search,
-                supervised=supervised,
-                reason=reason,
-                content=search_content,
-                rationale_kind="search_evidence",
-                protected_literals=search_literals,
-            )
-            grouped_ids = grouped_broad_search_candidates(candidate_id, entity_type, search)
-            page_scope = public_search_scope(search, entity_type)
-            if candidate_id == loop_target and not loop_injected:
-                loop_label = (
-                    entity_name
-                    if candidate_id in result.observation.visible_entity_ids or name_grounded
-                    else _entity_type_label(entity_type)
+            search_key = _action_fingerprint(search)
+            session = search_sessions.get(search_key)
+            if session is None:
+                result = execute(
+                    search,
+                    supervised=supervised,
+                    reason=reason,
+                    content=search_content,
+                    rationale_kind="search_evidence",
+                    protected_literals=search_literals,
                 )
-                for attempt in range(loop_count):
-                    execute(
-                        search,
-                        supervised=False,
-                        reason="injected_loop",
-                        content=_loop_action_rationale(
-                            seed,
-                            task_id,
-                            position=len(steps),
-                            entity_name=loop_label,
-                            city=str(search["arguments"].get("city", "")),
-                            attempt=attempt,
-                        ),
-                        rationale_kind="injected_loop",
-                        protected_literals=(loop_label,),
+                page_number = 1
+                search_sessions[search_key] = (result, page_number)
+            else:
+                result, page_number = session
+            if candidate_id not in visible_entities and not name_grounded:
+                nearby_fallback = route_grounded_nearby_search(candidate_id, entity_type)
+                if nearby_fallback is not None:
+                    search, search_content, search_literals = nearby_fallback
+                    search_key = _action_fingerprint(search)
+                    session = search_sessions.get(search_key)
+                    if session is None:
+                        result = execute(
+                            search,
+                            supervised=supervised,
+                            reason=reason,
+                            content=search_content,
+                            rationale_kind="search_route_continuity",
+                            protected_literals=search_literals,
+                        )
+                        page_number = 1
+                        search_sessions[search_key] = (result, page_number)
+                    else:
+                        result, page_number = session
+            page_scope = public_search_scope(search, entity_type)
+            consecutive_pages = 0
+            planned_search_ids = (
+                {
+                    planned_id
+                    for planned_id in candidate_order
+                    if _entity_type(entities[planned_id]) == entity_type
+                    and _entity_name(entities[planned_id]) not in str(public["query"])
+                    and _action_fingerprint(
+                        _task_grounded_search_action(
+                            record,
+                            entities[planned_id],
+                            entity_type,
+                        )
                     )
-                loop_injected = True
-                pending_recovery = True
-            page_number = 1
-            while not grouped_ids.issubset(visible_entities):
+                    == search_key
+                }
+                if entity_type in {"attraction", "restaurant", "hotel"}
+                else set()
+            )
+            visible_planned_count = len(planned_search_ids & visible_entities.keys())
+            required_candidate_count = _required_activity_count(record, entity_type)
+            resolved_candidate_count = sum(
+                _entity_type(visible_entities[entity_id]) == entity_type
+                for entity_id in active_candidates
+                if entity_id in visible_entities
+            )
+            if candidate_id not in visible_entities and not _pagination_is_task_grounded(
+                name_grounded=name_grounded,
+                search_tool=str(search["tool"]),
+                planned_candidate_count=len(planned_search_ids),
+                visible_planned_count=visible_planned_count,
+                required_candidate_count=required_candidate_count,
+                resolved_candidate_count=resolved_candidate_count,
+            ):
+                raise SFTRebuildError(
+                    "Task would require pagination without a visible unresolved predicate: "
+                    f"{task_id}:{candidate_id}. Regenerate the witness within the global "
+                    "first-page/grounded-nearby policy or add a real multi-entity gap."
+                )
+            while candidate_id not in visible_entities:
+                if consecutive_pages >= MAX_CONSECUTIVE_TOOL_CALLS:
+                    raise SFTRebuildError(
+                        f"Task {task_id} needs more than three consecutive next_page calls."
+                    )
                 page = (result.observation.tool_result or {}).get("page", {})
                 cursor = page.get("next_cursor")
                 if not isinstance(cursor, str):
                     raise SFTRebuildError(
-                        "Search did not expose all witness entities sharing a public "
-                        f"condition: {sorted(grouped_ids - set(visible_entities))}."
+                        "Search did not expose witness entity "
+                        f"{candidate_id} within the available cursor chain."
                     )
                 page_label = entity_name if name_grounded else _entity_type_label(entity_type)
-                content = _page_rationale(
-                    seed,
-                    task_id,
-                    position=len(steps),
-                    entity_name=page_label,
-                    public_scope=page_scope,
-                    page_number=page_number + 1,
-                    pages_checked=page_number,
-                    collecting_group=len(grouped_ids) > 1,
-                )
-                rationale_kind = "continue_search"
-                is_recovery = False
-                if pending_recovery:
-                    content = _loop_reflection(
-                        seed,
-                        task_id,
-                        entity_name=page_label,
-                        target_visible=False,
-                        search_scope=page_scope,
-                    )
-                    pending_recovery = False
-                    rationale_kind = "loop_recovery"
-                    is_recovery = True
                 result = execute(
                     {"tool": "next_page", "arguments": {"cursor": cursor}},
                     supervised=supervised,
-                    reason=("supervised_loop_exit_reflection" if is_recovery else reason),
-                    content=content,
-                    rationale_kind=rationale_kind,
+                    reason=reason,
+                    content=_page_rationale(
+                        seed,
+                        task_id,
+                        position=len(steps),
+                        entity_name=page_label,
+                        public_scope=page_scope,
+                        page_number=page_number + 1,
+                        pages_checked=page_number,
+                        planned_candidate_count=len(planned_search_ids),
+                        visible_planned_count=visible_planned_count,
+                        required_candidate_count=required_candidate_count,
+                        resolved_candidate_count=resolved_candidate_count,
+                    ),
+                    rationale_kind="continue_search",
                     protected_literals=(page_label,),
                 )
+                next_page_calls += 1
                 page_number += 1
+                consecutive_pages += 1
+                visible_planned_count = len(planned_search_ids & visible_entities.keys())
+                search_sessions[search_key] = (result, page_number)
+            if (
+                search["tool"] == "search_nearby"
+                and nearby_path is not None
+                and candidate_id == str(nearby_path.get("candidate_id"))
+            ):
+                completed_paths.add("nearby_discovery")
         if candidate_id not in visible_entities:
             raise SFTRebuildError(f"Witness entity was not made visible: {candidate_id}.")
-        maybe_food_comparison(candidate_id, entity_type)
-        save_content = _save_rationale(
-            seed,
-            task_id,
-            position=len(steps),
-            entity_name=entity_name,
-            purpose=purpose,
-        )
-        save_kind = "save_evidence"
-        action_reason = reason
-        if pending_recovery:
-            save_content = _loop_reflection(
+        complete_evidence_paths_before_save(candidate_id, entity, entity_type)
+        execute(
+            {
+                "tool": "save_candidate",
+                "arguments": {"entity_id": candidate_id, "purpose": purpose},
+            },
+            supervised=supervised,
+            reason=reason,
+            content=_save_rationale(
                 seed,
                 task_id,
-                entity_name=str(entity.get("name", "目标候选")),
-                target_visible=True,
-            )
-            pending_recovery = False
-            action_reason = "supervised_loop_exit_reflection"
-            save_kind = "loop_recovery"
-
-        def save() -> None:
-            execute(
-                {
-                    "tool": "save_candidate",
-                    "arguments": {"entity_id": candidate_id, "purpose": purpose},
-                },
-                supervised=supervised,
-                reason=action_reason,
-                content=save_content,
-                rationale_kind=save_kind,
-                protected_literals=(
-                    (entity_name, _purpose_label(purpose))
-                    if save_kind == "save_evidence"
-                    else (entity_name,)
+                position=len(steps),
+                entity_name=entity_name,
+                purpose=purpose,
+                decision_facts=_save_decision_facts(
+                    record,
+                    public,
+                    visible_entities[candidate_id],
+                    entity_type,
+                    purpose,
                 ),
-            )
-
-        if save_kind == "loop_recovery":
-            save()
-        if entity_type in {"attraction", "restaurant", "hotel"} and (
-            _bucket(seed, task_id, f"inspect:{candidate_id}", 3) == 0
-            or candidate_id == loop_target
-        ):
-            execute(
-                {"tool": "inspect_place", "arguments": {"place_id": candidate_id}},
-                supervised=supervised,
-                reason=reason,
-                content=f"在确定安排前查看{entity_name}的完整快照，核对价格、类型和时间信息。",
-                rationale_kind="inspect_evidence",
-                protected_literals=(entity_name,),
-            )
-        activity = activity_by_candidate[candidate_id]
-        if entity_type in {"attraction", "restaurant"} and _bucket(
-            seed, task_id, f"open:{candidate_id}", 2
-        ) == 0:
-            at_time = str(activity["start_time"])
-            open_preview = env.backend.check_place_open(candidate_id, at_time)
-            if open_preview.get("is_open") is True:
-                execute(
-                    {
-                        "tool": "check_place_open",
-                        "arguments": {"place_id": candidate_id, "at_time": at_time},
-                    },
-                    supervised=supervised,
-                    reason=reason,
-                    content=f"计划在{at_time}使用{entity_name}，现在单独核对该时刻是否开放。",
-                    rationale_kind="check_open_evidence",
-                    protected_literals=(entity_name, at_time),
-                )
-        if save_kind != "loop_recovery":
-            save()
-        if entity_type in {"attraction", "restaurant", "hotel"}:
-            last_visible_place_id = candidate_id
-            maybe_compare_and_remove(candidate_id, entity_type, purpose)
-        elif purpose == "outbound_transport":
-            transport = visible_entities.get(candidate_id, {})
-            anchor_id = transport.get("destination_anchor_id")
-            if isinstance(anchor_id, str) and anchor_id in visible_entities:
-                last_visible_place_id = anchor_id
+            ),
+            rationale_kind="save_evidence",
+            protected_literals=(entity_name, _purpose_label(purpose)),
+        )
+        complete_evidence_paths_after_save(candidate_id, purpose)
 
     try:
-        for candidate_id in candidate_order:
+        remaining_candidates = list(candidate_order)
+        while remaining_candidates:
+            # A broad search can expose several later witness entities at once. If the
+            # previous turn already saved one, prefer a candidate that still needs a
+            # real search so the policy does not learn a long save_candidate burst.
+            if steps and steps[-1]["action"]["tool"] == "save_candidate":
+                candidate_id = next(
+                    (
+                        item
+                        for item in remaining_candidates
+                        if item not in visible_entities
+                    ),
+                    remaining_candidates[0],
+                )
+            else:
+                candidate_id = remaining_candidates[0]
             reveal_and_save(candidate_id)
-        if family != "loop_recovery" and _bucket(
-            seed, task_id, "candidate-review", 4
-        ) == 0:
-            supervised, reason = base_supervision()
-            candidate_count, candidate_purposes = candidate_context()
-            execute(
-                {"tool": "list_candidates", "arguments": {}},
-                supervised=supervised,
-                reason=reason,
-                content=_candidate_review_rationale(
-                    seed,
-                    task_id,
-                    position=len(steps),
-                    review_kind="coverage",
-                    candidate_count=candidate_count,
-                    candidate_purposes=candidate_purposes,
-                ),
-                rationale_kind="review_candidates",
+            remaining_candidates.remove(candidate_id)
+            # Query every route that became ready because of this candidate. This
+            # dependency-driven placement avoids a large pre-submit route batch;
+            # the number executed here follows the itinerary graph rather than a
+            # universal per-tool run cap.
+            drain_ready_routes()
+        if completed_paths != set(path_by_kind):
+            raise SFTRebuildError(
+                f"Programmatic evidence paths were not completed for {task_id}: "
+                f"expected={sorted(path_by_kind)}, actual={sorted(completed_paths)}."
             )
-        route_order = list(
-            dict.fromkeys(
-                str(item["route_from_previous_id"])
-                for item in activities
-                if item.get("route_from_previous_id") is not None
+        drain_ready_routes()
+        if executed_routes != set(route_order):
+            missing = sorted(set(route_order) - executed_routes)
+            raise SFTRebuildError(
+                f"Programmatic route dependencies were never satisfied for {task_id}: {missing}"
             )
+        longest_tool, longest_run = _longest_tool_run(
+            [str(step["action"]["tool"]) for step in steps]
         )
-        for route_id in route_order:
-            route = evidence["routes"][route_id]
-            first_segment = route["segments"][0]
-            supervised, reason = base_supervision()
-            execute(
-                {
-                    "tool": "get_route",
-                    "arguments": {
-                        "origin_place_id": route["origin_place_id"],
-                        "destination_place_id": route["destination_place_id"],
-                        "mode": route["mode"],
-                        "start_time": first_segment["start_time"],
-                    },
-                },
-                supervised=supervised,
-                reason=reason,
-                content=_route_rationale(
-                    seed,
-                    task_id,
-                    position=len(steps),
-                    origin_name=str(first_segment["start"]),
-                    destination_name=str(route["segments"][-1]["end"]),
-                    mode=str(route["mode"]),
-                    start_time=str(first_segment["start_time"]),
-                ),
-                rationale_kind="complete_route_evidence",
-                protected_literals=(
-                    str(first_segment["start"]),
-                    str(route["segments"][-1]["end"]),
-                    _route_mode_label(str(route["mode"])),
-                    str(first_segment["start_time"]),
-                ),
+        if longest_run > MAX_CONSECUTIVE_TOOL_CALLS:
+            raise SFTRebuildError(
+                f"Programmatic policy produced {longest_run} consecutive "
+                f"{longest_tool} calls for {task_id}; maximum is "
+                f"{MAX_CONSECUTIVE_TOOL_CALLS}."
             )
         kinds = {str(item["activity_type"]) for item in activities}
         evidence_names = ["往返交通", "景点", "完整路线"]
@@ -1015,15 +2102,12 @@ def _build_one(
             route_count=len(route_order),
             evidence_landmarks=submit_landmarks,
         )
-        submit_reason = "supervised_correct_action"
-        if family == "evidence_ready_submit":
-            submit_reason = "supervised_evidence_ready_reflection"
         terminal = execute(
             {"tool": "submit_plan", "arguments": {"plan": plan}},
             supervised=True,
-            reason=submit_reason,
+            reason="supervised_correct_action",
             content=submit_content,
-            rationale_kind="evidence_ready_submit",
+            rationale_kind="submit_evidence_ready_plan",
             protected_literals=tuple(evidence_names) + submit_literal_names,
         )
         detail = terminal.info.get("reward_detail")
@@ -1035,6 +2119,10 @@ def _build_one(
             or detail.get("all_hard_pass") is not True
         ):
             raise SFTRebuildError(f"Programmatic replay failed for {task_id}: {detail}")
+        if len(steps) > DEFAULT_MAX_VALID_STEPS:
+            raise SFTRebuildError(
+                f"Programmatic trajectory exceeded {DEFAULT_MAX_VALID_STEPS} actions for {task_id}."
+            )
     finally:
         env.close()
 
@@ -1062,7 +2150,13 @@ def _build_one(
         "assistant_loss_mask": masks,
         "mask_reasons": mask_reasons,
         "sample_family": family,
-        "batch_metadata": {"thinking": "disabled", "source": PROGRAMMATIC_POLICY_VERSION},
+        "batch_metadata": {
+            "thinking": "disabled",
+            "source": PROGRAMMATIC_POLICY_VERSION,
+            "max_valid_steps": DEFAULT_MAX_VALID_STEPS,
+            "max_consecutive_tool_calls": MAX_CONSECUTIVE_TOOL_CALLS,
+            "evidence_paths": [dict(path) for path in evidence_paths],
+        },
     }
     audit = {
         "programmatic_policy_version": PROGRAMMATIC_POLICY_VERSION,
@@ -1083,20 +2177,10 @@ def _build_one(
             }
             for index, step in enumerate(steps)
         ],
-        "loop_tool": next(
-            (
-                step["action"]["tool"]
-                for step, reason in zip(steps, mask_reasons, strict=True)
-                if reason == "injected_loop"
-            ),
-            None,
-        ),
-        "loop_positions": [
-            index for index, reason in enumerate(mask_reasons) if reason == "injected_loop"
-        ],
-        "loop_count": sum(reason == "injected_loop" for reason in mask_reasons),
-        "alternative_removed": removed_alternative,
-        "first_evidence_ready_position": len(steps) - 1,
+        "max_valid_steps": DEFAULT_MAX_VALID_STEPS,
+        "max_consecutive_tool_calls": MAX_CONSECUTIVE_TOOL_CALLS,
+        "next_page_calls": next_page_calls,
+        "evidence_paths": [dict(path) for path in evidence_paths],
         "action_count": len(steps),
         "termination_reason": "plan_submitted",
         "replay_reward": 1.0,
@@ -1104,36 +2188,6 @@ def _build_one(
         "reward_groups": dict(detail.get("group_results", {})),
     }
     return row, audit
-
-
-def _loop_reflection(
-    seed: int,
-    task_id: str,
-    *,
-    entity_name: str,
-    target_visible: bool,
-    search_scope: str = "",
-) -> str:
-    if target_visible:
-        templates = (
-            "{name}已经出现在候选中，重复搜索不会补充新证据；现在保存它并继续完善行程。",
-            "刚才的查询结果足以确认{name}，无需再查同一页；下一步保存候选。",
-            "已经定位到{name}，继续重复检索没有必要；接下来保存该候选并处理剩余证据。",
-        )
-    else:
-        templates = (
-            "重复当前搜索没有带来新结果；接下来查看后续候选，继续定位{name}。",
-            "同一页结果已经核对过，无需再次查询；现在继续翻页查找{name}。",
-            "再次搜索仍是相同候选列表；下一步应查看后续结果并找到{name}。",
-            "{scope}这一页已反复返回相同结果，继续查同一页无法补充{name}；现在翻到下一页。",
-            "针对{scope}的重复查询没有新增候选，接下来沿用原条件查看后续页面并定位{name}。",
-            "已确认{scope}当前结果不会变化；停止重复查询，继续读取下一页寻找{name}。",
-        )
-    index = int(hashlib.sha256(f"{seed}:{task_id}:loop-text".encode()).hexdigest(), 16)
-    return templates[index % len(templates)].format(
-        name=entity_name,
-        scope=search_scope or "本轮搜索",
-    )
 
 
 def _entity_name(entity: Mapping[str, Any]) -> str:
@@ -1147,58 +2201,9 @@ def _choice(
     return templates[int(digest, 16) % len(templates)]
 
 
-def _cycle_choice(
-    templates: tuple[str, ...],
-    seed: int,
-    task_id: str,
-    *,
-    scope: str,
-    ordinal: int,
-) -> str:
-    """Choose a stable template stream without repeating a form in one search.
-
-    ``ordinal`` is local to a single paged/looped operation.  Hashing only its
-    initial offset preserves diversity across tasks while cycling subsequent
-    pages or loop attempts through different natural phrasings.
-    """
-
-    digest = hashlib.sha256(f"{seed}:{task_id}:{scope}".encode()).hexdigest()
-    return templates[(int(digest, 16) + ordinal) % len(templates)]
-
-
-def _bucket(seed: int, task_id: str, scope: str, modulo: int) -> int:
-    digest = hashlib.sha256(f"{seed}:{task_id}:{scope}".encode()).hexdigest()
-    return int(digest, 16) % modulo
-
-
-def _item_index(items: list[dict[str, Any]], candidate_id: str) -> int:
-    for index, item in enumerate(items):
-        entity_id = item.get("place_id") or item.get("transport_id")
-        if entity_id == candidate_id:
-            return index
-    return -1
-
-
-def _first_facet(value: str) -> str:
-    return next(
-        (part.strip() for part in re.split(r"[,，、|/]", value) if part.strip()),
-        value.strip(),
-    )
-
-
 def _coarse_departure(value: str) -> str:
     hour = int(value[:2])
     return f"{hour - hour % 3:02d}:00"
-
-
-def _numeric_price(value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value)
-
-
-def _format_price(value: float) -> str:
-    return str(int(value)) if value.is_integer() else f"{value:.2f}".rstrip("0")
 
 
 def _entity_type_label(entity_type: str) -> str:
@@ -1267,13 +2272,20 @@ def _save_rationale(
     position: int,
     entity_name: str,
     purpose: str,
+    decision_facts: tuple[str, ...] = (),
 ) -> str:
     purpose_text = _purpose_label(purpose)
+    if decision_facts:
+        return (
+            f"{'；'.join(decision_facts)}。这些当前可见事实说明它可用于"
+            f"{purpose_text}，后续计划会引用该实体，因此现在保存候选。"
+        )
     template = _choice(
         (
-            "查询结果中已经找到{name}，它会作为最终计划的{purpose}，现在保存这项候选证据。",
-            "{name}符合当前要补充的{purpose}，后续提交会引用它，因此先保存候选。",
-            "已经取得{name}的有效信息，接下来把它保存为本次行程的{purpose}证据。",
+            "当前搜索结果已经明确返回{name}，计划仍缺少{purpose}证据；"
+            "后续提交会引用该实体，因此现在保存候选。",
+            "{name}已经出现在当前工具结果中，可作为计划需要的{purpose}；"
+            "为保证最终提交只引用已保存证据，现在保存它。",
         ),
         seed,
         task_id,
@@ -1281,6 +2293,79 @@ def _save_rationale(
         "save",
     )
     return template.format(name=entity_name, purpose=purpose_text)
+
+
+def _save_decision_facts(
+    record: Mapping[str, Any],
+    public: Mapping[str, Any],
+    entity: Mapping[str, Any],
+    entity_type: str,
+    purpose: str,
+) -> tuple[str, ...]:
+    """Explain adoption using facts visible before ``save_candidate``."""
+
+    name = _entity_name(entity)
+    facts: list[str] = []
+    if entity_type in {"train", "airplane"}:
+        mode = "火车" if entity_type == "train" else "飞机"
+        origin = str(entity.get("origin_city") or "起点")
+        destination = str(entity.get("destination_city") or "终点")
+        departure = entity.get("departure_time")
+        arrival = entity.get("arrival_time")
+        timing = (
+            f"，班次时刻为{departure}–{arrival}"
+            if isinstance(departure, str) and isinstance(arrival, str)
+            else ""
+        )
+        facts.append(f"搜索结果显示{name}是{origin}到{destination}的{mode}{timing}")
+        facts.append(f"当前计划需要一项{_purpose_label(purpose)}")
+        return tuple(facts)
+
+    query = str(public.get("query") or public.get("public_query") or "")
+    if name and name in query:
+        facts.append(f"题面指定的{name}已经由当前搜索结果确认")
+    required_facet = _catalog_requirement(record, entity, entity_type)
+    if required_facet is not None:
+        facts.append(f"结果字段显示{name}符合题面的{required_facet}要求")
+    price = _numeric_price(entity.get("price"))
+    price_limit = _hard_unit_price_limit(record, entity_type)
+    comparable_price = _comparable_unit_price(record, entity, entity_type)
+    if (
+        entity_type == "hotel"
+        and price is not None
+        and comparable_price is not None
+        and price_limit is not None
+    ):
+        travelers = int(record["task_spec"]["trip"]["travelers"])
+        rooms = round(comparable_price * travelers / price)
+        facts.append(
+            f"{name}每间每晚{_format_price(price)}元，按{rooms}间房和{travelers}人计算，"
+            f"人均每晚{_format_price(comparable_price)}元，未超过题面"
+            f"{_format_price(price_limit)}元的硬上限"
+        )
+    elif price is not None and comparable_price is not None and price_limit is not None:
+        if comparable_price <= price_limit:
+            facts.append(
+                f"{name}本餐人均{_format_price(comparable_price)}元，不高于题面"
+                f"{_format_price(price_limit)}元的每餐平均上限，有助于控制最终平均值"
+            )
+        else:
+            facts.append(
+                f"{name}本餐人均{_format_price(comparable_price)}元，高于题面"
+                f"{_format_price(price_limit)}元的平均目标；该约束按全部已安排餐次"
+                "取平均，后续必须搭配更低价餐并在提交前复核"
+            )
+    elif price is not None:
+        facts.append(
+            f"当前结果显示{name}价格为{_format_price(price)}元，题面没有更具体的"
+            f"{_purpose_label(purpose)}硬筛选条件"
+        )
+    if not facts:
+        facts.append(
+            f"当前搜索结果已经返回{name}的可引用ID，题面没有更具体的"
+            f"{_purpose_label(purpose)}筛选条件"
+        )
+    return tuple(dict.fromkeys(facts))
 
 
 def _purpose_label(purpose: str) -> str:
@@ -1341,39 +2426,43 @@ def _page_rationale(
     public_scope: str,
     page_number: int,
     pages_checked: int,
-    collecting_group: bool,
+    planned_candidate_count: int = 1,
+    visible_planned_count: int = 0,
+    required_candidate_count: int = 0,
+    resolved_candidate_count: int = 0,
 ) -> str:
-    if collecting_group:
-        templates = (
-            "{scope}当前结果还不够完整，继续查看第{page}页，避免后续重复从头检索。",
-            "同一筛选条件下还需补充更多{scope}候选，现在翻到第{page}页继续收集。",
-            "为了让后续安排复用这次{scope}检索，继续浏览第{page}页结果。",
-            "已查看前{checked}页{scope}结果，继续读取第{page}页以补充同条件候选。",
-            "不改变已确认的{scope}筛选，继续展开第{page}页，收集可比较的选择。",
-            "当前搜索流仍有下一页，先查看第{page}页{scope}候选，再决定后续安排。",
-            "前{checked}页已提供部分{scope}选择，继续核对第{page}页，避免遗漏同条件候选。",
-            "继续沿用当前城市和筛选条件，打开第{page}页{scope}结果。",
+    if (
+        required_candidate_count > 1
+        and 0 < resolved_candidate_count < required_candidate_count
+    ):
+        return (
+            f"题目要求安排{required_candidate_count}个不同的{entity_name}；"
+            f"目前只确定了{resolved_candidate_count}个，还缺"
+            f"{required_candidate_count - resolved_candidate_count}个。"
+            f"保持{public_scope}的公开搜索条件，继续查看第{page_number}页。"
         )
-        scope = "group-page"
-    else:
-        templates = (
-            "{scope}当前结果里还没有出现{entity}，继续查看第{page}页候选。",
-            "还需在{scope}中定位{entity}，因此翻到第{page}页继续检索。",
-            "现有{scope}候选尚未找到{entity}，下一步查看第{page}页。",
-            "已核对前{checked}页{scope}结果，{entity}仍未出现；继续进入第{page}页。",
-            "前{checked}页结束后还缺{entity}，保持{scope}条件继续查第{page}页。",
-            "本次{scope}搜索仍有下一页；为了找到{entity}，继续读取第{page}页。",
-            "当前筛选条件不变，前{checked}页{scope}结果暂未定位{entity}，继续检索第{page}页候选。",
-            "已完成{scope}前{checked}页的核对，下一页继续寻找{entity}。",
+    if planned_candidate_count > 1 and 0 < visible_planned_count < planned_candidate_count:
+        return (
+            f"既定行程还需要{planned_candidate_count}个不同的{entity_name}；"
+            f"{public_scope}前{pages_checked}页只展示了其中{visible_planned_count}个，尚缺"
+            f"{planned_candidate_count - visible_planned_count}个；保持当前公开筛选条件，"
+            f"继续查看第{page_number}页。"
         )
-        scope = "page"
-    template = _cycle_choice(
-        templates,
-        seed,
-        task_id,
-        scope=f"{scope}:{public_scope}",
-        ordinal=page_number - 1,
+    if entity_name.startswith("合适的"):
+        raise SFTRebuildError(
+            "Unnamed pagination has no visible name, ranking objective, or quantity gap."
+        )
+    templates = (
+        "{scope}当前结果里还没有出现{entity}，继续查看第{page}页候选。",
+        "还需在{scope}中定位{entity}，因此翻到第{page}页继续检索。",
+        "现有{scope}候选尚未找到{entity}，下一步查看第{page}页。",
+        "已核对前{checked}页{scope}结果，{entity}仍未出现；继续进入第{page}页。",
+        "前{checked}页结束后还缺{entity}，保持{scope}条件继续查第{page}页。",
+        "本次{scope}搜索仍有下一页；为了找到{entity}，继续读取第{page}页。",
+        "当前筛选条件不变，前{checked}页{scope}结果暂未定位{entity}，继续检索第{page}页候选。",
+        "已完成{scope}前{checked}页的核对，下一页继续寻找{entity}。",
     )
+    template = _choice(templates, seed, task_id, position, f"page:{public_scope}")
     return template.format(
         entity=entity_name,
         scope=public_scope,
@@ -1390,9 +2479,15 @@ def _catalog_rationale(
     city: str,
     label: str,
     tool: str,
+    required_facet: str | None = None,
     candidate_count: int = 0,
     candidate_purposes: tuple[str, ...] = (),
 ) -> str:
+    if required_facet is not None:
+        return (
+            f"题目明确要求{required_facet}；先核对{city}的{label}目录中存在这一选项，"
+            "再按该条件搜索。"
+        )
     saved_context = (
         f"目前已保存{candidate_count}项候选（{'、'.join(candidate_purposes)}）"
         if candidate_purposes
@@ -1435,96 +2530,43 @@ def _facet_search_rationale(
     return template.format(city=city, facet=facet, noun=noun)
 
 
-def _candidate_review_rationale(
+def _unfiltered_search_rationale(
     seed: int,
     task_id: str,
     *,
     position: int,
-    review_kind: str,
-    candidate_count: int | None = None,
-    candidate_purposes: tuple[str, ...] = (),
-    comparison_names: tuple[str, str] | None = None,
-) -> str:
-    if review_kind == "compare":
-        if comparison_names is None:
-            raise ValueError("Comparison candidate review requires two visible candidate names.")
-        templates = (
-            "{first}和{second}这组同类备选都已保存，先调出候选清单核对差异再取舍。",
-            "当前已有{count}项候选；先在清单中比较{first}与{second}的已展示信息。",
-            "现在需要在{first}和{second}之间做选择，先查看候选清单里的对应记录。",
-            "先回看清单中{first}与{second}这两个同类选项，再依据已展示的信息完成取舍。",
-        )
-    elif review_kind == "coverage":
-        if candidate_count is None or not candidate_purposes:
-            raise ValueError("Coverage candidate review requires visible candidate context.")
-        templates = (
-            "目前已保存{count}项候选，涵盖{purposes}；先复查清单再补齐路线。",
-            "在查询路线前回看这{count}项候选，确认{purposes}的证据没有遗漏。",
-            "先汇总核对候选清单：已保存的{count}项是否足以覆盖{purposes}等行程环节。",
-            "已有{count}项候选可供提交，先检查清单中{purposes}的证据是否完整。",
-        )
-    else:
-        raise ValueError(f"Unknown candidate review kind: {review_kind}")
-    return _choice(templates, seed, task_id, position, f"candidate-review:{review_kind}").format(
-        count=candidate_count,
-        purposes="、".join(candidate_purposes),
-        first=comparison_names[0] if comparison_names is not None else "",
-        second=comparison_names[1] if comparison_names is not None else "",
-    )
-
-
-def _loop_action_rationale(
-    seed: int,
-    task_id: str,
-    *,
-    position: int,
-    entity_name: str,
-    city: str = "",
-    attempt: int = 0,
-) -> str:
-    query_object = entity_name.removeprefix("合适的")
-    location = f"在{city}" if city else ""
-    template = _cycle_choice(
-        (
-            "为了再确认一次{object}的候选信息，我{location}执行一次相同的查询。",
-            "我再{location}按相同条件检索一次{object}，核对结果是否有变化。",
-            "这里{location}再次查询{object}，尝试重新确认候选列表。",
-        ),
-        seed,
-        task_id,
-        scope=f"loop-action:{location}:{query_object}",
-        ordinal=attempt,
-    )
-    return template.format(object=query_object, location=location)
-
-
-def _nearby_page_rationale(
-    seed: int,
-    task_id: str,
-    *,
-    position: int,
-    anchor_name: str,
-    radius_km: int,
+    city: str,
     noun: str,
-    page_number: int,
+    entity_type: str,
 ) -> str:
     template = _choice(
         (
-            "{anchor}周边{radius}公里的{noun}还需继续查看，翻到该范围的第{page}页。",
-            "当前{radius}公里范围内尚未选定合适的{noun}，继续浏览{anchor}附近的第{page}页结果。",
-            "沿用{anchor}周边{radius}公里这一条件，继续查看第{page}页{noun}候选。",
-            "为了在{anchor}附近完成衔接，继续核对{radius}公里范围内第{page}页的{noun}。",
+            "题面没有限定具体{noun}类别，先查看{city}的公开候选，再从结果中选择可行安排。",
+            "当前只需补充一处可行{noun}，先不添加额外筛选条件，查看{city}候选。",
+            "没有更多题面条件可以缩小{noun}范围，先查询{city}的首批公开候选。",
         ),
         seed,
         task_id,
         position,
-        "nearby-page",
+        f"unfiltered:{entity_type}",
     )
-    return template.format(
-        anchor=anchor_name,
-        radius=radius_km,
-        noun=noun,
-        page=page_number,
+    return template.format(city=city, noun=noun)
+
+
+def _cost_search_rationale(*, city: str, noun: str) -> str:
+    return f"题面希望降低总花费；先按价格从低到高查看{city}的{noun}候选。"
+
+
+def _averaged_budget_search_rationale(
+    *, city: str, noun: str, max_price: float, facet: str = ""
+) -> str:
+    facet_text = f"，搜索时仍使用题面的{facet}条件" if facet else ""
+    basis = "每间房报价" if noun == "酒店" else "单家餐厅的人均报价"
+    average = "每人每晚平均" if noun == "酒店" else "所有已安排餐次的每餐平均"
+    return (
+        f"题面要求{average}不超过{_format_price(max_price)}元；工具返回的是{basis}，"
+        f"不能把平均上限直接当作单项max_price{facet_text}。先查询{city}{noun}候选，"
+        "随后按题面计价口径核算组合。"
     )
 
 
@@ -1622,6 +2664,69 @@ def _read_jsonl_index(path: Path) -> dict[str, dict[str, Any]]:
             row = json.loads(line)
             rows[str(row["uid"])] = row
     return rows
+
+
+def _programmatic_source_identity(records: list[dict[str, Any]]) -> str:
+    payload = [
+        {
+            "task_id": record["task_spec"]["task_id"],
+            "blueprint_id": record["blueprint"]["blueprint_id"],
+            "surface_id": record["surface"]["surface_id"],
+            "scenario_id": record["scenario"]["scenario_id"],
+        }
+        for record in records
+    ]
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _numbered_json_paths(directory: Path) -> list[Path]:
+    paths: list[tuple[int, Path]] = []
+    for path in directory.glob("*.json"):
+        try:
+            index = int(path.stem)
+        except ValueError:
+            continue
+        paths.append((index, path))
+    return [path for _, path in sorted(paths)]
+
+
+def _numbered_json_indices(directory: Path) -> set[int]:
+    return {int(path.stem) for path in _numbered_json_paths(directory)}
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise SFTRebuildError(f"Invalid programmatic checkpoint JSON: {path}") from error
+    if not isinstance(value, dict):
+        raise SFTRebuildError(f"Programmatic checkpoint must be an object: {path}")
+    return value
+
+
+def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as handle:
+        json.dump(value, handle, ensure_ascii=False, sort_keys=True, indent=2)
+        handle.write("\n")
+        temporary = Path(handle.name)
+    os.replace(temporary, path)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _atomic_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:

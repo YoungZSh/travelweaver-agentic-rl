@@ -11,9 +11,12 @@ from typing import Any
 
 from ..errors import TaskSpecError
 
-SPEC_VERSION = "travelweaver-task-spec-v2"
+SPEC_VERSION = "travelweaver-task-spec-v3"
 LEGACY_SPEC_VERSION = "travelweaver-task-spec-v1"
-SUPPORTED_SPEC_VERSIONS = frozenset({LEGACY_SPEC_VERSION, SPEC_VERSION})
+LEGACY_SPEC_V2_VERSION = "travelweaver-task-spec-v2"
+SUPPORTED_SPEC_VERSIONS = frozenset(
+    {LEGACY_SPEC_VERSION, LEGACY_SPEC_V2_VERSION, SPEC_VERSION}
+)
 
 _CONSTRAINT_KINDS = frozenset(
     {

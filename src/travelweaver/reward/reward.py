@@ -11,7 +11,7 @@ from ..tasks import TravelTaskSpec
 from .evaluators import evaluate_constraint
 from .models import CHECK_FAIL, CHECK_PASS, CHECK_UNVERIFIABLE, CheckResult, RewardResult
 
-REWARD_VERSION = "travelweaver-reward-v2"
+REWARD_VERSION = "travelweaver-reward-v3"
 
 REWARD_GROUPS = (
     "protocol_structure",

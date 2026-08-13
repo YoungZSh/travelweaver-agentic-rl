@@ -174,6 +174,10 @@ uv run --project training python training/scripts/split_qwen_sft.py \
   --seed 20260811
 ```
 
+Use `--holdout-name test` when the requested in-distribution holdout should be written as
+`test.parquet`; the default remains `validation.parquet`. This naming choice does not change the
+split algorithm, and neither holdout replaces the pinned ChinaTravel blind benchmark.
+
 Pass the resulting validation file with `VAL_FILE`. The launcher uses veRL's regular
 `trainer.test_freq` path (configured by `VALIDATION_FREQ`) and records `val/loss`, perplexity, and
 teacher-forced `val/token_accuracy`. The accuracy only covers tokens selected by the explicit SFT

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ from travelweaver.errors import SynthesisError
 from travelweaver.llm import DeepSeekConfig
 from travelweaver.synthesis.artifacts import ArtifactStore, _alignment
 from travelweaver.synthesis.catalog import build_pilot_slots
+from travelweaver.synthesis.compose import _constraint
 from travelweaver.synthesis.pipeline import (
     SynthesisConfig,
     SynthesisPipeline,
@@ -22,6 +24,20 @@ from travelweaver.synthesis.pipeline import (
 )
 from travelweaver.synthesis.polisher import TaskPolisher, validate_surface
 from travelweaver.synthesis.render import render_canonical
+from travelweaver.synthesis.trajectory_policy import (
+    MAX_CONSECUTIVE_TOOL_CALLS,
+    MAX_PROGRAMMATIC_CATALOG_ACTIONS,
+    MAX_SYNTHESIS_VALID_STEPS,
+    MAX_WITNESS_VALID_STEPS,
+    TRAJECTORY_POLICY_VERSION,
+    trajectory_policy,
+)
+from travelweaver.synthesis.witness import (
+    WitnessBuilder,
+    _attraction_cluster_radius,
+    _local_route_mode,
+    _LocalActivity,
+)
 from travelweaver.tasks import (
     BlueprintConstraint,
     BlueprintPreference,
@@ -72,6 +88,101 @@ def _payload(blueprint: TaskBlueprint) -> dict:
     }
 
 
+def test_walking_witness_uses_taxi_only_for_terminal_transfers() -> None:
+    airport = {"entity_type": "route_anchor"}
+    attraction = {"entity_type": "attraction"}
+    restaurant = {"entity_type": "restaurant"}
+
+    assert _local_route_mode("walk", airport, attraction) == "taxi"
+    assert _local_route_mode("walk", attraction, restaurant) == "walk"
+    assert _local_route_mode("walk", restaurant, airport) == "taxi"
+    assert _local_route_mode("metro", airport, attraction) == "metro"
+    assert WitnessBuilder._route_mode_order("walk") == ("walk",)
+    assert WitnessBuilder._route_mode_order("metro") == ("metro", "taxi")
+    assert (
+        _attraction_cluster_radius(
+            "walk",
+            attraction_count=1,
+            needs_restaurant=False,
+            has_hotel=False,
+        )
+        == 15.0
+    )
+    assert (
+        _attraction_cluster_radius(
+            "walk",
+            attraction_count=1,
+            needs_restaurant=True,
+            has_hotel=False,
+        )
+        == 1.0
+    )
+
+
+def test_walking_hotel_selection_requires_enough_nearby_attractions() -> None:
+    sparse = {
+        "place_id": "hotel-sparse",
+        "entity_type": "hotel",
+        "city": "测试城",
+        "name": "稀疏酒店",
+        "price": 100,
+        "room_type": 1,
+        "latitude": 31.0,
+        "longitude": 121.0,
+    }
+    dense = {
+        **sparse,
+        "place_id": "hotel-dense",
+        "name": "密集酒店",
+        "latitude": 30.0,
+        "longitude": 120.0,
+    }
+    attractions = [
+        {
+            "place_id": f"attraction-{index}",
+            "entity_type": "attraction",
+            "city": "测试城",
+            "price": 0,
+            "open_time": "08:00",
+            "close_time": "20:00",
+            "latitude": 30.0 + index / 10000,
+            "longitude": 120.0 + index / 10000,
+        }
+        for index in range(3)
+    ]
+
+    class FakeBackend:
+        @staticmethod
+        def _records(kind: str, city: str):
+            assert city == "测试城"
+            return [sparse, dense] if kind == "hotel" else attractions
+
+        @staticmethod
+        def search_hotels(**arguments):
+            assert arguments == {"city": "测试城"}
+            return [sparse, dense]
+
+        @staticmethod
+        def search_attractions(**arguments):
+            assert arguments == {"city": "测试城"}
+            return attractions
+
+    slot = replace(
+        build_pilot_slots(1, 20260812)[0],
+        destination="测试城",
+        days=3,
+        attractions_per_day=1,
+        route_mode="walk",
+        recipe=(),
+    )
+
+    selected = WitnessBuilder(FakeBackend(), seed=7)._select_hotel(  # type: ignore[arg-type]
+        slot, "walk"
+    )
+
+    assert selected["place_id"] == "hotel-dense"
+
+
 def test_question_normalization_ignores_only_surface_typography() -> None:
     assert _normalize_question("请安排 上海→杭州，2 天！") == _normalize_question(
         "请安排上海杭州2天"
@@ -114,15 +225,540 @@ def test_synthesis_defaults_to_256_llm_workers(tmp_path) -> None:
     assert SynthesisConfig(output_dir=tmp_path).llm_concurrency == 256
 
 
-def test_witness_refill_cycles_viable_origins_with_distinct_attempts(monkeypatch) -> None:
+def test_short_trajectory_policy_uses_one_global_consecutive_limit() -> None:
+    assert trajectory_policy() == {
+        "policy_version": TRAJECTORY_POLICY_VERSION,
+        "max_valid_steps": 50,
+        "max_consecutive_tool_calls": 3,
+    }
+
+
+def test_witness_step_reserve_covers_the_clean_teacher_overhead() -> None:
+    assert (
+        MAX_WITNESS_VALID_STEPS
+        + MAX_PROGRAMMATIC_CATALOG_ACTIONS
+        + MAX_CONSECUTIVE_TOOL_CALLS
+        == MAX_SYNTHESIS_VALID_STEPS
+    )
+
+
+@pytest.mark.parametrize("attraction_targets", [(1,), (2,)])
+def test_witness_prefers_attractions_on_first_unfiltered_page(
+    attraction_targets: tuple[int, ...],
+) -> None:
+    records = [
+        {
+            "place_id": f"attraction-{index:02d}",
+            "entity_type": "attraction",
+            "city": "测试城",
+            "name": f"景点{index:02d}",
+            "category": "公园",
+            "price": 10.0,
+            "open_time": "08:00",
+            "close_time": "20:00",
+            "latitude": 30.0 + index / 10000,
+            "longitude": 120.0 + index / 10000,
+        }
+        for index in range(30)
+    ]
+
+    class FakeBackend:
+        @staticmethod
+        def _records(kind: str, city: str) -> list[dict[str, object]]:
+            assert kind == "attraction" and city == "测试城"
+            return records
+
+        @staticmethod
+        def search_attractions(**arguments: object) -> list[dict[str, object]]:
+            assert arguments == {"city": "测试城"}
+            return records
+
+    slot = replace(
+        build_pilot_slots(1, 20260812)[0],
+        destination="测试城",
+        days=1,
+        attractions_per_day=1,
+        include_meal=False,
+        route_mode="taxi",
+        recipe=(),
+    )
+    builder = WitnessBuilder(FakeBackend(), seed=7)  # type: ignore[arg-type]
+    selected = builder._select_attractions(
+        slot,
+        outbound_arrival="08:00",
+        return_departure="20:00",
+        needs_restaurant=False,
+        hotel=None,
+        route_mode="taxi",
+        attraction_targets=attraction_targets,
+    )
+
+    pages = [builder._public_page_index(item) for item in selected]
+    assert len(pages) == sum(attraction_targets)
+    assert pages == [0] * sum(attraction_targets)
+
+
+def test_witness_uses_bounded_later_page_to_fill_public_attraction_count() -> None:
+    records = [
+        {
+            "place_id": f"attraction-{index:02d}",
+            "entity_type": "attraction",
+            "city": "测试城",
+            "name": f"景点{index:02d}",
+            "category": "公园",
+            "price": 10.0,
+            "open_time": "08:00",
+            "close_time": "20:00",
+            "latitude": 30.0 + index / 10000,
+            "longitude": 120.0 + index / 10000,
+        }
+        for index in range(50)
+    ]
+
+    class FakeBackend:
+        @staticmethod
+        def _records(kind: str, city: str) -> list[dict[str, object]]:
+            assert kind == "attraction" and city == "测试城"
+            return records
+
+        @staticmethod
+        def search_attractions(**arguments: object) -> list[dict[str, object]]:
+            assert arguments == {"city": "测试城"}
+            return records
+
+        @staticmethod
+        def search_nearby(**arguments: object) -> list[dict[str, object]]:
+            del arguments
+            return []
+
+    slot = replace(
+        build_pilot_slots(1, 20260812)[0],
+        destination="测试城",
+        days=1,
+        attractions_per_day=2,
+        include_meal=False,
+        route_mode="taxi",
+        recipe=("attraction_count",),
+    )
+    builder = WitnessBuilder(FakeBackend(), seed=7)  # type: ignore[arg-type]
+    selected = builder._select_attractions(
+        slot,
+        outbound_arrival="08:00",
+        return_departure="20:00",
+        needs_restaurant=False,
+        hotel=None,
+        route_mode="taxi",
+        attraction_targets=(2,),
+    )
+
+    pages = [builder._public_page_index(item) for item in selected]
+    assert pages[0] == 0
+    assert pages[1] in {1, 2, 3}
+
+
+def test_witness_beyond_three_continuations_allows_nearby_discovery() -> None:
+    records = [
+        {
+            "place_id": f"attraction-{index:02d}",
+            "entity_type": "attraction",
+            "city": "测试城",
+            "name": f"景点{index:02d}",
+        }
+        for index in range(42)
+    ]
+
+    class FakeBackend:
+        @staticmethod
+        def search_attractions(**arguments: object) -> list[dict[str, object]]:
+            assert arguments == {"city": "测试城"}
+            return records
+
+        @staticmethod
+        def search_nearby(**arguments: object) -> list[dict[str, object]]:
+            assert arguments["place_id"] == "anchor-1"
+            assert arguments["category"] == "attraction"
+            assert arguments["top_k"] == 10
+            return [records[40]]
+
+    activity = _LocalActivity(
+        evidence=records[40],
+        activity_type="attraction",
+        start_time="10:00",
+        end_time="11:00",
+        route={"origin_place_id": "anchor-1"},
+    )
+    WitnessBuilder(FakeBackend(), seed=7)._require_grounded_local_discovery(  # type: ignore[arg-type]
+        [[activity]], initial_anchor_ids=("anchor-1",)
+    )
+
+
+def test_witness_beyond_three_continuations_rejects_hidden_target() -> None:
+    records = [
+        {
+            "place_id": f"attraction-{index:02d}",
+            "entity_type": "attraction",
+            "city": "测试城",
+            "name": f"景点{index:02d}",
+        }
+        for index in range(42)
+    ]
+
+    class FakeBackend:
+        @staticmethod
+        def search_attractions(**arguments: object) -> list[dict[str, object]]:
+            assert arguments == {"city": "测试城"}
+            return records
+
+        @staticmethod
+        def search_nearby(**arguments: object) -> list[dict[str, object]]:
+            del arguments
+            return records[:10]
+
+    activity = _LocalActivity(
+        evidence=records[40],
+        activity_type="attraction",
+        start_time="10:00",
+        end_time="11:00",
+        route={"origin_place_id": "anchor-1"},
+    )
+    with pytest.raises(SynthesisError, match="first nearby page"):
+        WitnessBuilder(FakeBackend(), seed=7)._require_grounded_local_discovery(  # type: ignore[arg-type]
+            [[activity]], initial_anchor_ids=("anchor-1",)
+        )
+
+
+def test_candidate_beyond_three_continuations_is_rejected_before_commit() -> None:
+    records = [
+        {
+            "place_id": f"attraction-{index:02d}",
+            "entity_type": "attraction",
+            "city": "测试城",
+            "name": f"景点{index:02d}",
+        }
+        for index in range(42)
+    ]
+
+    class FakeBackend:
+        @staticmethod
+        def search_attractions(**arguments: object) -> list[dict[str, object]]:
+            assert arguments == {"city": "测试城"}
+            return records
+
+        @staticmethod
+        def search_nearby(**arguments: object) -> list[dict[str, object]]:
+            del arguments
+            return records[:10]
+
+    builder = WitnessBuilder(FakeBackend(), seed=7)  # type: ignore[arg-type]
+    assert not builder._local_candidate_is_grounded(
+        records[40],
+        recipe=(),
+        preference_kinds=(),
+        required_facets=None,
+        established_anchor_ids=("anchor-1",),
+    )
+
+
+def test_nearby_visibility_reuses_the_same_public_page_for_multiple_candidates() -> None:
+    records = [
+        {
+            "place_id": f"attraction-{index:02d}",
+            "entity_type": "attraction",
+            "city": "测试城",
+            "name": f"景点{index:02d}",
+        }
+        for index in range(42)
+    ]
+    calls = 0
+
+    class FakeBackend:
+        @staticmethod
+        def search_attractions(**arguments: object) -> list[dict[str, object]]:
+            assert arguments == {"city": "测试城"}
+            return records
+
+        @staticmethod
+        def search_nearby(**arguments: object) -> list[dict[str, object]]:
+            nonlocal calls
+            calls += 1
+            assert arguments["place_id"] == "anchor-1"
+            return records[:10]
+
+    builder = WitnessBuilder(FakeBackend(), seed=7)  # type: ignore[arg-type]
+    for candidate in records[40:42]:
+        assert not builder._local_candidate_is_grounded(
+            candidate,
+            recipe=(),
+            preference_kinds=(),
+            required_facets=None,
+            established_anchor_ids=("anchor-1",),
+        )
+
+    assert calls == 5
+
+
+def test_unnamed_later_page_candidate_is_not_directly_grounded() -> None:
+    records = [
+        {
+            "place_id": f"attraction-{index:02d}",
+            "entity_type": "attraction",
+            "city": "测试城",
+            "name": f"景点{index:02d}",
+        }
+        for index in range(40)
+    ]
+
+    class FakeBackend:
+        @staticmethod
+        def search_attractions(**arguments: object) -> list[dict[str, object]]:
+            assert arguments == {"city": "测试城"}
+            return records
+
+    builder = WitnessBuilder(FakeBackend(), seed=7)  # type: ignore[arg-type]
+    assert not builder._local_candidate_is_grounded(
+        records[30],
+        recipe=(),
+        preference_kinds=(),
+        required_facets=None,
+        established_anchor_ids=(),
+    )
+    assert builder._local_candidate_is_grounded(
+        records[0],
+        recipe=(),
+        preference_kinds=(),
+        required_facets=None,
+        established_anchor_ids=(),
+    )
+
+
+def test_partial_activity_count_grounds_up_to_three_cursor_steps() -> None:
+    records = [
+        {
+            "place_id": f"attraction-{index:02d}",
+            "entity_type": "attraction",
+            "city": "测试城",
+            "name": f"景点{index:02d}",
+        }
+        for index in range(42)
+    ]
+
+    class FakeBackend:
+        @staticmethod
+        def search_attractions(**arguments: object) -> list[dict[str, object]]:
+            assert arguments == {"city": "测试城"}
+            return records
+
+        @staticmethod
+        def search_nearby(**arguments: object) -> list[dict[str, object]]:
+            del arguments
+            return []
+
+    builder = WitnessBuilder(FakeBackend(), seed=7)  # type: ignore[arg-type]
+    assert builder._local_candidate_is_grounded(
+        records[30],
+        recipe=("attraction_count",),
+        preference_kinds=(),
+        required_facets=None,
+        established_anchor_ids=(),
+        allow_named_query=False,
+        resolved_candidate_count=1,
+    )
+    assert not builder._local_candidate_is_grounded(
+        records[40],
+        recipe=("attraction_count",),
+        preference_kinds=(),
+        required_facets=None,
+        established_anchor_ids=(),
+        allow_named_query=False,
+        resolved_candidate_count=1,
+    )
+
+
+def test_candidate_beyond_three_continuations_can_use_grounded_nearby() -> None:
+    records = [
+        {
+            "place_id": f"attraction-{index:02d}",
+            "entity_type": "attraction",
+            "city": "测试城",
+            "name": f"景点{index:02d}",
+        }
+        for index in range(42)
+    ]
+
+    class FakeBackend:
+        @staticmethod
+        def search_attractions(**arguments: object) -> list[dict[str, object]]:
+            assert arguments == {"city": "测试城"}
+            return records
+
+        @staticmethod
+        def search_nearby(**arguments: object) -> list[dict[str, object]]:
+            assert arguments["place_id"] == "anchor-1"
+            return [records[40]]
+
+    builder = WitnessBuilder(FakeBackend(), seed=7)  # type: ignore[arg-type]
+    assert builder._local_candidate_is_grounded(
+        records[40],
+        recipe=(),
+        preference_kinds=(),
+        required_facets=None,
+        established_anchor_ids=("anchor-1",),
+    )
+
+
+def test_task_page_index_does_not_apply_one_meal_cuisine_to_other_meals() -> None:
+    target = {
+        "place_id": "restaurant-western",
+        "entity_type": "restaurant",
+        "city": "测试城",
+        "name": "西餐厅",
+        "cuisine": "西餐",
+    }
+
+    class FakeBackend:
+        @staticmethod
+        def search_restaurants(**arguments: object) -> list[dict[str, object]]:
+            assert arguments == {"city": "测试城"}
+            return [target]
+
+    builder = WitnessBuilder(FakeBackend(), seed=7)  # type: ignore[arg-type]
+
+    assert builder._task_page_index(
+        target,
+        ("restaurant_cuisine",),
+        required_facets={"restaurant": "北京菜"},
+    ) == 0
+
+
+def test_named_attraction_uses_the_question_grounded_name_search() -> None:
+    target = {
+        "place_id": "named-attraction",
+        "entity_type": "attraction",
+        "city": "测试城",
+        "name": "题面指定景点",
+    }
+
+    class FakeBackend:
+        @staticmethod
+        def search_attractions(**arguments: object) -> list[dict[str, object]]:
+            assert arguments == {"city": "测试城", "query": "题面指定景点"}
+            return [target]
+
+    builder = WitnessBuilder(FakeBackend(), seed=7)  # type: ignore[arg-type]
+
+    assert builder._task_page_index(target, ("include_attraction",)) == 0
+
+
+def test_additional_attraction_does_not_inherit_named_search() -> None:
+    target = {
+        "place_id": "additional-attraction",
+        "entity_type": "attraction",
+        "city": "测试城",
+        "name": "未被题面点名的景点",
+    }
+    records = [
+        {
+            "place_id": f"other-{index}",
+            "entity_type": "attraction",
+            "city": "测试城",
+            "name": f"其他景点{index}",
+        }
+        for index in range(10)
+    ] + [target]
+
+    class FakeBackend:
+        @staticmethod
+        def search_attractions(**arguments: object) -> list[dict[str, object]]:
+            assert arguments == {"city": "测试城"}
+            return records
+
+    builder = WitnessBuilder(FakeBackend(), seed=7)  # type: ignore[arg-type]
+
+    assert builder._task_page_index(
+        target,
+        ("include_attraction", "attraction_count"),
+        allow_named_query=False,
+    ) == 1
+
+
+def test_witness_refill_tries_each_original_origin_before_destination_replacements(
+    monkeypatch,
+) -> None:
     pipeline = object.__new__(SynthesisPipeline)
+    pipeline.config = SimpleNamespace(seed=20260813)
+    pipeline.backend = SimpleNamespace(
+        supported_cities=("武汉", "广州", "北京", "上海")
+    )
     monkeypatch.setattr(pipeline, "_origins", lambda slot: ("武汉", "广州"))
     slot = build_pilot_slots(1, 20260813, "chinatravel_blended_v1_1")[0]
 
     origins = pipeline._candidate_origins(slot)
+    attempts = pipeline._candidate_slot_origins(slot)
 
-    assert len(origins) == 12
-    assert origins == ("武汉", "广州") * 6
+    assert origins == ("武汉", "广州")
+    assert attempts[:2] == ((slot, "武汉"), (slot, "广州"))
+    assert all(candidate.destination != slot.destination for candidate, _ in attempts[2:])
+    assert len(attempts) <= 24
+
+
+def test_witness_candidate_deadline_moves_to_next_deterministic_attempt(
+    monkeypatch,
+) -> None:
+    pipeline = object.__new__(SynthesisPipeline)
+    pipeline.config = SimpleNamespace(seed=20260813, profile="chinatravel_blended_v1_1")
+    slot = build_pilot_slots(1, 20260813, "chinatravel_blended_v1_1")[0]
+    monkeypatch.setattr(
+        pipeline,
+        "_candidate_slot_origins",
+        lambda _slot: ((slot, "武汉"), (slot, "广州")),
+    )
+    monkeypatch.setattr(
+        "travelweaver.synthesis.pipeline.MAX_WITNESS_CANDIDATE_SECONDS",
+        0.01,
+    )
+
+    def prepare_candidate(
+        _slot,
+        *,
+        uid,
+        origin,
+        candidate_attempt,
+    ):
+        del uid, candidate_attempt
+        if origin == "武汉":
+            time.sleep(1)
+        return SimpleNamespace(blueprint=SimpleNamespace(blueprint_id="unique"))
+
+    monkeypatch.setattr(pipeline, "_prepare_candidate", prepare_candidate)
+
+    candidate, quarantine = pipeline._prepare_slot(slot, frozenset())
+
+    assert candidate.blueprint.blueprint_id == "unique"
+    assert len(quarantine) == 1
+    assert "exceeded 0.01s CPU deadline" in quarantine[0]["stage_error"]
+
+
+def test_origin_fallbacks_try_catalog_origin_without_round_trip_prescan() -> None:
+    class FakeBackend:
+        supported_cities = ("北京", "上海", "杭州")
+
+        @staticmethod
+        def search_intercity_transport(**arguments):
+            raise AssertionError(f"origin ordering must not query transport: {arguments}")
+
+    pipeline = object.__new__(SynthesisPipeline)
+    pipeline.backend = FakeBackend()
+    pipeline.config = SimpleNamespace(seed=20260813)
+    slot = replace(
+        build_pilot_slots(1, 20260813, "chinatravel_blended_v1_1")[0],
+        origin="北京",
+        destination="上海",
+    )
+
+    origins = pipeline._origins(slot)
+
+    assert origins[0] == "北京"
+    assert set(origins) == {"北京", "杭州"}
 
 
 def test_artifact_store_migrates_only_missing_llm_concurrency(tmp_path) -> None:
@@ -137,6 +773,181 @@ def test_artifact_store_migrates_only_missing_llm_concurrency(tmp_path) -> None:
     store = ArtifactStore(output_dir, {**old_config, "llm_concurrency": 256})
 
     assert store.manifest["config"]["llm_concurrency"] == 256
+
+
+def test_artifact_store_persists_slot_progress_immediately(tmp_path) -> None:
+    store = ArtifactStore(tmp_path / "batch", {"count": 2, "seed": 17})
+    store.save_record(1000, {"value": "complete"}, api_calls=0)
+    store.record_progress(
+        {
+            "event": "slot_completed",
+            "slot_index": 1000,
+            "requested": 2,
+            "completed": 1,
+        }
+    )
+
+    assert (tmp_path / "batch" / "records" / "001000.json").is_file()
+    manifest = json.loads(
+        (tmp_path / "batch" / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["completed"] == 1
+    assert manifest["last_event"]["event"] == "slot_completed"
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "batch" / "progress.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert events[0]["slot_index"] == 1000
+
+
+def test_synthesis_resumes_after_the_last_persisted_slot(tmp_path, monkeypatch) -> None:
+    slots = build_pilot_slots(2, 20260807)
+    monkeypatch.setattr(
+        "travelweaver.synthesis.pipeline.build_pilot_slots",
+        lambda count, seed, profile: slots,
+    )
+    monkeypatch.setattr(ArtifactStore, "finalize", lambda self, slots, api_calls: {})
+    config = SynthesisConfig(
+        output_dir=tmp_path / "streaming-batch",
+        count=2,
+        seed=20260807,
+        canonical_only=True,
+    )
+    llm_config = DeepSeekConfig(
+        api_key="offline-canonical", model="deterministic-canonical"
+    )
+
+    def prepared(slot):
+        return SimpleNamespace(
+            slot=slot,
+            uid=f"task-{slot.index}",
+            candidate_attempt=1,
+            blueprint=SimpleNamespace(blueprint_id=f"blueprint-{slot.index}"),
+        )
+
+    def record(candidate):
+        index = candidate.slot.index
+        return {
+            "slot": asdict(candidate.slot),
+            "blueprint": {"blueprint_id": f"blueprint-{index}"},
+            "surface": {
+                "surface_id": f"surface-{index}",
+                "public_query": f"第{index}道恢复测试题",
+            },
+            "task_spec": {"task_id": f"task-{index}"},
+            "witness": {},
+        }
+
+    first_events = []
+    first = SynthesisPipeline(
+        config,
+        llm_config,
+        backend=object(),  # type: ignore[arg-type]
+        progress=first_events.append,
+    )
+    monkeypatch.setattr(
+        first,
+        "_prepare_slot",
+        lambda slot, blocked: (prepared(slot), []),
+    )
+
+    def fail_second(candidate):
+        if candidate.slot.index == 1:
+            raise SynthesisError("simulated interruption")
+        return record(candidate)
+
+    monkeypatch.setattr(first, "_materialize_candidate", fail_second)
+    with pytest.raises(SynthesisError, match="simulated interruption"):
+        first.run()
+
+    assert {
+        int(path.stem) for path in (config.output_dir / "records").glob("*.json")
+    } == {0}
+    assert any(event["event"] == "slot_completed" for event in first_events)
+
+    resumed_events = []
+    prepared_on_resume = []
+    resumed = SynthesisPipeline(
+        config,
+        llm_config,
+        backend=object(),  # type: ignore[arg-type]
+        progress=resumed_events.append,
+    )
+
+    def prepare_remaining(slot, blocked):
+        del blocked
+        prepared_on_resume.append(slot.index)
+        return prepared(slot), []
+
+    monkeypatch.setattr(resumed, "_prepare_slot", prepare_remaining)
+    monkeypatch.setattr(resumed, "_materialize_candidate", record)
+    report = resumed.run()
+
+    assert prepared_on_resume == [1]
+    assert report.completed == 2
+    assert resumed_events[0]["event"] == "synthesis_resumed"
+    assert {
+        int(path.stem) for path in (config.output_dir / "records").glob("*.json")
+    } == {0, 1}
+
+
+def test_synthesis_persists_later_slots_after_an_independent_slot_failure(
+    tmp_path, monkeypatch
+) -> None:
+    slots = build_pilot_slots(3, 20260807)
+    monkeypatch.setattr(
+        "travelweaver.synthesis.pipeline.build_pilot_slots",
+        lambda count, seed, profile: slots,
+    )
+    monkeypatch.setattr(ArtifactStore, "finalize", lambda self, slots, api_calls: {})
+    config = SynthesisConfig(
+        output_dir=tmp_path / "failure-isolation",
+        count=3,
+        seed=20260807,
+        canonical_only=True,
+    )
+    pipeline = SynthesisPipeline(
+        config,
+        DeepSeekConfig(api_key="offline-canonical", model="deterministic-canonical"),
+        backend=object(),  # type: ignore[arg-type]
+    )
+
+    def prepared(slot, blocked):
+        del blocked
+        if slot.index == 1:
+            raise SynthesisError("structurally infeasible")
+        candidate = SimpleNamespace(
+            slot=slot,
+            uid=f"task-{slot.index}",
+            candidate_attempt=1,
+            blueprint=SimpleNamespace(blueprint_id=f"blueprint-{slot.index}"),
+        )
+        return candidate, []
+
+    def materialized(candidate):
+        index = candidate.slot.index
+        return {
+            "slot": asdict(candidate.slot),
+            "blueprint": {"blueprint_id": f"blueprint-{index}"},
+            "surface": {
+                "surface_id": f"surface-{index}",
+                "public_query": f"第{index}道失败隔离测试题",
+            },
+            "task_spec": {"task_id": f"task-{index}"},
+            "witness": {},
+        }
+
+    monkeypatch.setattr(pipeline, "_prepare_slot", prepared)
+    monkeypatch.setattr(pipeline, "_materialize_candidate", materialized)
+
+    with pytest.raises(SynthesisError, match="1 synthesis slot"):
+        pipeline.run()
+
+    assert {
+        int(path.stem) for path in (config.output_dir / "records").glob("*.json")
+    } == {0, 2}
 
 
 def test_pilot_catalog_has_balanced_100_task_distribution() -> None:
@@ -265,7 +1076,7 @@ def test_chinatravel_blended_profile_preserves_200_task_baseline() -> None:
         ),
         (
             "chinatravel_blended_v1_1",
-            "27ec824929fa3cf900907d8f2b79a54350bb9be17d2d353e4ccb6019880ad785",
+            "315f4e0b704033e41b4b6ec754aeb13664a83b0e3d5fa08780b27a82f1fbb525",
         ),
     ],
 )
@@ -339,6 +1150,165 @@ def test_chinatravel_blended_v1_1_scales_to_500_task_quotas() -> None:
     }
     assert sum(kind in official for kind in preferences) == 35
     assert max(Counter(preferences).values()) - min(Counter(preferences).values()) <= 4
+    logic_keys = {
+        "attraction_categories_all",
+        "attraction_categories_any",
+        "exclude_attraction",
+        "allowed_innercity_modes",
+    }
+    logic_counts = Counter(
+        key for slot in slots for key in slot.recipe if key in logic_keys
+    )
+    assert set(logic_counts) == logic_keys
+    assert all(25 <= count <= 50 for count in logic_counts.values())
+    assert all(sum(key in logic_keys for key in slot.recipe) <= 1 for slot in slots)
+    assert all(
+        slot.days > 1
+        for slot in slots
+        if "attraction_categories_all" in slot.recipe
+    )
+
+
+def test_logic_diversity_constraints_render_and_validate_end_to_end() -> None:
+    blueprint = TaskBlueprint(
+        trip=TripSpec(origin="上海", destinations=("北京",), days=2, travelers=2),
+        constraints=(
+            BlueprintConstraint(
+                id="c001",
+                kind="entity_category",
+                operator="contains",
+                value={"values": ["公园", "博物馆"]},
+                scope="attraction",
+            ),
+            BlueprintConstraint(
+                id="c002",
+                kind="entity_category",
+                operator="contains",
+                value={"any_of": [["美术馆"], ["历史建筑"]]},
+                scope="attraction",
+            ),
+            BlueprintConstraint(
+                id="c003",
+                kind="exclude_entity",
+                operator="exclude",
+                value={"names": ["测试景点"]},
+                scope="attraction",
+            ),
+            BlueprintConstraint(
+                id="c004",
+                kind="transport_mode",
+                operator="not_in",
+                value={"modes": ["walk"], "leg": "all"},
+                scope="innercity_route",
+            ),
+        ),
+        world_snapshot_version="snapshot-v1",
+        generator_version="generator-v1",
+        generation_seed=7,
+    )
+
+    canonical = render_canonical(blueprint)
+    assert "公园类景点和博物馆类景点" in canonical.query
+    assert "美术馆类景点或历史建筑类景点" in canonical.query
+    assert "不要安排测试景点" in canonical.query
+    assert "只能使用出租车或地铁，不要步行" in canonical.query
+    validate_surface(
+        blueprint,
+        canonical,
+        _payload(blueprint),
+        model="logic-diversity-test",
+    )
+
+
+def test_polisher_rejects_swapped_conjunction_and_disjunction() -> None:
+    blueprint = TaskBlueprint(
+        trip=TripSpec(origin="上海", destinations=("北京",), days=2, travelers=2),
+        constraints=(
+            BlueprintConstraint(
+                id="c001",
+                kind="entity_category",
+                operator="contains",
+                value={"values": ["公园", "博物馆"]},
+                scope="attraction",
+            ),
+            BlueprintConstraint(
+                id="c002",
+                kind="entity_category",
+                operator="contains",
+                value={"any_of": [["美术馆"], ["历史建筑"]]},
+                scope="attraction",
+            ),
+        ),
+        world_snapshot_version="snapshot-v1",
+        generator_version="generator-v1",
+        generation_seed=7,
+    )
+    canonical = render_canonical(blueprint)
+    query = canonical.query.replace(
+        "公园类景点和博物馆类景点", "公园类景点或博物馆类景点"
+    ).replace(
+        "美术馆类景点或历史建筑类景点", "美术馆类景点和历史建筑类景点"
+    )
+
+    with pytest.raises(SynthesisError, match="Logical conjunction changed"):
+        validate_surface(
+            blueprint,
+            canonical,
+            {
+                "query": query,
+                "mentions": [
+                    {
+                        "constraint_id": "c001",
+                        "text": "至少分别安排一个公园类景点或博物馆类景点",
+                    },
+                    {
+                        "constraint_id": "c002",
+                        "text": "至少安排一个美术馆类景点和历史建筑类景点",
+                    },
+                ],
+                "preference_mentions": [],
+            },
+            model="logic-shape-test",
+            validation_policy="minimal_semantic",
+        )
+
+
+def test_polisher_rejects_conjunctive_allowed_transport_set() -> None:
+    blueprint = TaskBlueprint(
+        trip=TripSpec(origin="上海", destinations=("北京",), days=2, travelers=2),
+        constraints=(
+            BlueprintConstraint(
+                id="c001",
+                kind="transport_mode",
+                operator="not_in",
+                value={"modes": ["walk"], "leg": "all"},
+                scope="innercity_route",
+            ),
+        ),
+        world_snapshot_version="snapshot-v1",
+        generator_version="generator-v1",
+        generation_seed=7,
+    )
+    canonical = render_canonical(blueprint)
+    query = canonical.query.replace("出租车或地铁", "出租车和地铁")
+
+    with pytest.raises(SynthesisError, match="Logical disjunction changed"):
+        validate_surface(
+            blueprint,
+            canonical,
+            {
+                "query": query,
+                "mentions": [
+                    {
+                        "constraint_id": "c001",
+                        "text": "至少安排两个市内地点，地点之间只能使用出租车和地铁，不要步行",
+                    }
+                ],
+                "preference_mentions": [],
+            },
+            model="allowed-set-test",
+            validation_policy="minimal_semantic",
+        )
 
 
 def test_official_hybrid_v2_first_batch_has_locked_quotas() -> None:
@@ -465,6 +1435,63 @@ def test_innercity_preference_candidates_add_a_routable_meal(monkeypatch) -> Non
 
     assert all(captured_include_meal)
     assert len({_preference_metric(row, "less_innercity_time") for row in candidates}) >= 2
+
+
+def test_long_relaxed_preference_varies_meal_stop_instead_of_extra_attractions(
+    monkeypatch,
+) -> None:
+    slot = replace(
+        build_pilot_slots(500, 20260838, "chinatravel_blended_v1_1")[69],
+        days=4,
+        preference_kinds=("relaxed_itinerary",),
+        include_meal=False,
+    )
+    captured: list[tuple[int, bool]] = []
+
+    class FakeBackend:
+        @staticmethod
+        def _records(entity_type: str, city: str) -> list[dict[str, object]]:
+            del entity_type, city
+            return []
+
+    class FakeWitnessBuilder:
+        def __init__(self, backend, *, seed: int) -> None:
+            del backend, seed
+
+        def build(self, candidate_slot, *, origin: str, uid: str):
+            del origin, uid
+            captured.append(
+                (candidate_slot.attractions_per_day, candidate_slot.include_meal)
+            )
+            return SimpleNamespace(
+                evidence_bundle={"routes": {}, "cost_items": [], "total_cost": 0.0},
+                route_mode=candidate_slot.route_mode,
+                selected={
+                    "attractions": [{}] * candidate_slot.days,
+                    "restaurant": (
+                        {"place_id": "restaurant"}
+                        if candidate_slot.include_meal
+                        else None
+                    ),
+                },
+            )
+
+    monkeypatch.setattr(
+        "travelweaver.synthesis.pipeline.WitnessBuilder", FakeWitnessBuilder
+    )
+    pipeline = object.__new__(SynthesisPipeline)
+
+    candidates = pipeline._preference_witnesses(
+        FakeBackend(),
+        slot,
+        origin="南京",
+        uid="long-relaxed-regression",
+        generation_seed=7,
+    )
+
+    assert {include_meal for _, include_meal in captured} == {False, True}
+    assert {attractions_per_day for attractions_per_day, _ in captured} == {1}
+    assert len({_preference_metric(row, "relaxed_itinerary") for row in candidates}) == 2
 
 
 def test_chinatravel_blended_v1_1_keeps_benchmark_core_and_tail_split() -> None:
@@ -868,7 +1895,6 @@ def test_restaurant_budget_requires_nonempty_meal_scope_after_polishing() -> Non
         model="canonical-nonempty-meal-test",
         validation_profile="benchmark_natural",
     )
-
     natural_query = canonical.query.replace("至少安排一顿用餐", "最少吃一顿饭")
     natural_payload = {
         "query": natural_query,
@@ -903,6 +1929,33 @@ def test_restaurant_budget_requires_nonempty_meal_scope_after_polishing() -> Non
             validation_profile="benchmark_natural",
             validation_policy="minimal_semantic",
         )
+
+
+def test_restaurant_budget_uses_all_planned_meals_not_only_first_price() -> None:
+    slot = replace(
+        build_pilot_slots(1, 20260812)[0],
+        days=2,
+        travelers=2,
+        tightness="medium",
+        recipe=("restaurant_budget",),
+    )
+    witness = SimpleNamespace(
+        selected={"restaurant": {"price": 80}},
+        public_task={"days": 2, "people_number": 2},
+        evidence_bundle={
+            "cost_items": [
+                {"activity_type": "lunch", "amount": 160},
+                {"activity_type": "dinner", "amount": 400},
+            ]
+        },
+    )
+
+    constraint = _constraint(1, "restaurant_budget", slot, witness, (witness,))
+
+    assert constraint.value == {
+        "amount": 160,
+        "basis": "per_person_per_activity",
+    }
 
 
 def test_innercity_transport_requires_two_places_after_polishing() -> None:

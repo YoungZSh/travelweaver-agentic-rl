@@ -6,16 +6,18 @@ import hashlib
 import json
 import math
 import os
+import signal
+import time
 import unicodedata
 from collections import Counter
-from collections.abc import Mapping
-from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from ..env import ChinaTravelBackend, ScenarioBackend, ScenarioSpec
-from ..errors import BackendQueryError, SynthesisError, TravelWeaverError
+from ..errors import SynthesisError, TravelWeaverError
 from ..llm import DEFAULT_DEEPSEEK_CONCURRENCY, DeepSeekConfig
 from ..reward import TravelReward
 from ..tasks import TaskBlueprint, materialize_task_spec
@@ -34,9 +36,58 @@ from .polisher import POLISHER_PROMPT_HASH, TaskPolisher, canonical_surface
 from .randomness import deterministic_rng
 from .render import render_canonical
 from .scenario import build_scenario
+from .trajectory_policy import (
+    MAX_CONSECUTIVE_TOOL_CALLS,
+    MAX_SYNTHESIS_VALID_STEPS,
+    trajectory_policy,
+)
 from .witness import WitnessBuilder
 
-MAX_WITNESS_CANDIDATE_ATTEMPTS = 12
+# A slot first tries every viable origin exactly once.  Remaining attempts use
+# deterministic destination replacements instead of repeating an impossible
+# destination with new random seeds.  This keeps exact task/scenario quotas while
+# preventing a few low-feasibility city combinations from dominating batch time.
+MAX_WITNESS_CANDIDATE_ATTEMPTS = 24
+MAX_WITNESS_CANDIDATE_SECONDS = 30
+_PREPARATION_WORKER: Any | None = None
+
+
+class _CandidatePreparationTimeout(Exception):
+    """Internal signal used to abandon one pathological witness candidate."""
+
+
+def _prepare_candidate_with_deadline(
+    pipeline: SynthesisPipeline,
+    slot: PilotSlot,
+    *,
+    uid: str,
+    origin: str,
+    candidate_attempt: int,
+) -> _PreparedCandidate:
+    """Prepare one candidate with a process-local CPU deadline.
+
+    Witness preparation normally completes in well under a second, but a rare
+    combinatorial route search can otherwise occupy one pool worker indefinitely.
+    SIGALRM is local to the worker process and lets the slot continue to its next
+    deterministic origin/destination candidate without changing accepted samples.
+    """
+
+    def raise_timeout(_signum: int, _frame: Any) -> None:
+        raise _CandidatePreparationTimeout
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, raise_timeout)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, MAX_WITNESS_CANDIDATE_SECONDS)
+    try:
+        return pipeline._prepare_candidate(
+            slot,
+            uid=uid,
+            origin=origin,
+            candidate_attempt=candidate_attempt,
+        )
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 @dataclass(frozen=True)
@@ -48,7 +99,7 @@ class SynthesisConfig:
     profile: str = "pilot_v2_1"
     validation_policy: str = "minimal_semantic"
     llm_concurrency: int = DEFAULT_DEEPSEEK_CONCURRENCY
-    witness_concurrency: int = min(8, os.cpu_count() or 1)
+    witness_concurrency: int = min(32, os.cpu_count() or 1)
     exclude_task_dirs: tuple[Path, ...] = ()
     canonical_only: bool = False
 
@@ -104,24 +155,6 @@ class _PreparedCandidate:
     canonical: CanonicalTask
 
 
-def _prepare_official_chunk(
-    payload: tuple[SynthesisConfig, tuple[PilotSlot, ...], frozenset[str]],
-) -> list[tuple[_PreparedCandidate, list[dict[str, Any]]]]:
-    """Process worker that loads one backend and reuses it across a stable slot chunk."""
-
-    config, slots, blocked_blueprint_ids = payload
-    pipeline = SynthesisPipeline(
-        config,
-        DeepSeekConfig(api_key="offline-canonical", model="deterministic-canonical"),
-    )
-    pipeline._origin_usage = Counter()
-    pipeline._od_usage = Counter()
-    return [
-        pipeline._prepare_slot(slot, blocked_blueprint_ids)
-        for slot in slots
-    ]
-
-
 class SynthesisPipeline:
     def __init__(
         self,
@@ -130,12 +163,14 @@ class SynthesisPipeline:
         *,
         backend: ChinaTravelBackend | None = None,
         polisher: TaskPolisher | None = None,
+        progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.config = config
         self.llm_config = llm_config
         self._backend_is_default = backend is None
         self.backend = backend or ChinaTravelBackend()
         self.polisher = polisher
+        self.progress = progress
         if self.polisher is None and not config.canonical_only:
             self.polisher = TaskPolisher(
                 llm_config,
@@ -167,6 +202,10 @@ class SynthesisPipeline:
                 "llm_concurrency": self.config.llm_concurrency,
                 "witness_concurrency": self.config.witness_concurrency,
                 "canonical_only": self.config.canonical_only,
+                "trajectory_policy": {
+                    "max_valid_steps": MAX_SYNTHESIS_VALID_STEPS,
+                    "max_consecutive_tool_calls": MAX_CONSECUTIVE_TOOL_CALLS,
+                },
                 "exclude_task_dirs": [
                     str(path.resolve()) for path in self.config.exclude_task_dirs
                 ],
@@ -207,59 +246,9 @@ class SynthesisPipeline:
                 "Task ids duplicate excluded or accepted tasks: "
                 + ", ".join(duplicate_task_ids[:3])
             )
-        base_blueprint_ids = frozenset(blueprint_ids)
-        if self.config.profile == OFFICIAL_HYBRID_V2_PROFILE:
-            if self._backend_is_default and self.config.witness_concurrency > 1:
-                worker_count = min(self.config.witness_concurrency, len(pending_slots))
-                chunk_size = math.ceil(len(pending_slots) / worker_count)
-                chunks = tuple(
-                    tuple(pending_slots[offset : offset + chunk_size])
-                    for offset in range(0, len(pending_slots), chunk_size)
-                )
-                payloads = tuple(
-                    (self.config, chunk, base_blueprint_ids) for chunk in chunks
-                )
-                with ProcessPoolExecutor(max_workers=worker_count) as executor:
-                    chunk_results = list(executor.map(_prepare_official_chunk, payloads))
-                prepared_results = [
-                    result for chunk_result in chunk_results for result in chunk_result
-                ]
-            else:
-                with ThreadPoolExecutor(
-                    max_workers=self.config.witness_concurrency
-                ) as executor:
-                    prepared_results = list(
-                        executor.map(
-                            lambda slot: self._prepare_slot(slot, base_blueprint_ids),
-                            pending_slots,
-                        )
-                    )
-        else:
-            prepared_results = [
-                self._prepare_slot(slot, frozenset(blueprint_ids)) for slot in pending_slots
-            ]
-        prepared: list[_PreparedCandidate] = []
-        for slot, (candidate, quarantine_rows) in zip(
-            pending_slots, prepared_results, strict=True
-        ):
-            for row in quarantine_rows:
-                store.quarantine(row, api_calls=self._api_calls(starting_api_calls))
-            if candidate.blueprint.blueprint_id in blueprint_ids:
-                candidate, extra_rows = self._prepare_slot(slot, frozenset(blueprint_ids))
-                for row in extra_rows:
-                    store.quarantine(row, api_calls=self._api_calls(starting_api_calls))
-            if candidate.blueprint.blueprint_id in blueprint_ids:
-                raise SynthesisError(
-                    f"Unable to find a unique Blueprint for synthesis slot {slot.index}."
-                )
-            blueprint_ids.add(candidate.blueprint.blueprint_id)
-            self._origin_usage[candidate.slot.origin] += 1
-            self._od_usage[(candidate.slot.origin, slot.destination)] += 1
-            prepared.append(candidate)
-
         remaining_budget = self.config.max_api_calls - starting_api_calls
         required_budget = (
-            0 if self.polisher is None else len(prepared) * self.polisher.max_attempts
+            0 if self.polisher is None else len(pending_slots) * self.polisher.max_attempts
         )
         if remaining_budget < required_budget:
             raise SynthesisError(
@@ -267,55 +256,265 @@ class SynthesisPipeline:
                 f"need {required_budget}, have {remaining_budget}."
             )
 
-        futures: dict[int, Future[dict[str, Any]]] = {}
-        with ThreadPoolExecutor(max_workers=self.config.llm_concurrency) as executor:
-            futures = {
-                candidate.slot.index: executor.submit(
-                    self._materialize_candidate,
-                    candidate,
+        started_at = time.monotonic()
+        start_event = "synthesis_resumed" if completed else "synthesis_started"
+        self._emit_progress(
+            store,
+            event=start_event,
+            requested=len(slots),
+            completed=len(completed),
+            pending=len(pending_slots),
+        )
+
+        def persist_candidate(
+            candidate: _PreparedCandidate, record: dict[str, Any]
+        ) -> None:
+            surface = record["surface"]
+            surface_id = str(surface["surface_id"])
+            normalized_query = _normalize_question(str(surface["public_query"]))
+            if surface_id in surface_ids:
+                raise SynthesisError(
+                    "Polished surface duplicates an excluded or accepted task."
                 )
-                for candidate in prepared
-            }
-            for candidate in prepared:
+            if normalized_query in normalized_queries:
+                raise SynthesisError(
+                    "Normalized Question duplicates an excluded or accepted task."
+                )
+            store.save_record(
+                candidate.slot.index,
+                record,
+                api_calls=self._api_calls(starting_api_calls),
+            )
+            surface_ids.add(surface_id)
+            normalized_queries.add(normalized_query)
+            task_ids.add(candidate.uid)
+            completed_count = len(store.completed_indices())
+            self._emit_progress(
+                store,
+                event="slot_completed",
+                slot_index=candidate.slot.index,
+                task_id=candidate.uid,
+                requested=len(slots),
+                completed=completed_count,
+                pending=len(slots) - completed_count,
+                percent=round(completed_count * 100 / len(slots), 2),
+                elapsed_seconds=round(time.monotonic() - started_at, 3),
+            )
+
+        def fail_candidate(candidate: _PreparedCandidate, error: Exception) -> None:
+            store.quarantine(
+                {
+                    "slot_index": candidate.slot.index,
+                    "candidate_attempt": candidate.candidate_attempt,
+                    "origin": candidate.slot.origin,
+                    "destination": candidate.slot.destination,
+                    "scenario_profile": candidate.slot.scenario_profile,
+                    "stage_error": f"{type(error).__name__}: {error}",
+                },
+                api_calls=self._api_calls(starting_api_calls),
+            )
+            self._emit_progress(
+                store,
+                event="slot_failed",
+                slot_index=candidate.slot.index,
+                task_id=candidate.uid,
+                requested=len(slots),
+                completed=len(store.completed_indices()),
+                error=f"{type(error).__name__}: {error}",
+            )
+
+        materialize_futures: dict[Future[dict[str, Any]], _PreparedCandidate] = {}
+        executor = (
+            ThreadPoolExecutor(max_workers=self.config.llm_concurrency)
+            if self.polisher is not None
+            else None
+        )
+        use_parallel_preparation = (
+            self._backend_is_default
+            and self.config.witness_concurrency > 1
+            and len(pending_slots) > 1
+        )
+        preparation_executor = (
+            ProcessPoolExecutor(
+                max_workers=min(self.config.witness_concurrency, len(pending_slots)),
+                initializer=_initialize_preparation_worker,
+                initargs=(self.config,),
+            )
+            if use_parallel_preparation
+            else None
+        )
+        preparation_futures: dict[
+            Future[tuple[_PreparedCandidate, list[dict[str, Any]]]], PilotSlot
+        ] = {}
+        failures: list[tuple[int, Exception]] = []
+        if preparation_executor is not None:
+            for slot in pending_slots:
+                self._emit_progress(
+                    store,
+                    event="slot_started",
+                    slot_index=slot.index,
+                    requested=len(slots),
+                    completed=len(store.completed_indices()),
+                )
+                preparation_futures[
+                    preparation_executor.submit(_prepare_slot_in_worker, slot)
+                ] = slot
+            preparation_items: Any = (
+                (preparation_futures[future], future)
+                for future in as_completed(tuple(preparation_futures))
+            )
+        else:
+            preparation_items = ((slot, None) for slot in pending_slots)
+        try:
+            for slot, preparation_future in preparation_items:
+                if preparation_future is None:
+                    self._emit_progress(
+                        store,
+                        event="slot_started",
+                        slot_index=slot.index,
+                        requested=len(slots),
+                        completed=len(store.completed_indices()),
+                    )
                 try:
-                    record = futures[candidate.slot.index].result()
-                    surface = record["surface"]
-                    surface_id = str(surface["surface_id"])
-                    normalized_query = _normalize_question(str(surface["public_query"]))
-                    if surface_id in surface_ids:
-                        raise SynthesisError(
-                            "Polished surface duplicates an excluded or accepted task."
+                    candidate, quarantine_rows = (
+                        self._prepare_slot(slot, frozenset(blueprint_ids))
+                        if preparation_future is None
+                        else preparation_future.result()
+                    )
+                    for row in quarantine_rows:
+                        store.quarantine(
+                            row, api_calls=self._api_calls(starting_api_calls)
                         )
-                    if normalized_query in normalized_queries:
+                    if candidate.blueprint.blueprint_id in blueprint_ids:
+                        candidate, extra_rows = self._prepare_slot(
+                            slot, frozenset(blueprint_ids)
+                        )
+                        for row in extra_rows:
+                            store.quarantine(
+                                row, api_calls=self._api_calls(starting_api_calls)
+                            )
+                    if candidate.blueprint.blueprint_id in blueprint_ids:
                         raise SynthesisError(
-                            "Normalized Question duplicates an excluded or accepted task."
+                            f"Unable to find a unique Blueprint for synthesis slot {slot.index}."
                         )
                 except (TravelWeaverError, ValueError) as error:
-                    store.quarantine(
-                        {
-                            "slot_index": candidate.slot.index,
-                            "candidate_attempt": candidate.candidate_attempt,
-                            "origin": candidate.slot.origin,
-                            "destination": candidate.slot.destination,
-                            "scenario_profile": candidate.slot.scenario_profile,
-                            "stage_error": f"{type(error).__name__}: {error}",
-                        },
-                        api_calls=self._api_calls(starting_api_calls),
+                    self._emit_progress(
+                        store,
+                        event="slot_failed",
+                        slot_index=slot.index,
+                        requested=len(slots),
+                        completed=len(store.completed_indices()),
+                        error=f"{type(error).__name__}: {error}",
                     )
-                    raise SynthesisError(
-                        f"Concurrent polish failed for slot {candidate.slot.index}: {error}"
-                    ) from error
-                store.save_record(
-                    candidate.slot.index,
-                    record,
-                    api_calls=self._api_calls(starting_api_calls),
+                    failures.append((slot.index, error))
+                    continue
+                blueprint_ids.add(candidate.blueprint.blueprint_id)
+                self._origin_usage[candidate.slot.origin] += 1
+                self._od_usage[
+                    (candidate.slot.origin, candidate.slot.destination)
+                ] += 1
+                if candidate.slot.destination != slot.destination:
+                    self._emit_progress(
+                        store,
+                        event="slot_replaced",
+                        slot_index=slot.index,
+                        requested_destination=slot.destination,
+                        replacement_destination=candidate.slot.destination,
+                        candidate_attempt=candidate.candidate_attempt,
+                        requested=len(slots),
+                        completed=len(store.completed_indices()),
+                    )
+                self._emit_progress(
+                    store,
+                    event="slot_prepared",
+                    slot_index=slot.index,
+                    task_id=candidate.uid,
+                    requested=len(slots),
+                    completed=len(store.completed_indices()),
                 )
-                surface_ids.add(surface_id)
-                normalized_queries.add(normalized_query)
-                task_ids.add(candidate.uid)
+                if executor is None:
+                    try:
+                        persist_candidate(
+                            candidate, self._materialize_candidate(candidate)
+                        )
+                    except (TravelWeaverError, ValueError) as error:
+                        fail_candidate(candidate, error)
+                        failures.append((slot.index, error))
+                        continue
+                else:
+                    future = executor.submit(self._materialize_candidate, candidate)
+                    materialize_futures[future] = candidate
+                    for completed_future in tuple(materialize_futures):
+                        if not completed_future.done():
+                            continue
+                        completed_candidate = materialize_futures.pop(completed_future)
+                        try:
+                            persist_candidate(
+                                completed_candidate, completed_future.result()
+                            )
+                        except (TravelWeaverError, ValueError) as error:
+                            fail_candidate(completed_candidate, error)
+                            failures.append((completed_candidate.slot.index, error))
+            for completed_future in as_completed(tuple(materialize_futures)):
+                candidate = materialize_futures[completed_future]
+                try:
+                    persist_candidate(candidate, completed_future.result())
+                except (TravelWeaverError, ValueError) as error:
+                    fail_candidate(candidate, error)
+                    failures.append((candidate.slot.index, error))
+            if failures:
+                detail = " | ".join(
+                    f"slot {index}: {type(error).__name__}: {error}"
+                    for index, error in failures[-5:]
+                )
+                raise SynthesisError(
+                    f"{len(failures)} synthesis slot(s) failed after all independent "
+                    f"results were persisted: {detail}"
+                )
+        except BaseException as error:
+            self._emit_progress(
+                store,
+                event=(
+                    "synthesis_interrupted"
+                    if isinstance(error, KeyboardInterrupt)
+                    else "synthesis_failed"
+                ),
+                requested=len(slots),
+                completed=len(store.completed_indices()),
+                pending=len(slots) - len(store.completed_indices()),
+                error=f"{type(error).__name__}: {error}",
+                elapsed_seconds=round(time.monotonic() - started_at, 3),
+            )
+            raise
+        finally:
+            if preparation_executor is not None:
+                preparation_executor.shutdown(wait=True, cancel_futures=True)
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
 
         api_calls = self._api_calls(starting_api_calls)
-        distributions = store.finalize(slots, api_calls=api_calls)
+        try:
+            distributions = store.finalize(slots, api_calls=api_calls)
+        except (TravelWeaverError, ValueError) as error:
+            self._emit_progress(
+                store,
+                event="finalization_failed",
+                requested=len(slots),
+                completed=len(store.completed_indices()),
+                pending=len(slots) - len(store.completed_indices()),
+                error=f"{type(error).__name__}: {error}",
+                elapsed_seconds=round(time.monotonic() - started_at, 3),
+            )
+            raise
+        self._emit_progress(
+            store,
+            event="synthesis_completed",
+            requested=len(slots),
+            completed=len(slots),
+            pending=0,
+            percent=100.0,
+            elapsed_seconds=round(time.monotonic() - started_at, 3),
+        )
         return SynthesisReport(
             output_dir=str(self.config.output_dir.resolve()),
             requested=self.config.count,
@@ -327,6 +526,15 @@ class SynthesisPipeline:
             distributions=distributions,
         )
 
+    def _emit_progress(
+        self,
+        store: ArtifactStore,
+        **event: Any,
+    ) -> None:
+        store.record_progress(event)
+        if self.progress is not None:
+            self.progress(dict(event))
+
     def _prepare_slot(
         self, slot: PilotSlot, blocked_blueprint_ids: frozenset[str]
     ) -> tuple[_PreparedCandidate, list[dict[str, Any]]]:
@@ -334,10 +542,13 @@ class SynthesisPipeline:
         uid = f"tw_syn_{uid_version}_{self.config.seed}_{slot.index:04d}"
         quarantine_rows: list[dict[str, Any]] = []
         errors: list[str] = []
-        for candidate_attempt, origin in enumerate(self._candidate_origins(slot), 1):
+        for candidate_attempt, (candidate_slot, origin) in enumerate(
+            self._candidate_slot_origins(slot), 1
+        ):
             try:
-                candidate = self._prepare_candidate(
-                    slot,
+                candidate = _prepare_candidate_with_deadline(
+                    self,
+                    candidate_slot,
                     uid=uid,
                     origin=origin,
                     candidate_attempt=candidate_attempt,
@@ -347,6 +558,23 @@ class SynthesisPipeline:
                         "Blueprint semantic hash duplicates an accepted task."
                     )
                 return candidate, quarantine_rows
+            except _CandidatePreparationTimeout:
+                message = (
+                    "SynthesisError: witness candidate exceeded "
+                    f"{MAX_WITNESS_CANDIDATE_SECONDS}s CPU deadline"
+                )
+                errors.append(message)
+                quarantine_rows.append(
+                    {
+                        "slot_index": slot.index,
+                        "candidate_attempt": candidate_attempt,
+                        "origin": origin,
+                        "destination": candidate_slot.destination,
+                        "requested_destination": slot.destination,
+                        "scenario_profile": candidate_slot.scenario_profile,
+                        "stage_error": message,
+                    }
+                )
             except (TravelWeaverError, ValueError) as error:
                 message = f"{type(error).__name__}: {error}"
                 errors.append(message)
@@ -355,8 +583,9 @@ class SynthesisPipeline:
                         "slot_index": slot.index,
                         "candidate_attempt": candidate_attempt,
                         "origin": origin,
-                        "destination": slot.destination,
-                        "scenario_profile": slot.scenario_profile,
+                        "destination": candidate_slot.destination,
+                        "requested_destination": slot.destination,
+                        "scenario_profile": candidate_slot.scenario_profile,
                         "stage_error": message,
                     }
                 )
@@ -417,7 +646,11 @@ class SynthesisPipeline:
             witness = WitnessBuilder(
                 scenario_backend,
                 seed=generation_seed,
-            ).build(effective_slot, origin=origin, uid=uid)
+            ).build(
+                effective_slot,
+                origin=origin,
+                uid=uid,
+            )
             preference_audit = None
         if effective_slot.synthesis_profile == OFFICIAL_HYBRID_V2_PROFILE:
             selected_ids = {
@@ -545,50 +778,69 @@ class SynthesisPipeline:
             preference_audit=preference_audit,
             polish_audit=list(polish_audit),
             candidate_attempt=candidate.candidate_attempt,
+            trajectory_policy=trajectory_policy(),
         )
 
     def _origins(self, slot: PilotSlot) -> tuple[str, ...]:
-        cities = [city for city in self.backend.supported_cities if city != slot.destination]
-        viable = [city for city in cities if self._has_usable_round_trip(slot, city)]
-        deterministic_rng(self.config.seed, "origin-fallbacks", slot.index).shuffle(viable)
-        if slot.synthesis_profile == OFFICIAL_HYBRID_V2_PROFILE:
-            return tuple(viable)
-        viable.sort(
-            key=lambda city: (
-                self._od_usage[(city, slot.destination)],
-                self._origin_usage[city],
-            )
+        # Catalog assignment already balances origins.  Trying that city first avoids
+        # the former O(slots*cities) round-trip pre-scan; failed cities naturally fall
+        # through to deterministic alternatives in _prepare_slot.
+        alternatives = [
+            city
+            for city in self.backend.supported_cities
+            if city not in {slot.destination, slot.origin}
+        ]
+        deterministic_rng(self.config.seed, "origin-fallbacks", slot.index).shuffle(
+            alternatives
         )
-        return tuple(viable)
+        return (slot.origin, *alternatives)
 
     def _candidate_origins(self, slot: PilotSlot) -> tuple[str, ...]:
-        """Repeat viable origins with distinct attempt seeds for deterministic refill."""
+        """Return every viable origin once in deterministic preference order."""
 
         origins = self._origins(slot)
-        if not origins:
-            return ()
-        return tuple(
-            origins[index % len(origins)]
-            for index in range(MAX_WITNESS_CANDIDATE_ATTEMPTS)
-        )
+        return tuple(dict.fromkeys(origin for origin in origins if origin != slot.destination))
 
-    def _has_usable_round_trip(self, slot: PilotSlot, origin: str) -> bool:
-        try:
-            outbound = self.backend.search_intercity_transport(
-                origin_city=origin,
-                destination_city=slot.destination,
-                mode=slot.outbound_mode,
+    def _candidate_slot_origins(
+        self, slot: PilotSlot
+    ) -> tuple[tuple[PilotSlot, str], ...]:
+        """Try the requested destination once per origin, then deterministic replacements.
+
+        Repeating the same low-feasibility destination with different random seeds created the
+        former 497/500 tail.  Destination replacements preserve the slot's task type, Scenario,
+        recipe, day count, and transport requirements; the progress audit records every change.
+        """
+
+        attempts: list[tuple[PilotSlot, str]] = [
+            (slot, origin) for origin in self._candidate_origins(slot)
+        ]
+        destinations = [
+            city for city in self.backend.supported_cities if city != slot.destination
+        ]
+        deterministic_rng(
+            self.config.seed, "destination-fallbacks", slot.index
+        ).shuffle(destinations)
+        replacement_origins = [
+            (
+                replace(slot, destination=destination),
+                self._candidate_origins(replace(slot, destination=destination)),
             )
-            returning = self.backend.search_intercity_transport(
-                origin_city=slot.destination,
-                destination_city=origin,
-                mode=slot.return_mode,
-            )
-        except BackendQueryError:
-            return False
-        return any(_same_day_outbound(item) for item in outbound) and any(
-            _same_day_return(item) for item in returning
-        )
+            for destination in destinations
+        ]
+        round_index = 0
+        while len(attempts) < MAX_WITNESS_CANDIDATE_ATTEMPTS:
+            added = False
+            for candidate_slot, origins in replacement_origins:
+                if round_index >= len(origins):
+                    continue
+                attempts.append((candidate_slot, origins[round_index]))
+                added = True
+                if len(attempts) == MAX_WITNESS_CANDIDATE_ATTEMPTS:
+                    break
+            if not added:
+                break
+            round_index += 1
+        return tuple(attempts)
 
     def _api_calls(self, starting_api_calls: int) -> int:
         return starting_api_calls + (0 if self.polisher is None else self.polisher.api_calls)
@@ -621,6 +873,11 @@ class SynthesisPipeline:
             else 6
         )
         for candidate_index in range(max_candidates):
+            vary_relaxed_long_trip_meal = (
+                preference_kind == "relaxed_itinerary"
+                and slot.days > 3
+                and bool(candidate_index % 2)
+            )
             attractions_per_day = (
                 2
                 if preference_kind in {"more_attractions", "relaxed_itinerary"}
@@ -634,6 +891,7 @@ class SynthesisPipeline:
                 include_meal=(
                     slot.include_meal
                     or preference_kind in {"less_innercity_time", "less_walking"}
+                    or vary_relaxed_long_trip_meal
                 ),
                 route_mode=route_modes[candidate_index % len(route_modes)],
             )
@@ -682,6 +940,35 @@ class SynthesisPipeline:
         return candidates
 
 
+def _initialize_preparation_worker(config: SynthesisConfig) -> None:
+    """Create one backend per worker and reuse it across independently seeded slots."""
+
+    global _PREPARATION_WORKER
+    worker_config = replace(
+        config,
+        canonical_only=True,
+        max_api_calls=0,
+    )
+    _PREPARATION_WORKER = SynthesisPipeline(
+        worker_config,
+        DeepSeekConfig(
+            api_key="offline-preparation",
+            model="deterministic-witness-preparation",
+            thinking="disabled",
+        ),
+        backend=ChinaTravelBackend(),
+        polisher=None,
+    )
+
+
+def _prepare_slot_in_worker(
+    slot: PilotSlot,
+) -> tuple[_PreparedCandidate, list[dict[str, Any]]]:
+    if not isinstance(_PREPARATION_WORKER, SynthesisPipeline):
+        raise RuntimeError("Synthesis preparation worker was not initialized.")
+    return _PREPARATION_WORKER._prepare_slot(slot, frozenset())
+
+
 def _clock_minutes(value: Any) -> int:
     if not isinstance(value, str) or ":" not in value:
         return -1
@@ -690,18 +977,6 @@ def _clock_minutes(value: Any) -> int:
     except ValueError:
         return -1
     return hours * 60 + minutes
-
-
-def _same_day_outbound(item: dict[str, Any]) -> bool:
-    departure = _clock_minutes(item.get("departure_time"))
-    arrival = _clock_minutes(item.get("arrival_time"))
-    return departure < arrival <= 14 * 60
-
-
-def _same_day_return(item: dict[str, Any]) -> bool:
-    departure = _clock_minutes(item.get("departure_time"))
-    arrival = _clock_minutes(item.get("arrival_time"))
-    return 14 * 60 <= departure < arrival
 
 
 _PREFERENCE_DIRECTIONS = {

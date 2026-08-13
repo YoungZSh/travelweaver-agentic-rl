@@ -148,7 +148,7 @@ TravelWeaver 应形成对应闭环：
 
 ## 5. TravelWeaverEnv 工具设计
 
-当前向 Agent 暴露 17 个 JSON Schema 工具，不暴露 Python lambda、`eval` 或任意代码执行。
+当前向 Agent 暴露 15 个 JSON Schema 工具，不暴露 Python lambda、`eval` 或任意代码执行。
 类别/菜系/酒店特色目录是受类型约束的真实数据查询，不是数据库 schema 探测。
 
 | 工具 | 作用 |
@@ -157,12 +157,10 @@ TravelWeaver 应形成对应闭环：
 | `search_attractions` | 按城市、类型、价格等条件搜索景点 |
 | `list_restaurant_cuisines` | 查询城市当前可用菜系 |
 | `search_restaurants` | 按城市、菜系、推荐菜和价格搜索餐厅 |
-| `search_restaurants_by_food` | 按推荐菜独立检索餐厅 |
 | `list_hotel_features` | 查询酒店特色和房型床位数 |
 | `search_hotels` | 按城市、房型、酒店特征和价格搜索酒店 |
 | `search_intercity_transport` | 查询城市间火车或航班 |
 | `search_nearby` | 查询某地点附近的景点、餐厅或酒店 |
-| `inspect_place` | 获取地点详情、开放时间、价格及其他证据 |
 | `check_place_open` | 核验地点在指定时刻是否开放 |
 | `get_route` | 查询步行、出租车或地铁路线 |
 | `next_page` | 获取当前结果的下一页 |
@@ -430,7 +428,7 @@ Baseline、SFT、GRPO 使用相同测试任务、环境快照、工具协议和 
 
 1. ChinaTravel 足以作为 TravelWeaver 的数据世界和验证器基础。
 2. 它不能原样充当训练环境，需要补齐状态机、typed tools、终止动作和逐 episode Reward。
-3. 当前 17 个语义化工具保留目录发现、按菜品搜索和详情核验等不同决策阶段，同时合并同语义的附近搜索；这比逐函数照搬底层接口更适合 Agent 训练。
+3. 当前 15 个语义化工具保留目录发现、条件搜索、营业核验、路线查询和候选管理等必要决策阶段；按菜品搜索已合入 `search_restaurants`，地点详情不再单独暴露，减少等价动作和无信息增益调用。
 4. 5K 严格通过的 SFT 轨迹加 5K GRPO prompt 是合理的目标规模。
 5. TravelWeaver 可以构建与 ShopSimulator 同级别的确定性 Reward，并拥有更丰富的时间、空间、预算和组合约束。
 6. 旅行任务不存在唯一正确计划，应采用基于属性和约束的验证，而不是匹配单一 oracle 行程。

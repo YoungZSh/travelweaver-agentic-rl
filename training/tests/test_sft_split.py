@@ -69,3 +69,9 @@ def test_split_records_rejects_duplicate_samples() -> None:
         assert "duplicate sample IDs" in str(error)
     else:
         raise AssertionError("Duplicate sample IDs must be rejected.")
+
+
+def test_split_supports_validation_and_test_holdout_names() -> None:
+    module = _load_split_module()
+
+    assert module.HOLDOUT_NAMES == ("validation", "test")

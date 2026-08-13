@@ -1,10 +1,15 @@
 # 4000 条 Question、官方兼容约束与 8:1:1 程序化 SFT 合并实施计划
 
+> 轨迹长度、工具覆盖和 teacher-family 策略已由
+> [`causal-graph-sft-v2.md`](causal-graph-sft-v2.md) 取代：新批次只生成 50 步以内的
+> `efficient_success` 轨迹，所有工具进入统一因果图，并采用全局连续调用上限 3，不再为
+> `next_page` 设置单独配额。本文保留题目分布、official-hybrid 约束和历史批次设计，不能再
+> 作为新 SFT 轨迹策略的唯一基线。
+
 ## 状态与目标
 
-本文是第一版 4000 条 Question/轨迹方案与后续 ChinaTravel 官方兼容方案的合并版本，作为
-本轮实现、合成和验收的唯一基线。既有约 875 条 Reward=1.0 的 DeepSeek 轨迹原样保留，
-不计入本轮 4000 条，也不重新调用 API。
+本文是第一版 4000 条 Question/轨迹方案与后续 ChinaTravel 官方兼容方案的合并版本。既有约
+875 条 Reward=1.0 的 DeepSeek 轨迹原样保留，不计入本轮 4000 条，也不重新调用 API。
 
 本轮分两阶段：
 
@@ -70,7 +75,8 @@ frozen Scenario
 
 DeepSeek 只润色自然语言，不得改变城市、实体、人数、天数、数字、约束方向或偏好。所有付费批量
 入口默认 256 并发；polisher 固定 thinking disabled。CPU witness 和程序化轨迹构造使用有界
-多线程，产物按槽位重新排序，保证并发不改变确定性结果。
+进程池，worker 只计算，主进程在每个槽位完成时立即原子写入恢复目录。中断后按稳定槽位跳过
+已有结果；整批 JSONL 只由逐槽位恢复点按槽位顺序派生，保证并发完成顺序不改变确定性结果。
 
 Question polisher 与轨迹决策说明 polisher 是两条独立链路。前者只处理用户题面；后者在完整
 程序化动作已经确定并回放成功后，为每个 assistant 工具回合润色可见的决策说明。不得用题面
@@ -155,15 +161,16 @@ witness 手工拼 observation。
 
 ### 工具语义与覆盖策略
 
-模型侧工具协议为 `travelweaver-tools-v4-agent`，共 17 个工具。相同返回契约的附近搜索继续
-合并为一个带 `category` 的类型化工具；语义不同的“目录发现 → 搜索 → 详情/营业核验”保持拆分，
-包括景点类别、餐厅菜系、按推荐菜搜索、酒店特色、详情和营业时间查询。JSON Schema 已承担参数
-发现职责，因此不恢复官方任意 `*_keys`/lambda 入口。
+模型侧工具协议为 `travelweaver-tools-v5-agent`，共 15 个工具。相同返回契约的附近搜索继续
+合并为一个带 `category` 的类型化工具；推荐菜统一通过 `search_restaurants.recommended_food`
+查询，完整地点证据在 `save_candidate` 时内部固化，不再向模型暴露重复的推荐菜和详情工具。
+JSON Schema 已承担参数发现职责，因此不恢复官方任意 `*_keys`/lambda 入口。
 
 `list_candidates` 放在证据阶段性完备后的复查点；`remove_candidate` 只用于真实的纠错支线：先查询
 并检查一个非 witness 备选，保存、列出比较后再删除，最终计划仍只引用 witness。分页、附近检索、
-目录查询和核验动作都必须来自模拟器真实结果，不为刷频次手工拼 observation。每批审计要求 17 个
-工具全部出现、全部具有至少一个监督目标，且每个工具至少调用批量规模的 10%（500 条时为 50 次）。
+目录查询和核验动作都必须来自模拟器真实结果，不为刷频次手工拼 observation。每批审计要求 15 个
+工具全部出现、全部具有至少一个监督目标。每个工具覆盖批量规模的 10%（500 条时为 50 条样本）
+作为审计建议；不足时报告 warning，但不阻塞产物，也不为达到比例强制插入调用。
 
 ### efficient_success
 
@@ -263,8 +270,9 @@ Blueprint/audit，不再出现在题面或 polisher request。B01 的 500 条题
 策略采用可见证据因果图：目录结果必须驱动下一次筛选；名称、菜品、ID、城际时间窗和删除候选的
 价格比较均只能来自当时的 user/工具上下文。审计中八项 grounding check 均通过，包含
 `search_nearby` 三种类别分布（景点 29、餐厅 63、酒店 14）和 90 条有清单价格依据的
-`remove_candidate`。17 个工具均出现且在至少 50 条监督样本中出现；最低调用数为
-`search_restaurants_by_food=86`，`remove_candidate=90`。500 条完整工具序列均不重复。
+`remove_candidate`。该段记录的是旧 v4/17 工具试验；v5 已移除重复的
+`search_restaurants_by_food` 与 `inspect_place`，正式批次按 15 个公开工具重新审计覆盖率。
+500 条完整工具序列均不重复。
 
 可见决策说明随后已按每条轨迹一次、256 并发的 DeepSeek 结构化调用完成润色。r17 最终版在
 24,372 回合中接受 18,669 条润色（76.60%），其余 5,703 条因严格 validator 自动回退模板；

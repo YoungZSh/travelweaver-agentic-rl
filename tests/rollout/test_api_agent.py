@@ -119,7 +119,7 @@ def test_api_agent_executes_model_tool_call_and_records_trajectory(env) -> None:
     assert run.termination_reason == "invalid_plan_submitted"
     assert run.step_count == 1
     assert run.usage["total_tokens"] == 110
-    assert len(completions.requests[0]["tools"]) == 17
+    assert len(completions.requests[0]["tools"]) == 15
     assert completions.requests[0]["tool_choice"] == "auto"
     assert completions.requests[0]["messages"][1] == {
         "role": "user",
@@ -150,7 +150,7 @@ def test_api_agent_executes_model_tool_call_and_records_trajectory(env) -> None:
     assert run.steps[0]["tool_call"]["id"] == "call-1"
     assert run.steps[0]["model_tool_response"] == terminal_payload
     assert "observation" in run.steps[0]["result"]
-    assert len(run.tools) == 17
+    assert len(run.tools) == 15
     persisted = run.to_dict(include_trajectory=True)
     assert persisted["trajectory_version"] == "travelweaver-trajectory-v9"
     assert persisted["user_content_format"] == "travelweaver-natural-query-v1"

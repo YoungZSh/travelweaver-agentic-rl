@@ -13,12 +13,13 @@ dist/
 .coverage
 htmlcov/
 
-# Local downloads and generated runtime artifacts.
+# Local datasets, downloads, and generated runtime artifacts.
 ckpts/
-data/downloads/
-data/trajectories/
-data/generated/
-data/sft/
+/data/
+/checkpoints/
+/logs/
+/ray_results/
+/wandb/
 
 # Hydra defaults when a launcher runs from the repository root.
 /outputs/

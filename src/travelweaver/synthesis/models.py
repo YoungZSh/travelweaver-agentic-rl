@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-GENERATOR_VERSION = "travelweaver-synthesis-v4"
-PROMPT_VERSION = "travelweaver-zh-polisher-v6"
-ARTIFACT_VERSION = "travelweaver-synthesis-artifacts-v6"
+GENERATOR_VERSION = "travelweaver-synthesis-v12"
+PROMPT_VERSION = "travelweaver-zh-polisher-v7"
+ARTIFACT_VERSION = "travelweaver-synthesis-artifacts-v10"
 WORLD_SNAPSHOT_VERSION = "chinatravel-pinned-v1"
 
 
@@ -35,11 +35,6 @@ class PilotSlot:
     persona_context: str | None = None
     metadata_prefix: str | None = None
     preference_kinds: tuple[str, ...] = ()
-
-    @property
-    def mixed_transport(self) -> bool:
-        return self.outbound_mode != self.return_mode
-
 
 @dataclass(frozen=True)
 class CanonicalTask:

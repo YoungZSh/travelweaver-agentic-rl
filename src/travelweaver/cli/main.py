@@ -45,6 +45,7 @@ from ..sft import (
     SFTSource,
     audit_programmatic_batch,
     build_programmatic_trajectories,
+    compare_rollout_batches,
     polish_programmatic_rationales,
     rebuild_sft_dataset,
     revalidate_programmatic_rationales,
@@ -97,10 +98,13 @@ def _smoke(args: argparse.Namespace) -> int:
     _print({"event": "step", "result": search.to_dict()})
     items = (search.observation.tool_result or {}).get("items", [])
     if items and not search.terminated and not search.truncated:
-        inspect = env.step(
-            {"tool": "inspect_place", "arguments": {"place_id": items[0]["place_id"]}}
+        open_check = env.step(
+            {
+                "tool": "check_place_open",
+                "arguments": {"place_id": items[0]["place_id"], "at_time": "12:00"},
+            }
         )
-        _print({"event": "step", "result": inspect.to_dict()})
+        _print({"event": "step", "result": open_check.to_dict()})
     env.close()
     return 0
 
@@ -218,6 +222,9 @@ def _synthesize_tasks(args: argparse.Namespace) -> int:
             canonical_only=args.canonical_only,
         ),
         llm_config,
+        progress=lambda payload: print(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True
+        ),
     ).run()
     _print(report.to_dict())
     return 0
@@ -243,6 +250,7 @@ def _repolish_tasks(args: argparse.Namespace) -> int:
             max_api_calls=args.max_api_calls,
             validation_policy=args.validation_policy,
             canonical_only=args.canonical_only,
+            allow_partial_input=args.allow_partial_input,
         ),
         llm_config,
     ).run()
@@ -261,6 +269,7 @@ def _rebuild_sft(args: argparse.Namespace) -> int:
             repair_surface_semantics=args.repair_surface_semantics,
             tool_response_mode=args.tool_response_mode,
             supervision_mode=args.supervision_mode,
+            require_official_commonsense=args.require_official_commonsense,
         )
     )
     _print(report.to_dict())
@@ -281,7 +290,11 @@ def _programmatic_sft(args: argparse.Namespace) -> int:
             audit_path=audit_path,
             seed=args.seed,
             concurrency=args.concurrency,
-        )
+            work_dir=Path(args.work_dir) if args.work_dir else None,
+        ),
+        progress=lambda payload: print(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True
+        ),
     )
     _print(report)
     return 0
@@ -357,6 +370,16 @@ def _audit_programmatic(args: argparse.Namespace) -> int:
     )
     _print(report)
     return 0 if report["accepted"] else 2
+
+
+def _compare_rollouts(args: argparse.Namespace) -> int:
+    report = compare_rollout_batches(
+        args.programmatic,
+        args.model,
+        output_path=args.output,
+    )
+    _print(report)
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -494,8 +517,8 @@ def build_parser() -> argparse.ArgumentParser:
     synthesize.add_argument(
         "--witness-concurrency",
         type=int,
-        default=min(8, os.cpu_count() or 1),
-        help="CPU concurrency for deterministic witness construction.",
+        default=min(32, os.cpu_count() or 1),
+        help="Process concurrency for deterministic witness construction.",
     )
     synthesize.add_argument(
         "--exclude-task-dir",
@@ -546,6 +569,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["strict", "minimal_semantic"],
         default="minimal_semantic",
     )
+    repolish.add_argument(
+        "--allow-partial-input",
+        action="store_true",
+        help="Explicitly repolish the records currently present in an incomplete source batch.",
+    )
     repolish.set_defaults(handler=_repolish_tasks)
 
     rebuild_sft = subparsers.add_parser(
@@ -562,6 +590,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rebuild_sft.add_argument("--output-dir", required=True)
     rebuild_sft.add_argument("--repair-surface-semantics", action="store_true")
+    rebuild_sft.add_argument(
+        "--require-official-commonsense",
+        action="store_true",
+        help="Only retain tasks that pass the complete official-audit.jsonl gate.",
+    )
     rebuild_sft.add_argument(
         "--supervision-mode",
         choices=SFT_SUPERVISION_MODES,
@@ -584,9 +617,21 @@ def build_parser() -> argparse.ArgumentParser:
     programmatic_sft.add_argument("--input-dir", required=True)
     programmatic_sft.add_argument("--output", required=True)
     programmatic_sft.add_argument("--audit")
+    programmatic_sft.add_argument(
+        "--work-dir",
+        help="Per-task recovery directory; defaults next to --output.",
+    )
     programmatic_sft.add_argument("--seed", type=int, default=20260821)
     programmatic_sft.add_argument(
         "--concurrency", type=int, default=min(32, os.cpu_count() or 1)
+    )
+    programmatic_sft.add_argument(
+        "--allow-undercovered-tools",
+        action="store_true",
+        help=(
+            "Deprecated compatibility flag; tool coverage below 10%% is always reported "
+            "as a warning and does not block output."
+        ),
     )
     programmatic_sft.set_defaults(handler=_programmatic_sft)
 
@@ -651,6 +696,15 @@ def build_parser() -> argparse.ArgumentParser:
     batch_audit.add_argument("--output")
     batch_audit.add_argument("--require-rationale-polish", action="store_true")
     batch_audit.set_defaults(handler=_audit_programmatic)
+
+    compare_rollouts = subparsers.add_parser(
+        "compare-rollout-batches",
+        help="Compare tool use and outcomes for two rollout strategies on identical tasks.",
+    )
+    compare_rollouts.add_argument("--programmatic", required=True)
+    compare_rollouts.add_argument("--model", required=True)
+    compare_rollouts.add_argument("--output")
+    compare_rollouts.set_defaults(handler=_compare_rollouts)
     return parser
 
 

@@ -30,6 +30,7 @@ class ArtifactStore:
         self.output_dir = Path(output_dir)
         self.records_dir = self.output_dir / "records"
         self.manifest_path = self.output_dir / "manifest.json"
+        self.progress_path = self.output_dir / "progress.jsonl"
         self.quarantine_path = self.output_dir / "quarantine.jsonl"
         self.config = dict(config)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -56,17 +57,32 @@ class ArtifactStore:
     def records(self) -> list[dict[str, Any]]:
         return [
             json.loads(path.read_text(encoding="utf-8"))
-            for path in sorted(self.records_dir.glob("*.json"))
+            for path in sorted(
+                self.records_dir.glob("*.json"), key=lambda path: int(path.stem)
+            )
         ]
 
     def save_record(self, index: int, record: dict[str, Any], *, api_calls: int) -> None:
-        path = self.records_dir / f"{index:03d}.json"
-        if path.exists():
+        if index in self.completed_indices():
             raise SynthesisError(f"Synthesis slot {index} already has a completed record.")
+        path = self.records_dir / f"{index:06d}.json"
         _atomic_json(path, record)
         self.manifest["completed"] = len(self.completed_indices())
         self.manifest["api_calls"] = api_calls
         self.manifest["updated_at"] = _now()
+        _atomic_json(self.manifest_path, self.manifest)
+
+    def record_progress(self, event: dict[str, Any]) -> None:
+        """Append an inspectable event and expose the latest progress in the manifest."""
+
+        payload = {**event, "timestamp": _now()}
+        with self.progress_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        self.manifest["completed"] = len(self.completed_indices())
+        self.manifest["last_event"] = payload
+        self.manifest["updated_at"] = payload["timestamp"]
         _atomic_json(self.manifest_path, self.manifest)
 
     def quarantine(self, row: dict[str, Any], *, api_calls: int) -> None:
@@ -213,6 +229,11 @@ class ArtifactStore:
                     "Output directory belongs to a different synthesis configuration; "
                     "choose a new directory or restore the matching arguments."
                 )
+            completed = len(self.completed_indices())
+            if manifest.get("completed") != completed:
+                manifest["completed"] = completed
+                manifest["updated_at"] = _now()
+                _atomic_json(self.manifest_path, manifest)
             return manifest
         manifest = {
             "artifact_version": ARTIFACT_VERSION,
@@ -240,6 +261,7 @@ def record_bundle(
     preference_audit: dict[str, Any] | None,
     polish_audit: list[dict[str, Any]],
     candidate_attempt: int,
+    trajectory_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "slot": asdict(slot),
@@ -251,6 +273,7 @@ def record_bundle(
         "preference_audit": preference_audit,
         "polish_audit": polish_audit,
         "candidate_attempt": candidate_attempt,
+        "trajectory_policy": trajectory_policy,
     }
 
 
@@ -300,6 +323,13 @@ def _preview(records: list[dict[str, Any]]) -> str:
 def _distributions(
     slots: tuple[PilotSlot, ...], records: list[dict[str, Any]]
 ) -> dict[str, Any]:
+    requested_destinations = {slot.index: slot.destination for slot in slots}
+    destination_replacements = Counter(
+        f"{requested_destinations[int(row['slot']['index'])]}->{row['slot']['destination']}"
+        for row in records
+        if str(row["slot"]["destination"])
+        != requested_destinations[int(row["slot"]["index"])]
+    )
     recipe_families = Counter(key for slot in slots for key in slot.recipe)
     recipe_pairs = Counter(
         f"{left}+{right}"
@@ -307,13 +337,29 @@ def _distributions(
         for left_index, left in enumerate(sorted(slot.recipe))
         for right in sorted(slot.recipe)[left_index + 1 :]
     )
+    logic_keys = {
+        "attraction_categories_all",
+        "attraction_categories_any",
+        "exclude_attraction",
+        "allowed_innercity_modes",
+    }
+    logic_shapes = Counter(
+        next((key for key in slot.recipe if key in logic_keys), "ordinary")
+        for slot in slots
+    )
     return {
         "count": len(slots),
         "task_types": dict(sorted(Counter(slot.task_type for slot in slots).items())),
         "origins": dict(
             sorted(Counter(str(row["slot"]["origin"]) for row in records).items())
         ),
-        "destinations": dict(sorted(Counter(slot.destination for slot in slots).items())),
+        "destinations": dict(
+            sorted(Counter(str(row["slot"]["destination"]) for row in records).items())
+        ),
+        "destination_replacements": {
+            "count": sum(destination_replacements.values()),
+            "pairs": dict(sorted(destination_replacements.items())),
+        },
         "directed_od_pairs": len(
             {
                 (str(row["slot"]["origin"]), str(row["slot"]["destination"]))
@@ -367,6 +413,7 @@ def _distributions(
         ),
         "constraint_recipes": dict(sorted(recipe_families.items())),
         "constraint_recipe_pairs": dict(sorted(recipe_pairs.items())),
+        "logic_shapes": dict(sorted(logic_shapes.items())),
         "unique_recipe_signatures": len({tuple(sorted(slot.recipe)) for slot in slots}),
         "unique_blueprints": len(
             {row["blueprint"]["blueprint_id"] for row in records}

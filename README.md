@@ -1,7 +1,7 @@
 # TravelWeaver
 
 TravelWeaver is a deterministic, replayable environment for training long-horizon
-travel-planning agents. The first milestone exposes 13 JSON tools over a pinned
+travel-planning agents. The current environment exposes 15 JSON tools over a pinned
 [ChinaTravel](https://github.com/LAMDA-NeSy/ChinaTravel) snapshot and implements the
 complete in-process query → candidate → plan submission episode lifecycle.
 
@@ -17,9 +17,10 @@ uv run travelweaver run-agent --task-id e20241028160248698752
 uv run pytest
 ```
 
-The ChinaTravel database is not redistributed by this repository. The bootstrap command
-can download the official Google Drive folder, import a local archive, or verify an
-existing manual installation.
+The ChinaTravel database and imported task snapshots are not redistributed by this repository.
+The bootstrap command can download the official Google Drive folder, import a local archive, or
+verify an existing manual installation; `import-tasks` recreates the ignored `data/tasks/`
+snapshots from the pinned upstream revision.
 
 See [the MVP guide](docs/travelweaver-env-mvp.md), the frozen
 [Reward and evaluation contract](docs/reward-and-evaluation.md), and the broader
@@ -28,10 +29,10 @@ See [the MVP guide](docs/travelweaver-env-mvp.md), the frozen
 ## Version baseline
 
 - Python: `3.10.19`
-- Environment protocol: `travelweaver-environment-v0.5`
-- Tool protocol: `travelweaver-tools-v4-agent`
-- TaskSpec / Reward: `travelweaver-task-spec-v2` / `travelweaver-reward-v2`
-- Trajectory / model response: `travelweaver-trajectory-v8` /
+- Environment protocol: `travelweaver-environment-v0.6`
+- Tool protocol: `travelweaver-tools-v5-agent`
+- TaskSpec / Reward: `travelweaver-task-spec-v3` / `travelweaver-reward-v3`
+- Trajectory / model response: `travelweaver-trajectory-v9` /
   `travelweaver-model-tool-response-v3`
 - RL training stack: pinned `verl==0.9.0.dev0` in the separate `training/` Linux/CUDA environment
 
@@ -92,12 +93,12 @@ uv run travelweaver rollout-api --task-id e20241028160248698752
 The command loads `.env`, calls the official OpenAI-compatible DeepSeek API, and appends
 the full replayable record to `data/trajectories/deepseek-v4-flash.jsonl`. The rollout
 runner itself is provider-neutral: DeepSeek is currently a configuration preset over the
-shared OpenAI-compatible function-calling client. Each `travelweaver-trajectory-v8`
+shared OpenAI-compatible function-calling client. Each `travelweaver-trajectory-v9`
 record contains canonical `messages`, `tools`, executed `steps`, terminal Reward details,
 RFT acceptance, and a separate audit event stream. Local dotenv files and generated
 trajectories are ignored by Git.
 
-Trajectory v8 canonicalizes malformed or non-object function arguments to `{}` in model history
+Trajectory v9 canonicalizes malformed or non-object function arguments to `{}` in model history
 while retaining the raw model output in the audit stream. The environment still returns an invalid
 tool response, allowing the next model turn to recover without resending malformed JSON to an
 OpenAI-compatible endpoint.
@@ -169,7 +170,10 @@ uv run travelweaver synthesize-tasks \
 
 To preserve the accepted Blueprints and witnesses while rerunning only the LLM surface
 rewrites, use the concurrent repolish command. It defaults to 256 simultaneous requests
-and writes every accepted or rejected raw tool response to `polish-audit.jsonl`:
+and writes every completed slot immediately so the same command can resume after an
+interruption. Complete source batches are required by default; `--allow-partial-input`
+must be explicit for an incomplete audit batch. Accepted or rejected raw tool responses
+are retained in `polish-audit.jsonl`:
 
 ```bash
 uv run travelweaver repolish-tasks \

@@ -41,8 +41,6 @@ CANDIDATE_PURPOSES = [
     "hotel",
     "outbound_transport",
     "return_transport",
-    "route_anchor",
-    "other",
 ]
 
 ACTIVITY = _object(
@@ -168,23 +166,6 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     {
         "type": "function",
         "function": {
-            "name": "search_restaurants_by_food",
-            "description": "按推荐菜名查找餐厅，对应 ChinaTravel 的推荐菜专用查询。",
-            "parameters": _object(
-                {
-                    "city": CITY,
-                    "food": {"type": "string", "minLength": 1},
-                    "min_price": PRICE,
-                    "max_price": PRICE,
-                    "sort_by": SORT,
-                },
-                ["city", "food"],
-            ),
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "list_hotel_features",
             "description": "列出指定城市当前可用的酒店特色和房型床位数。",
             "parameters": _object({"city": CITY}, ["city"]),
@@ -252,14 +233,6 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     {
         "type": "function",
         "function": {
-            "name": "inspect_place",
-            "description": "查看当前轨迹已见地点的完整快照证据。",
-            "parameters": _object({"place_id": {"type": "string", "minLength": 1}}, ["place_id"]),
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "check_place_open",
             "description": "检查当前轨迹已见景点或餐厅在指定时间是否开放。",
             "parameters": _object(
@@ -304,7 +277,6 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
                 {
                     "entity_id": {"type": "string", "minLength": 1},
                     "purpose": {"type": "string", "enum": CANDIDATE_PURPOSES},
-                    "note": {"type": "string", "maxLength": 500},
                 },
                 ["entity_id", "purpose"],
             ),
@@ -338,6 +310,36 @@ _TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     },
 )
 
+# Hidden compatibility aliases allow archived v4 trajectories to replay without
+# advertising redundant tools to newly trained or evaluated agents.
+_LEGACY_PARAMETER_SCHEMAS = {
+    "search_restaurants_by_food": _object(
+        {
+            "city": CITY,
+            "food": {"type": "string", "minLength": 1},
+            "min_price": PRICE,
+            "max_price": PRICE,
+            "sort_by": SORT,
+        },
+        ["city", "food"],
+    ),
+    "inspect_place": _object(
+        {"place_id": {"type": "string", "minLength": 1}},
+        ["place_id"],
+    ),
+    "save_candidate": _object(
+        {
+            "entity_id": {"type": "string", "minLength": 1},
+            "purpose": {
+                "type": "string",
+                "enum": [*CANDIDATE_PURPOSES, "route_anchor", "other"],
+            },
+            "note": {"type": "string", "maxLength": 500},
+        },
+        ["entity_id", "purpose"],
+    ),
+}
+
 
 def tool_schemas() -> list[dict[str, Any]]:
     """Return a defensive copy suitable for model tool registration."""
@@ -346,8 +348,12 @@ def tool_schemas() -> list[dict[str, Any]]:
 
 
 def parameter_schema(name: str) -> dict[str, Any] | None:
+    # Execution accepts the wider archived save_candidate shape while the model-visible
+    # v5 schema deliberately omits its unused note and legacy purposes.
+    if name == "save_candidate":
+        return _LEGACY_PARAMETER_SCHEMAS[name]
     for schema in _TOOL_SCHEMAS:
         function = schema["function"]
         if function["name"] == name:
             return function["parameters"]
-    return None
+    return _LEGACY_PARAMETER_SCHEMAS.get(name)

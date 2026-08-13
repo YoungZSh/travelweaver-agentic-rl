@@ -38,6 +38,11 @@ split 或 task ID。无法确定性验证的主观要求只进入离线 LLM Judg
 `outbound`、`return` 或 `all`。这使得去程火车/返程飞机等混合组合可以独立
 评分；旧 v1 数据缺省按 `all` 解释。市内交通只允许 `leg=all`。
 
+`travelweaver-task-spec-v3` 将机场和火车站的接驳路线排除在
+`scope=innercity_route` 之外。题面中的“市内地点之间步行”等约束只检查景点、餐厅、
+酒店等本地实体之间的路线；到达后的首段接驳和返程前的末段接驳可以使用出租车或地铁。
+v1/v2 快照继续使用包含接驳路线的旧语义，不按 v3 静默重解释。
+
 自由文本通过 OpenAI-compatible function calling 编译为 `TaskSpecDraft`。编译器最多
 尝试两次，随后执行 JSON Schema、字段范围、实体绑定、可支持性和基本可满足性验证。
 未通过验证的任务进入隔离区，不参与 RFT/SFT 或 GRPO。ChinaTravel 的已有约束使用
@@ -65,7 +70,7 @@ split 或 task ID。无法确定性验证的主观要求只进入离线 LLM Judg
 模型提交错误、伪造 ID 或缺少必需引用属于有效负样本；环境数据损坏、规格不受支持或
 验证器异常属于基础设施问题，返回 `reward_valid=false`。
 
-## 4. TravelReward v1
+## 4. TravelReward v3
 
 每个检查返回 `pass`、`fail` 或 `unverifiable`。硬检查分为两类：
 

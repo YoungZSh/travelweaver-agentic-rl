@@ -20,10 +20,10 @@ function-calling rollout、通用 TravelTaskSpec、终局 TravelReward 和严格
 - Python `3.10.19`，项目约束 `>=3.10,<3.11`；
 - ChinaTravel submodule commit `456b60a28ce0626875a968666c07094e3c90520e`；
 - 训练使用独立 Linux/CUDA 环境和固定 commit 的 `verl==0.9.0.dev`；
-- 环境、Observation、工具协议分别为 `travelweaver-environment-v0.5`、
-  `travelweaver-observation-v4`、`travelweaver-tools-v4-agent`；
-- TaskSpec、Reward 和轨迹协议分别为 `travelweaver-task-spec-v2`、
-  `travelweaver-reward-v2`、`travelweaver-trajectory-v8`；模型可见工具返回协议为
+- 环境、Observation、工具协议分别为 `travelweaver-environment-v0.6`、
+  `travelweaver-observation-v4`、`travelweaver-tools-v5-agent`；
+- TaskSpec、Reward 和轨迹协议分别为 `travelweaver-task-spec-v3`、
+  `travelweaver-reward-v3`、`travelweaver-trajectory-v9`；模型可见工具返回协议为
   `travelweaver-model-tool-response-v3`。
 
 ## 2. 安装与数据准备
@@ -97,12 +97,10 @@ env.close()
 | `search_attractions` | 搜索景点及开放时间、票价、建议游玩时长 |
 | `list_restaurant_cuisines` | 列出指定城市在当前 Scenario 中真实可用的餐厅菜系 |
 | `search_restaurants` | 搜索餐厅、菜系、推荐菜、营业时间和人均价格 |
-| `search_restaurants_by_food` | 按推荐菜名查询餐厅，保留官方菜品检索的独立语义 |
 | `list_hotel_features` | 列出指定城市真实可用的酒店特色和房型床位数 |
 | `search_hotels` | 搜索酒店特色、床位数和价格 |
 | `search_intercity_transport` | 查询火车或航班快照 |
 | `search_nearby` | 在已见地点附近按类别搜索 |
-| `inspect_place` | 查看已见地点的完整规范化证据 |
 | `check_place_open` | 核验已见景点或餐厅在给定时刻是否开放 |
 | `get_route` | 查询两个同城已见地点的步行、出租车或地铁路线 |
 | `next_page` | 使用一次性 cursor 获取下一页 |
@@ -111,7 +109,14 @@ env.close()
 | `remove_candidate` | 删除候选 |
 | `submit_plan` | 提交引用已保存候选的结构化多日行程并终止 |
 
-每页默认 10 条。Cursor 与 episode、查询和偏移绑定，使用一次后失效，不能跨轨迹复用。`inspect_place`、`search_nearby`、`get_route` 只接受本 episode 已经展示过的 `place_id`；`save_candidate` 也只能保存本 episode 已见的地点或交通 ID。
+每页默认 10 条。Cursor 与 episode、查询和偏移绑定，使用一次后失效，不能跨轨迹复用。
+`search_nearby`、`check_place_open`、`get_route` 只接受本 episode 已经展示过的 `place_id`；
+`save_candidate` 也只能保存本 episode 已见的地点或交通 ID。推荐菜查询统一使用
+`search_restaurants.recommended_food`；地点完整快照由 `save_candidate` 在内部固化，不再暴露
+独立详情工具。`purpose` 在保存时不改变搜索或候选生成；提交时环境才校验它与活动用途一致：
+景点使用 `attraction`，餐厅用餐使用 `meal`，住宿使用 `hotel`，往返交通分别使用
+`outbound_transport` 和 `return_transport`。酒店作为免费早餐地点时允许复用 `hotel` 候选，
+避免同一实体因候选按 ID 去重而无法同时承担住宿和早餐。
 
 `get_route` 返回 episode 内登记的稳定 `route_id`。同一天相邻同城地点活动必须在后一
 活动的 `route_from_previous_id` 中引用该路线；城际活动时间必须与车次/航班证据一致。
@@ -152,7 +157,7 @@ uv run travelweaver smoke-env --task-id e20241028160248698752
 uv run travelweaver run-agent --task-id e20241028160248698752
 ```
 
-`smoke-env` 检查真实查询，`run-agent` 使用只调用公开工具的确定性策略跑通查询、候选管理和计划提交，并输出终局方案。测试套件覆盖全部 17 个工具、稳定 ID、过滤排序、无结果、分页、候选隔离、提交校验、单次最终提交、跨 episode 越权、连续非法动作、动作上限、任务 public/oracle 隔离和数据库清单。
+`smoke-env` 检查真实查询，`run-agent` 使用只调用公开工具的确定性策略跑通查询、候选管理和计划提交，并输出终局方案。测试套件覆盖全部 15 个公开工具、稳定 ID、过滤排序、无结果、分页、候选隔离、提交校验、单次最终提交、跨 episode 越权、连续非法动作、动作上限、任务 public/oracle 隔离和数据库清单。
 
 使用官方 DeepSeek API 运行一条真实模型轨迹：
 
@@ -163,14 +168,14 @@ cp .env.example .env
 uv run travelweaver rollout-api --task-id e20241028160248698752
 ```
 
-默认模型为 `deepseek-v4-flash`，完整轨迹按 `travelweaver-trajectory-v6` 写入
+默认模型为 `deepseek-v4-flash`，完整轨迹按 `travelweaver-trajectory-v9` 写入
 `data/trajectories/deepseek-v4-flash.jsonl`。轨迹以标准 OpenAI-compatible
 `messages + tools` 作为可重放对话，同时独立保存已执行 `steps`、审计事件、终止状态
 和 token usage，但不会包含 API key。每个 assistant 回合只执行一个工具；若模型返回
 并行调用，规范化消息只保留第一个，其余调用只进入审计事件，避免出现未响应的
 `tool_call_id`。
 
-V6 对 malformed 或解析后非 object 的 function arguments 使用可恢复历史：原始坏字符串写入
+V9 对 malformed 或解析后非 object 的 function arguments 使用可恢复历史：原始坏字符串写入
 `tool_argument_normalization` 审计事件和 step 的 `raw_tool_call`，实际环境动作与下一轮模型历史
 统一规范为 `{}`。该动作仍会得到 invalid tool response，模型可以在下一轮修正，同时避免把坏
 JSON 原样发回 OpenAI-compatible 服务而触发 HTTP 400。

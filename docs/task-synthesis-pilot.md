@@ -71,8 +71,8 @@ Scenario 是环境状态，不是用户约束，因此不会在 query 或公开�
 | 文案风格 | 10 种开头、组织顺序和语气各 10 条 |
 
 约束组合使用家族频次和两两共现次数共同做贪心均衡，避免“人数等于约束数”等取模相关性。
-实际起点会先过滤没有可用同日往返的 OD，再按已使用的 OD 和起点次数均衡。苏州没有
-航班的快照事实也在分配时保留。
+实际起点由目录层先做均衡；witness 优先尝试目录起点，失败时再使用确定性的候选城市，
+避免每个槽位先扫描所有 OD。苏州没有航班的快照事实也在分配时保留。
 
 行程有 1 或 2 个景点/天，部分任务加入邻近餐食。4–5 天任务固定为 1 个景点/天，避免
 超过 Agent 的步骤预算。市内路线使用空间聚类和硬边界：步行单段不超过 2 km，出租车
@@ -134,6 +134,7 @@ Blueprint 或 OD。默认全局上限 300 次 API 调用。最终 query 必须�
 - 起终城市、天数、人数、实体名、预算和时间等 protected literals 逐字保留；
 - 不新增城市、数字、额外偏好或否定要求；
 - 上下限、去返程、确定值和包含语义不变；
+- 多值组内的“且/分别”、`any_of` 组间的“或”以及 `not_in/exclude` 的否定范围不变；
 - 餐厅预算必须同时明确至少安排一顿用餐，市内交通方式必须同时明确至少安排两个市内地点，
   避免约束因没有对应餐厅或路线而被架空；
 - 每个 `constraint_id` 恰好有一个可唯一定位且不重叠的 mention。
@@ -151,11 +152,14 @@ uv run travelweaver synthesize-tasks \
 
 输出目录包含：
 
-- `manifest.json`：配置、版本、分布、API/token 用量和完成状态；
+- `manifest.json`：配置、版本、API 用量、已完成槽位数和最近一条实时进度事件；
+- `progress.jsonl`：追加式记录 `slot_started`、`slot_prepared`、`slot_completed`、失败、
+  中断、恢复和最终完成事件；
 - `blueprints.jsonl`、`surfaces.jsonl`、`scenarios.jsonl`：三层权威产物；
 - `tasks.public.jsonl` 与 `tasks.oracle.jsonl`：公开任务和隐藏 TaskSpec/Scenario；
 - `witnesses.jsonl`：计划、快照、证据和最终 Reward 明细；
 - `diversity.json`：OD、天数、人数、路线、Scenario 和约束共现统计；
+  其中 `destination_replacements` 单独记录不可行原目的地的确定性补位数量与方向；
 - `alignment.json`：profile 配额、硬 Reward、去重、benchmark 原句复用和 Human 文案验收；
 - `preference-audit.jsonl`：Preference-like 多 witness 选优审计；
 - `polish-audit.jsonl`：每次 LM tool call 的请求、原始响应、解析 payload、验收结果和
@@ -163,11 +167,29 @@ uv run travelweaver synthesize-tasks \
 - `preview-*.md`：按任务类型输出的分类预览；
 - `quarantine.jsonl`：候选失败阶段和脱敏错误；
 - `preview.md`：所有 query 的可读预览；
-- `records/`：按 slot 原子写入的恢复点。
+- `records/`：每个槽位在 witness、题面和最终 Reward 全部通过后立即原子写入的恢复点。
 
-相同输出目录只能用完全一致的配置续跑，不同配置会拒绝覆盖。`.env`、API key 和模型
+生成过程中以 `records/` 为恢复真相源，不等待整批 witness 全部完成。进程中断后用完全相同的
+命令和输出目录重跑，会跳过已有记录并从未完成槽位继续；最终的 `tasks.*.jsonl`、
+`witnesses.jsonl` 和统计文件在全部槽位完成后按 slot 顺序汇总。相同输出目录只能用完全一致的
+配置续跑，不同配置会拒绝覆盖。`.env`、API key 和模型
 reasoning 不写入产物；为分析 validator 误杀，surface polisher 的原始 tool response 会写入
 本地 `polish-audit.jsonl`。`data/generated/` 默认被 Git 忽略。
+
+默认 backend 使用 `--witness-concurrency` 个独立进程并行准备槽位，每个进程复用一个
+backend；主进程仍是唯一写入者，因此完成一条就立即形成恢复点。注入自定义 backend 的测试
+保持串行，避免把不可序列化状态传入子进程。兼容 TaskSpec v2 的逻辑采样规则见
+[DSL 多样性 V1](dsl-diversity-v1.md)。
+
+worker 对原目的地只尝试一轮互异 origin；若目的地与时刻、步行聚类或公开可见性组合
+结构性不可行，剩余尝试会转向 seed 派生的替代目的地。替换保持该槽位的任务类型、Scenario、
+约束配方和难度维度，并写入 `slot_replaced`。任何单槽位失败都不会提前取消同批其他结果；
+全部独立 future 收集并持久化后才汇总失败。
+
+程序化 ReAct 轨迹合成遵循相同约束，并把两阶段中间结果分别写入
+`<output-stem>.work/capabilities/` 和 `<output-stem>.work/records/`。能力分析或轨迹构造任一条
+完成后都会由主进程立即落盘；恢复时只调度缺失槽位，不会重新启动已完成批次的 CPU worker。
+DeepSeek 润色和模型 rollout 是网络 I/O，并继续使用线程并发及各自的逐任务恢复目录。
 
 如果只需要重跑自然语言 surface，而不改变 Blueprint、Scenario、witness 和硬 Reward，使用：
 
@@ -183,6 +205,11 @@ uv run travelweaver repolish-tasks \
 `minimal_semantic` 是默认策略：会把不会造成 query 与隐藏 TaskSpec 矛盾的问题记录为
 `validation_warnings`，只有关键事实改变或硬约束弱化才重试。需要复现实验早期的逐字校验时，
 可显式传入 `--validation-policy strict`。
+
+`repolish-tasks` 默认只接受 `status=complete` 且 records 数量等于源 manifest `count` 的批次；
+确需抽查未完成批次时必须显式使用 `--allow-partial-input`。每条润色结果在 future 完成后立即
+原子写入 `records/` 并追加 `progress.jsonl`，中断后使用相同命令和输出目录只会重跑缺失
+槽位。单条失败进入 `quarantine.jsonl`，不会丢弃同批其他已经成功、已经产生 API 成本的结果。
 
 混合覆盖版本的标准命令为：
 

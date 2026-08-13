@@ -161,6 +161,36 @@ def _constraint(
             {"values": [category]},
             "attraction",
         )
+    if key == "attraction_categories_all":
+        categories = list(
+            dict.fromkeys(
+                _required_text(item, "category")
+                for item in selected["attractions"]
+            )
+        )
+        if len(categories) < 2:
+            raise SynthesisError(
+                "Multi-category attraction constraint needs two witness categories."
+            )
+        return _build(
+            constraint_id,
+            "entity_category",
+            "contains",
+            {"values": categories[:2]},
+            "attraction",
+        )
+    if key == "attraction_categories_any":
+        actual = _required_text(selected["attractions"][0], "category")
+        alternative = _required_logic_text(witness, "alternative_attraction_category")
+        if alternative == actual:
+            raise SynthesisError("Attraction category alternatives must differ.")
+        return _build(
+            constraint_id,
+            "entity_category",
+            "contains",
+            {"any_of": [[actual], [alternative]]},
+            "attraction",
+        )
     if key == "include_attraction":
         name = _required_text(selected["attractions"][0], "name")
         return _build(
@@ -169,6 +199,26 @@ def _constraint(
             "include",
             {"names": [name]},
             "attraction",
+        )
+    if key == "exclude_attraction":
+        name = _required_logic_text(witness, "excluded_attraction_name")
+        return _build(
+            constraint_id,
+            "exclude_entity",
+            "exclude",
+            {"names": [name]},
+            "attraction",
+        )
+    if key == "allowed_innercity_modes":
+        forbidden = next(
+            mode for mode in ("walk", "metro", "taxi") if mode != witness.route_mode
+        )
+        return _build(
+            constraint_id,
+            "transport_mode",
+            "not_in",
+            {"modes": [forbidden], "leg": "all"},
+            "innercity_route",
         )
     if key == "attraction_count":
         return _build(
@@ -188,9 +238,10 @@ def _constraint(
             "restaurant",
         )
     if key == "restaurant_budget":
-        restaurant = _required_entity(selected, "restaurant")
+        _required_entity(selected, "restaurant")
+        actual = _category_actual(witness, "restaurant")
         amount = _upper_bound(
-            restaurant["price"],
+            actual,
             quantum=10,
             factor=_budget_factor(slot.tightness),
         )
@@ -333,16 +384,35 @@ def _required_text(entity: Mapping[str, Any], key: str) -> str:
     return value.strip()
 
 
+def _required_logic_text(witness: WitnessResult, key: str) -> str:
+    logic = witness.selected.get("logic")
+    if not isinstance(logic, Mapping):
+        raise SynthesisError("Witness is missing logic-diversity evidence.")
+    value = logic.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise SynthesisError(f"Witness has no usable logic-diversity value for {key}.")
+    return value.strip()
+
+
 def _category_actual(witness: WitnessResult, activity_type: str) -> float:
+    scoped_types = (
+        {"breakfast", "lunch", "dinner"}
+        if activity_type == "restaurant"
+        else {activity_type}
+    )
     items = [
         item
         for item in witness.evidence_bundle["cost_items"]
-        if item.get("activity_type") == activity_type
+        if item.get("activity_type") in scoped_types
     ]
     amounts = [float(item["amount"]) for item in items]
-    nights = max(1, int(witness.public_task["days"]) - 1)
     travelers = int(witness.public_task["people_number"])
-    return sum(amounts) / travelers / nights
+    divisor = (
+        len(items)
+        if activity_type == "restaurant"
+        else max(1, int(witness.public_task["days"]) - 1)
+    )
+    return sum(amounts) / travelers / divisor
 
 
 def _upper_bound(value: Any, *, quantum: int, factor: float) -> int:

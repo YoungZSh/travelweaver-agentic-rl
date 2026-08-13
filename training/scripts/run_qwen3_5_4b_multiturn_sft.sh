@@ -382,7 +382,9 @@ training/.venv/bin/torchrun --standalone --nnodes=1 --nproc-per-node="${NUM_GPUS
 # Publish a stable path to the final Hugging Face export after successful training.
 TRACKER_FILE="${CHECKPOINT_DIR}/latest_checkpointed_iteration.txt"
 if [[ -f "${TRACKER_FILE}" ]]; then
-    read -r FINAL_STEP < "${TRACKER_FILE}"
+    # veRL writes this tracker without a trailing newline. `read` therefore returns status 1 and,
+    # under `set -e`, used to skip publishing final-model even after a successful checkpoint.
+    FINAL_STEP="$(<"${TRACKER_FILE}")"
     FINAL_HF_DIR="${CHECKPOINT_DIR}/global_step_${FINAL_STEP}/huggingface"
     if [[ -d "${FINAL_HF_DIR}" ]]; then
         ln -sfnT "checkpoints/global_step_${FINAL_STEP}/huggingface" "${RUN_DIR}/final-model"

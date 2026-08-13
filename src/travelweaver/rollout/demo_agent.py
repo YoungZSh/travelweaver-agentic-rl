@@ -58,7 +58,7 @@ class DemoTravelAgent:
             outbound = self._find_transport(start_city, target_city, "06:00")
             if outbound is None:
                 return self._finish("没有找到可用的去程火车或航班。")
-            self._save(outbound, "outbound_transport", "去程城际交通")
+            self._save(outbound, "outbound_transport")
 
         attraction_items = self._items(
             "search_attractions", {"city": target_city, "sort_by": "price"}
@@ -67,8 +67,7 @@ class DemoTravelAgent:
             return self._finish("目标城市没有可用景点。")
         attraction = attraction_items[0]
         attraction_id = str(attraction["place_id"])
-        self._call("inspect_place", {"place_id": attraction_id})
-        self._save(attraction, "attraction", "主要游览景点")
+        self._save(attraction, "attraction")
 
         restaurant_items = self._items(
             "search_nearby",
@@ -78,7 +77,7 @@ class DemoTravelAgent:
             restaurant_items = self._items("search_restaurants", {"city": target_city})
         restaurant = restaurant_items[0] if restaurant_items else None
         if restaurant is not None:
-            self._save(restaurant, "meal", "午餐候选")
+            self._save(restaurant, "meal")
 
         hotel: dict[str, Any] | None = None
         if int(task["days"]) > 1:
@@ -86,13 +85,13 @@ class DemoTravelAgent:
             if not hotel_items:
                 return self._finish("多日行程没有找到可用住宿。")
             hotel = hotel_items[0]
-            self._save(hotel, "hotel", "过夜住宿")
+            self._save(hotel, "hotel")
 
         if start_city != target_city:
             returning = self._find_transport(target_city, start_city, "18:00")
             if returning is None:
                 return self._finish("没有找到可用的返程火车或航班。")
-            self._save(returning, "return_transport", "返程城际交通")
+            self._save(returning, "return_transport")
 
         route_ids: dict[tuple[str, str], str] = {}
         local_sequence: list[dict[str, Any]] = []
@@ -166,13 +165,13 @@ class DemoTravelAgent:
                 return items[0]
         return None
 
-    def _save(self, item: dict[str, Any], purpose: str, note: str) -> None:
+    def _save(self, item: dict[str, Any], purpose: str) -> None:
         entity_id = item.get("place_id") or item.get("transport_id")
         if not isinstance(entity_id, str):
             raise RuntimeError("Search result does not contain a stable entity id.")
         result = self._call(
             "save_candidate",
-            {"entity_id": entity_id, "purpose": purpose, "note": note},
+            {"entity_id": entity_id, "purpose": purpose},
         )
         if not result.info.get("valid_action"):
             raise RuntimeError(f"Unable to save visible candidate {entity_id}.")

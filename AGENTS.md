@@ -63,7 +63,7 @@ uv run --project training ruff check training
 
 ## 当前代码结构
 
-- `src/travelweaver/env/`：episode 状态机、13 个公开工具、稳定 ID、Scenario 和
+- `src/travelweaver/env/`：episode 状态机、15 个公开工具、稳定 ID、Scenario 和
   ChinaTravel backend。
 - `src/travelweaver/data/`：数据库准备、校验和 benchmark 任务快照导入。
 - `src/travelweaver/tasks/`：`TaskBlueprint`、`TaskSurface`、通用 `TravelTaskSpec`、编译与解析。
@@ -84,19 +84,19 @@ uv run --project training ruff check training
 
 修改序列化结构或行为时，检查并按需升级对应版本：
 
-- Environment：`travelweaver-environment-v0.3`
-- Observation：`travelweaver-observation-v3`
-- Tools：`travelweaver-tools-v2-agent`
-- TaskSpec：`travelweaver-task-spec-v2`
+- Environment：`travelweaver-environment-v0.6`
+- Observation：`travelweaver-observation-v4`
+- Tools：`travelweaver-tools-v5-agent`
+- TaskSpec：`travelweaver-task-spec-v3`
 - Blueprint / Surface：`travelweaver-task-blueprint-v2` / `travelweaver-task-surface-v3`
-- Reward：`travelweaver-reward-v1`
-- Trajectory：`travelweaver-trajectory-v6`
-- Model tool response：`travelweaver-model-tool-response-v1`（默认 `delta`，兼容 `snapshot`）
+- Reward：`travelweaver-reward-v3`
+- Trajectory：`travelweaver-trajectory-v9`
+- Model tool response：`travelweaver-model-tool-response-v3`（默认 `delta`，兼容 `snapshot`）
 - Scenario：`travelweaver-scenario-v1`
-- Synthesis / artifacts：`travelweaver-synthesis-v3` /
-  `travelweaver-synthesis-artifacts-v5`
-- SFT：`travelweaver-sft-v4`
-- Polisher prompt：`travelweaver-zh-polisher-v4`
+- Synthesis / artifacts：`travelweaver-synthesis-v12` /
+  `travelweaver-synthesis-artifacts-v10`
+- SFT：`travelweaver-sft-v5`
+- Polisher prompt：`travelweaver-zh-polisher-v7`
 
 不要在不升级版本和补兼容测试的情况下静默改变字段含义。读取旧快照时保持显式兼容或明确
 拒绝，不要猜测缺失字段。
@@ -178,7 +178,7 @@ uv run travelweaver rollout-generated \
 
 ## SFT 数据转换约定
 
-SFT 转换使用版本化、可审计的 `travelweaver-sft-v4`，不直接把原始 JSONL 临时拼成训练输入。
+SFT 转换使用版本化、可审计的 `travelweaver-sft-v5`，不直接把原始 JSONL 临时拼成训练输入。
 
 - 只接纳正常 `plan_submitted`、`reward_valid=true`、全部硬约束通过且 `rft_accepted=true`
   的轨迹。
@@ -193,7 +193,7 @@ SFT 转换使用版本化、可审计的 `travelweaver-sft-v4`，不直接把原
 - ReAct Recovery 按 `docs/react-sft-recovery-v1.md` 实现：保留 invalid assistant/tool-error 回合
   作为上下文，对整个 invalid assistant message 设零 loss，监督后续可见反思和正确工具调用。
   转换时按原顺序重放全部 action 并重新生成 observation，不能删掉错误后继续使用旧上下文。
-  V4 使用显式 `assistant_loss_mask`，不能根据错误文本隐式推断监督范围。
+  V4/V5 使用显式 `assistant_loss_mask`，不能根据错误文本隐式推断监督范围。
 - 模型侧工具 schema 和 arguments 必须按 schema 递归使用 required-first 顺序；模型 JSON 禁止
   `sort_keys=True`。canonical hash 可以独立排序，但不能改变模型实际看到的字段顺序。
 - rollout 遇到 malformed 或非 object arguments 时，将模型历史规范为 `{}` 并作为 invalid action
@@ -201,7 +201,7 @@ SFT 转换使用版本化、可审计的 `travelweaver-sft-v4`，不直接把原
   JSON 返回 400。
 - 首条 user content 使用真人题面的纯自然语言 `query`，不包装 JSON observation，不暴露
   episode ID、协议版本、合成类型或 Blueprint/Surface ID。工具 observation 仍使用版本化 JSON。
-- SFT 中间 tool message 默认复用 `travelweaver-model-tool-response-v1` 的 `delta` 序列化，
+- SFT 中间 tool message 默认复用 `travelweaver-model-tool-response-v3` 的 `delta` 序列化，
   不重复 task、全部 candidates 或 visible ID 集合；旧 v3 轨迹可通过重放生成该格式。
 - 删除最终 `submit_plan` 之后包含 Reward 明细的 tool response；Reward、隐藏 TaskSpec、oracle
   witness 和验证明细不得进入模型输入，只能写入 audit sidecar。

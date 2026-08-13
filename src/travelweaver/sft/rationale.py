@@ -20,8 +20,8 @@ from ..errors import SFTRebuildError
 from ..llm import DEFAULT_DEEPSEEK_CONCURRENCY, DeepSeekConfig, OpenAICompatibleChatClient
 from .rationale_contract import has_visible_price_comparison
 
-RATIONALE_POLISHER_VERSION = "travelweaver-trajectory-rationale-polisher-v3"
-RATIONALE_PROMPT_VERSION = "travelweaver-trajectory-rationale-prompt-v2"
+RATIONALE_POLISHER_VERSION = "travelweaver-trajectory-rationale-polisher-v4"
+RATIONALE_PROMPT_VERSION = "travelweaver-trajectory-rationale-prompt-v3"
 
 _NUMBER = re.compile(r"\d+(?::\d{2})?")
 _PREMATURE_RESULT = re.compile(r"(?:已经|已)(?:找到|确认|核实|获得)|结果(?:显示|表明)|符合要求")
@@ -82,10 +82,9 @@ _SYSTEM_PROMPT = """你是旅行规划 Agent 的可见决策说明润色器。
    阿拉伯数字只能来自题面、template_rationale 或同回合 arguments，不得新增或改变。
 5. 表达应自然、有上下文感，可按决策复杂度使用一至数句，不要机械重复固定句式，也不要写成长篇
    思维链、自我身份说明、Markdown、步骤编号或最终答案。
-6. injected_loop 是刻意保留且不计 loss 的错误决策，只润色其原意；loop_recovery 必须清楚表达停止
-   重复并转向同回合正确工具。所有 rationale 都发生在同回合工具调用之前，描述当前动作时使用
-   “我再执行一次相同的查询”这类将要执行的表达，不得写成“我重复执行了查询”等完成时态；
-   evidence_ready_submit 必须说明证据完备后提交。
+6. 所有 rationale 都发生在同回合工具调用之前，描述当前动作时使用将要执行的表达，不得写成
+   已完成的查询或验证。分页只能解释为沿用当前 cursor 搜索继续定位同一目标；提交只能在已保存
+   候选与已查询路线完整时说明证据完备。
 7. 除函数调用外不要输出任何普通文本或隐藏思考。
 """
 

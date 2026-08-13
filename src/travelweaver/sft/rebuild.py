@@ -77,6 +77,7 @@ class SFTRebuildConfig:
     repair_surface_semantics: bool = False
     tool_response_mode: str = DEFAULT_TOOL_RESPONSE_MODE
     supervision_mode: str = DEFAULT_SFT_SUPERVISION_MODE
+    require_official_commonsense: bool = False
 
     def __post_init__(self) -> None:
         if not self.sources:
@@ -98,6 +99,7 @@ class SFTRebuildReport:
     reward_accepted_rows: int
     accepted_rows: int
     mode_excluded_rows: int
+    official_commonsense_excluded_rows: int
     samples: int
     replayed_valid_actions: int
     invalid_actions_removed: int
@@ -176,11 +178,28 @@ def rebuild_sft_dataset(
         rows = _read_jsonl(source.rollout_path)
         input_rows += len(rows)
         reward_records.extend((source, row) for row in rows if _is_accepted(row))
+    official_commonsense_passes: dict[SFTSource, set[str]] = {}
+    if config.require_official_commonsense:
+        official_commonsense_passes = {
+            source: _load_official_commonsense_passes(
+                source.task_dir,
+                expected_task_ids=set(snapshots[source].public),
+            )
+            for source in config.sources
+        }
     supervision_mode = validate_supervision_mode(config.supervision_mode)
     records: list[tuple[SFTSource, dict[str, Any]]] = []
     exclusions: list[dict[str, Any]] = []
+    official_commonsense_excluded_rows = 0
     for source, row in reward_records:
         reason = _mode_exclusion_reason(row, supervision_mode)
+        if (
+            reason is None
+            and config.require_official_commonsense
+            and str(row.get("task_id")) not in official_commonsense_passes[source]
+        ):
+            reason = "official_commonsense_not_passed"
+            official_commonsense_excluded_rows += 1
         if reason is None:
             records.append((source, row))
             continue
@@ -233,6 +252,7 @@ def rebuild_sft_dataset(
         reward_accepted_rows=len(reward_records),
         accepted_rows=len(records),
         mode_excluded_rows=len(exclusions),
+        official_commonsense_excluded_rows=official_commonsense_excluded_rows,
         samples=len(samples),
         replayed_valid_actions=sum(int(audit["replayed_valid_steps"]) for audit in audits),
         invalid_actions_removed=invalid_removed,
@@ -262,6 +282,7 @@ def rebuild_sft_dataset(
             "repair_surface_semantics": config.repair_surface_semantics,
             "tool_response_mode": config.tool_response_mode,
             "supervision_mode": supervision_mode,
+            "require_official_commonsense": config.require_official_commonsense,
             "model_tool_response_version": MODEL_TOOL_RESPONSE_VERSION,
             "user_content_format": USER_CONTENT_FORMAT,
             "sources": [
@@ -373,7 +394,6 @@ def _react_source_context(row: dict[str, Any]) -> tuple[str, str, int]:
     supported_prompts = {
         render_system_prompt(35): 35,
         SYSTEM_PROMPT: DEFAULT_MAX_VALID_STEPS,
-        render_system_prompt(100): 100,
     }
     system_content = system.get("content") if isinstance(system, dict) else None
     if (
@@ -1002,6 +1022,32 @@ def _load_source_snapshot(task_dir: Path) -> _SourceSnapshot:
     if public.keys() != oracle.keys() or public.keys() != records.keys():
         raise SFTRebuildError(f"Generated snapshot components do not align: {task_dir}")
     return _SourceSnapshot(public=public, oracle=oracle, records=records)
+
+
+def _load_official_commonsense_passes(
+    task_dir: Path,
+    *,
+    expected_task_ids: set[str],
+) -> set[str]:
+    """Load a complete official audit and return only fully passed task ids."""
+
+    audit_path = task_dir / "official-audit.jsonl"
+    if not audit_path.is_file():
+        raise SFTRebuildError(f"Official audit is required but missing: {audit_path}")
+    rows = _read_jsonl(audit_path)
+    audit_by_task: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        task_id = row.get("uid")
+        if not isinstance(task_id, str) or task_id in audit_by_task:
+            raise SFTRebuildError(f"Official audit has invalid or duplicate uid: {audit_path}")
+        audit_by_task[task_id] = row
+    if audit_by_task.keys() != expected_task_ids:
+        raise SFTRebuildError(f"Official audit does not align with generated tasks: {audit_path}")
+    return {
+        task_id
+        for task_id, row in audit_by_task.items()
+        if row.get("schema_passed") is True and row.get("commonsense_passed") is True
+    }
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

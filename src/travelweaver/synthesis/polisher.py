@@ -89,6 +89,8 @@ _SYSTEM_PROMPT = """你是中文旅行任务改写器。你的唯一职责是让
    硬约束而机械添加“必须、硬性要求”等词。
 10. 餐厅每餐预算约束必须明确要求至少安排一顿用餐；市内交通方式约束必须明确要求至少
     安排两个市内地点。两项前提都可以自然改写，但不得省略。
+11. constraint_semantics 中的逻辑结构必须逐字义保留：any_of 各组之间是“或”，同一组内
+    多个值是“且/分别”；not_in、exclude 和允许集合不得改变否定范围，也不得互换且/或。
 """
 _STYLE_DIRECTIONS = {
     "direct": "直接清楚地提出规划请求。",
@@ -500,6 +502,7 @@ def validate_surface(
                 text,
                 validation_profile=validation_profile,
             )
+        _validate_logic_shape(constraint, text)
         _validate_non_vacuous_scope(constraint, query)
         value = constraint.value if isinstance(constraint.value, dict) else {}
         leg = value.get("leg")
@@ -608,7 +611,13 @@ def validate_surface(
             )
 
     scrubbed = query.replace("不超过", "").replace("不高于", "")
-    if any(marker in scrubbed for marker in ("无需", "不需要", "禁止", "排除")):
+    if any(marker in scrubbed for marker in ("无需", "不需要")):
+        raise SynthesisError("Polisher introduced an unsupported negative requirement.")
+    expected_negative = any(
+        constraint.operator in {"not_in", "exclude", "not_contains"}
+        for constraint in blueprint.constraints
+    )
+    if not expected_negative and any(marker in scrubbed for marker in ("禁止", "排除")):
         raise SynthesisError("Polisher introduced an unsupported negative requirement.")
     return TaskSurface(
         blueprint_id=blueprint.blueprint_id,
@@ -686,6 +695,11 @@ def _validate_polarity(
             )
         ):
             raise SynthesisError(f"Inclusion mention became optional: {text}")
+    elif operator in {"not_in", "exclude", "not_contains"}:
+        if not any(
+            marker in text for marker in ("不要", "不能", "不安排", "排除", "避免", "禁止")
+        ):
+            raise SynthesisError(f"Negative mention lost its polarity: {text}")
 
 
 def _validate_minimal_constraint(constraint: Any, text: str, query: str) -> None:
@@ -730,6 +744,11 @@ def _validate_minimal_constraint(constraint: Any, text: str, query: str) -> None
             raise SynthesisError(f"Lower-bound mention lost its polarity: {text}")
         if any(marker in text for marker in ("不超过", "不超", "至多", "之前")):
             raise SynthesisError(f"Lower-bound mention reversed direction: {text}")
+    elif operator in {"not_in", "exclude", "not_contains"}:
+        if not any(
+            marker in text for marker in ("不要", "不能", "不安排", "排除", "避免", "禁止")
+        ):
+            raise SynthesisError(f"Negative mention lost its polarity: {text}")
 
     value = constraint.value if isinstance(constraint.value, dict) else {}
     if kind in {"total_budget", "category_budget"}:
@@ -738,20 +757,20 @@ def _validate_minimal_constraint(constraint: Any, text: str, query: str) -> None
         if not _contains_time(text, str(value.get("time", ""))):
             raise SynthesisError(f"Time value changed in mention {constraint.id}: {text}")
     elif kind == "transport_mode":
-        modes = [str(mode) for mode in value.get("modes", [])]
-        if not any(_mode_present(text, mode) for mode in modes):
+        modes = _flatten_string_groups(value, "modes")
+        if not all(_mode_present(text, mode) for mode in modes):
             raise SynthesisError(f"Transport mode changed in mention {constraint.id}: {text}")
     elif kind == "entity_category":
-        category = str(value.get("values", [""])[0])
-        if category not in text:
+        categories = _flatten_string_groups(value, "values")
+        if not all(category in text for category in categories):
             raise SynthesisError(f"Entity category changed in mention {constraint.id}: {text}")
     elif kind == "entity_attribute":
-        attribute = str(value.get("values", [""])[0])
-        if attribute not in text:
+        attributes = _flatten_string_groups(value, "values")
+        if not all(attribute in text for attribute in attributes):
             raise SynthesisError(f"Entity attribute changed in mention {constraint.id}: {text}")
-    elif kind == "include_entity":
-        name = str(value.get("names", [""])[0])
-        if name not in text:
+    elif kind in {"include_entity", "exclude_entity"}:
+        names = _flatten_string_groups(value, "names")
+        if not all(name in text for name in names):
             raise SynthesisError(f"Required entity changed in mention {constraint.id}: {text}")
     elif kind == "room_type":
         _require_count(text, value.get("room_type"), ("个床位", "张床"), constraint.id)
@@ -759,6 +778,117 @@ def _validate_minimal_constraint(constraint: Any, text: str, query: str) -> None
         _require_count(text, value.get("count"), ("间房", "间客房"), constraint.id)
     elif kind == "activity_count":
         _require_count(text, value.get("count"), ("个景点", "处景点"), constraint.id)
+
+
+def _validate_logic_shape(constraint: Any, text: str) -> None:
+    """Preserve finite DSL conjunction, disjunction, and allowed-set semantics."""
+
+    value = constraint.value if isinstance(constraint.value, dict) else {}
+    kind = str(constraint.kind)
+    key = {
+        "entity_category": "values",
+        "entity_attribute": "values",
+        "include_entity": "names",
+        "exclude_entity": "names",
+        "transport_mode": "modes",
+    }.get(kind)
+    if key is None:
+        return
+    groups = _logic_string_groups(value, key)
+    if not groups:
+        return
+    rendered_groups = [
+        [_logic_operand_in_text(kind, item, text) for item in group]
+        for group in groups
+    ]
+    if any(any(item is None for item in group) for group in rendered_groups):
+        raise SynthesisError(f"Logical operands changed in mention {constraint.id}: {text}")
+    operands = [[str(item) for item in group] for group in rendered_groups]
+    for group in operands:
+        if len(group) > 1:
+            expected = "or" if kind == "transport_mode" else "and"
+            _require_logic_connector(group, text, expected, constraint.id)
+    if isinstance(value.get("any_of"), list) and len(operands) > 1:
+        spans = [_operand_span(group, text) for group in operands]
+        spans.sort()
+        for left, right in zip(spans, spans[1:], strict=False):
+            between = text[left[1] : right[0]]
+            if not _has_or_connector(between, text) or _has_and_connector(between):
+                raise SynthesisError(
+                    f"Any-of groups lost their disjunction in mention {constraint.id}: {text}"
+                )
+    if (
+        kind == "transport_mode"
+        and str(constraint.scope) == "innercity_route"
+        and str(constraint.operator) in {"not_in", "exclude", "not_contains"}
+    ):
+        forbidden = {str(mode) for mode in _flatten_string_groups(value, "modes")}
+        allowed = [mode for mode in ("taxi", "metro", "walk") if mode not in forbidden]
+        present = [
+            operand
+            for mode in allowed
+            if (operand := _logic_operand_in_text(kind, mode, text)) is not None
+        ]
+        if len(present) > 1:
+            _require_logic_connector(present, text, "or", constraint.id)
+        if any(marker in text for marker in ("只能", "仅能", "只可", "只用")) and len(
+            present
+        ) < len(allowed):
+            raise SynthesisError(
+                f"Allowed transport set was narrowed in mention {constraint.id}: {text}"
+            )
+
+
+def _logic_string_groups(value: dict[str, Any], key: str) -> list[list[str]]:
+    any_of = value.get("any_of")
+    raw_groups = any_of if isinstance(any_of, list) else [value.get(key, [])]
+    return [
+        [str(item) for item in group if str(item).strip()]
+        for group in raw_groups
+        if isinstance(group, list) and group
+    ]
+
+
+def _logic_operand_in_text(kind: str, value: str, text: str) -> str | None:
+    candidates = _mode_aliases(value) if kind == "transport_mode" else (value,)
+    present = [candidate for candidate in candidates if candidate in text]
+    return min(present, key=lambda candidate: text.index(candidate)) if present else None
+
+
+def _operand_span(operands: list[str], text: str) -> tuple[int, int]:
+    starts = [text.index(operand) for operand in operands]
+    ends = [start + len(operand) for start, operand in zip(starts, operands, strict=True)]
+    return min(starts), max(ends)
+
+
+def _require_logic_connector(
+    operands: list[str], text: str, expected: str, constraint_id: str
+) -> None:
+    positions = sorted((text.index(operand), operand) for operand in operands)
+    for (left_start, left), (right_start, _) in zip(positions, positions[1:], strict=False):
+        between = text[left_start + len(left) : right_start]
+        if expected == "and":
+            valid = not _has_or_connector(between, "") and (
+                _has_and_connector(between)
+                or any(marker in text for marker in ("分别", "同时", "各", "都", "均"))
+            )
+        else:
+            valid = not _has_and_connector(between) and _has_or_connector(between, text)
+        if not valid:
+            label = "conjunction" if expected == "and" else "disjunction"
+            raise SynthesisError(
+                f"Logical {label} changed in mention {constraint_id}: {text}"
+            )
+
+
+def _has_or_connector(between: str, full_text: str) -> bool:
+    return any(marker in between for marker in ("或", "或者")) or any(
+        marker in full_text for marker in ("任选", "任一", "其中一种", "二选一")
+    )
+
+
+def _has_and_connector(text: str) -> bool:
+    return any(marker in text for marker in ("和", "与", "及", "以及", "、", "并且"))
 
 
 def _strip_scope_prerequisite(kind: str, text: str) -> str:
@@ -845,6 +975,7 @@ def _repair_constraint_mention(constraint: Any, query: str) -> str | None:
         return None
     if str(constraint.kind) in {
         "include_entity",
+        "exclude_entity",
         "entity_category",
         "entity_attribute",
     }:
@@ -855,10 +986,10 @@ def _repair_constraint_mention(constraint: Any, query: str) -> str | None:
 def _constraint_anchor(constraint: Any, query: str) -> str | None:
     value = constraint.value if isinstance(constraint.value, dict) else {}
     kind = str(constraint.kind)
-    if kind == "include_entity":
-        return _first_present(query, (str(value.get("names", [""])[0]),))
+    if kind in {"include_entity", "exclude_entity"}:
+        return _first_present(query, tuple(_flatten_string_groups(value, "names")))
     if kind in {"entity_category", "entity_attribute"}:
-        return _first_present(query, (str(value.get("values", [""])[0]),))
+        return _first_present(query, tuple(_flatten_string_groups(value, "values")))
     if kind in {"total_budget", "category_budget"}:
         return _number_anchor(query, value.get("amount"))
     if kind == "time_window":
@@ -867,7 +998,7 @@ def _constraint_anchor(constraint: Any, query: str) -> str | None:
     if kind == "transport_mode":
         aliases = tuple(
             alias
-            for mode in value.get("modes", [])
+            for mode in _flatten_string_groups(value, "modes")
             for alias in _mode_aliases(str(mode))
         )
         return _first_present(query, aliases)
@@ -878,6 +1009,18 @@ def _constraint_anchor(constraint: Any, query: str) -> str | None:
     if kind == "activity_count":
         return _count_anchor(query, value.get("count"), ("个景点", "处景点"))
     return None
+
+
+def _flatten_string_groups(value: dict[str, Any], key: str) -> list[str]:
+    any_of = value.get("any_of")
+    raw_groups = any_of if isinstance(any_of, list) else [value.get(key, [])]
+    return [
+        str(item)
+        for group in raw_groups
+        if isinstance(group, list)
+        for item in group
+        if str(item).strip()
+    ]
 
 
 def _number_anchor(text: str, value: Any) -> str | None:

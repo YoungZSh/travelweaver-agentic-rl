@@ -202,13 +202,37 @@ def _transport_mode(
     evidence: Mapping[str, Any],
 ) -> CheckResult:
     value = constraint.value if isinstance(constraint.value, Mapping) else {}
-    required = {str(item) for item in value.get("modes", [])}
+    groups = _required_groups(value, "modes")
+    if groups is None:
+        return _result(constraint, CHECK_UNVERIFIABLE, "Transport modes are invalid.")
     leg = str(value.get("leg", "all"))
     if constraint.scope == "innercity_route":
         routes = evidence.get("routes")
         if not isinstance(routes, Mapping):
             return _result(constraint, CHECK_UNVERIFIABLE, "Route modes are unavailable.")
-        actual = {str(route.get("mode")) for route in routes.values() if isinstance(route, Mapping)}
+        entities = evidence.get("entities")
+        if spec.spec_version == "travelweaver-task-spec-v3":
+            if not isinstance(entities, Mapping):
+                return _result(
+                    constraint,
+                    CHECK_UNVERIFIABLE,
+                    "Route endpoint evidence is unavailable.",
+                )
+            # Airport and railway-station transfers are required for itinerary
+            # continuity, but they are not travel between the user's requested
+            # in-city places.  TaskSpec v1/v2 retain the historical all-route
+            # interpretation; v3 excludes either endpoint being a route anchor.
+            routes = {
+                route_id: route
+                for route_id, route in routes.items()
+                if isinstance(route, Mapping)
+                and not _route_touches_terminal_anchor(route, entities)
+            }
+        actual = {
+            str(route.get("mode"))
+            for route in routes.values()
+            if isinstance(route, Mapping)
+        }
     else:
         entities = evidence.get("entities")
         if not isinstance(entities, Mapping):
@@ -231,20 +255,30 @@ def _transport_mode(
             if expected_direction is None or direction == expected_direction:
                 actual.add(str(item.get("activity_type")))
     if constraint.operator == "eq":
-        passed = actual == required
+        passed = any(actual == required for required in groups)
     elif constraint.operator in {"include", "contains"}:
-        passed = required.issubset(actual)
+        passed = any(required.issubset(actual) for required in groups)
     elif constraint.operator in {"not_in", "exclude"}:
-        passed = actual.isdisjoint(required)
+        passed = actual.isdisjoint(set().union(*groups))
     else:
         return _result(constraint, CHECK_UNVERIFIABLE, "Unsupported mode operator.")
     return _result(
         constraint,
         CHECK_PASS if passed else CHECK_FAIL,
         "Transport mode check completed.",
-        required={"leg": leg, "modes": sorted(required)},
+        required={"leg": leg, "mode_groups": [sorted(group) for group in groups]},
         actual=sorted(actual),
     )
+
+
+def _route_touches_terminal_anchor(
+    route: Mapping[str, Any], entities: Mapping[str, Any]
+) -> bool:
+    for key in ("origin_place_id", "destination_place_id"):
+        entity = entities.get(route.get(key))
+        if isinstance(entity, Mapping) and entity.get("entity_type") == "route_anchor":
+            return True
+    return False
 
 
 def _entity_category(

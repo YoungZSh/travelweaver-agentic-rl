@@ -17,7 +17,7 @@ def _step(env: TravelWeaverEnv, tool: str, **arguments: object):
 def test_query_and_evidence_tools_and_pagination(env: TravelWeaverEnv) -> None:
     reset = env.reset("task-hangzhou")
     assert reset.remaining_steps == 50
-    assert len(env.tool_schemas()) == 17
+    assert len(env.tool_schemas()) == 15
 
     categories = _step(env, "list_attraction_categories", city="杭州")
     assert "公园" in categories.observation.tool_result["categories"]
@@ -39,7 +39,7 @@ def test_query_and_evidence_tools_and_pagination(env: TravelWeaverEnv) -> None:
 
     restaurants = _step(env, "search_restaurants", city="杭州", cuisine="杭帮菜")
     assert restaurants.observation.tool_result["items"][0]["name"] == "西湖餐厅"
-    food = _step(env, "search_restaurants_by_food", city="杭州", food="西湖醋鱼")
+    food = _step(env, "search_restaurants", city="杭州", recommended_food="西湖醋鱼")
     assert food.observation.tool_result["items"][0]["name"] == "西湖餐厅"
 
     hotels = _step(env, "search_hotels", city="杭州", room_type=2)
@@ -55,8 +55,6 @@ def test_query_and_evidence_tools_and_pagination(env: TravelWeaverEnv) -> None:
     assert transport.observation.tool_result["items"][0]["source_id"] == "G1"
 
     first_id, second_id = first_page["items"][0]["place_id"], first_page["items"][1]["place_id"]
-    inspected = _step(env, "inspect_place", place_id=first_id)
-    assert inspected.observation.tool_result["item"]["place_id"] == first_id
     open_check = _step(env, "check_place_open", place_id=first_id, at_time="12:00")
     assert open_check.observation.tool_result["is_open"] is True
 
@@ -99,7 +97,9 @@ def test_filters_are_deterministic_and_no_result_is_valid(env: TravelWeaverEnv) 
 def test_unseen_ids_and_schema_errors_count_as_invalid(env: TravelWeaverEnv, backend) -> None:
     env.reset("task-hangzhou")
     hidden_id = backend.search_hotels(city="杭州")[0]["place_id"]
-    invalid = env.step({"tool": "inspect_place", "arguments": {"place_id": hidden_id}})
+    invalid = env.step(
+        {"tool": "check_place_open", "arguments": {"place_id": hidden_id, "at_time": "12:00"}}
+    )
     assert not invalid.info["valid_action"]
     assert invalid.info["consecutive_invalid_actions"] == 1
 
@@ -193,7 +193,12 @@ def test_cursor_and_visible_state_are_episode_local(backend, task_store) -> None
 
     foreign_cursor = second.step({"tool": "next_page", "arguments": {"cursor": cursor}})
     assert not foreign_cursor.info["valid_action"]
-    foreign_id = second.step({"tool": "inspect_place", "arguments": {"place_id": first_visible}})
+    foreign_id = second.step(
+        {
+            "tool": "check_place_open",
+            "arguments": {"place_id": first_visible, "at_time": "12:00"},
+        }
+    )
     assert not foreign_id.info["valid_action"]
 
     first.reset("task-shanghai")
@@ -277,7 +282,6 @@ def test_candidate_management_and_plan_submission_close_the_loop(env: TravelWeav
         "save_candidate",
         entity_id=restaurant["place_id"],
         purpose="meal",
-        note="午餐",
     )
 
     plan = {
@@ -367,3 +371,88 @@ def test_schema_valid_invalid_submission_terminates_without_retry(env: TravelWea
     assert invalid.terminated
     assert invalid.info["termination_reason"] == "invalid_plan_submitted"
     assert invalid.reward == -1.0
+
+
+def test_submit_rejects_candidate_saved_for_the_wrong_purpose(
+    env: TravelWeaverEnv,
+) -> None:
+    env.reset("task-hangzhou")
+    attraction = _step(env, "search_attractions", city="杭州").observation.tool_result[
+        "items"
+    ][0]
+    _step(
+        env,
+        "save_candidate",
+        entity_id=attraction["place_id"],
+        purpose="meal",
+    )
+
+    rejected = _step(
+        env,
+        "submit_plan",
+        plan={
+            "people_number": 1,
+            "start_city": "上海",
+            "target_city": "杭州",
+            "itinerary": [
+                {
+                    "day": 1,
+                    "activities": [
+                        {
+                            "candidate_id": attraction["place_id"],
+                            "type": "attraction",
+                            "start_time": "10:00",
+                            "end_time": "12:00",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert rejected.terminated
+    assert rejected.info["termination_reason"] == "invalid_plan_submitted"
+    assert "saved for purpose 'meal'" in rejected.info["submission_error"]["message"]
+
+
+@pytest.mark.parametrize(
+    ("activity_type", "entity_type", "purpose"),
+    [
+        ("attraction", "attraction", "attraction"),
+        ("breakfast", "restaurant", "meal"),
+        ("breakfast", "hotel", "hotel"),
+        ("lunch", "restaurant", "meal"),
+        ("dinner", "restaurant", "meal"),
+        ("accommodation", "hotel", "hotel"),
+    ],
+)
+def test_candidate_purpose_accepts_supported_local_uses(
+    activity_type: str,
+    entity_type: str,
+    purpose: str,
+) -> None:
+    TravelWeaverEnv._validate_candidate_purpose(
+        {"candidate_id": "candidate", "purpose": purpose},
+        activity_type,
+        {"entity_type": entity_type},
+        start_city="上海",
+        target_city="杭州",
+    )
+
+
+def test_candidate_purpose_distinguishes_outbound_and_return_transport() -> None:
+    TravelWeaverEnv._validate_candidate_purpose(
+        {"candidate_id": "outbound", "purpose": "outbound_transport"},
+        "train",
+        {"origin_city": "上海", "destination_city": "杭州"},
+        start_city="上海",
+        target_city="杭州",
+    )
+    with pytest.raises(ValueError, match="return_transport"):
+        TravelWeaverEnv._validate_candidate_purpose(
+            {"candidate_id": "return", "purpose": "outbound_transport"},
+            "train",
+            {"origin_city": "杭州", "destination_city": "上海"},
+            start_city="上海",
+            target_city="杭州",
+        )

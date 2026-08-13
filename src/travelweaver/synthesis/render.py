@@ -257,6 +257,17 @@ def _constraint_clause(
         mode_text = "或".join(modes)
         leg = value.get("leg", "all")
         if scope == "innercity_route":
+            if operator in {"not_in", "exclude"}:
+                universe = ("taxi", "metro", "walk")
+                forbidden = {str(mode) for mode in value["modes"]}
+                allowed = [_MODE_ZH[mode] for mode in universe if mode not in forbidden]
+                if not allowed:
+                    raise SynthesisError("Inner-city allowed-mode set cannot be empty.")
+                allowed_text = "或".join(allowed)
+                return (
+                    f"至少安排两个市内地点，地点之间只能使用{allowed_text}，不要{mode_text}",
+                    {*allowed, *modes},
+                )
             if mode_text == "步行":
                 clause = (
                     "至少安排两个市内地点，地点之间都步行"
@@ -284,18 +295,38 @@ def _constraint_clause(
         modality = "要" if validation_profile != "strict" else "必须"
         return f"{leg}{modality}在{time}{direction}{field}", {leg, time}
     if kind == "entity_category":
-        category = str(value["values"][0])
+        groups = _string_groups(value, "values")
+        literals = {item for group in groups for item in group}
         if scope == "attraction":
-            suffix = "" if category.endswith("景点") else "类景点"
-            return f"至少安排一个{category}{suffix}", {category}
-        return f"至少安排一顿{category}", {category}
+            rendered_groups = [
+                "和".join(
+                    f"{category}{'' if category.endswith('景点') else '类景点'}"
+                    for category in group
+                )
+                for group in groups
+            ]
+            if len(groups) > 1:
+                return f"至少安排一个{'或'.join(rendered_groups)}", literals
+            if len(groups[0]) > 1:
+                return f"至少分别安排一个{rendered_groups[0]}", literals
+            return f"至少安排一个{rendered_groups[0]}", literals
+        rendered_groups = ["和".join(group) for group in groups]
+        if len(groups) > 1:
+            return f"至少安排一顿{'或'.join(rendered_groups)}", literals
+        if len(groups[0]) > 1:
+            return f"至少分别安排一顿{'和'.join(groups[0])}", literals
+        return f"至少安排一顿{groups[0][0]}", literals
     if kind == "entity_attribute":
-        attribute = str(value["values"][0])
+        groups = _string_groups(value, "values")
+        literals = {item for group in groups for item in group}
+        rendered = "或".join("和".join(group) for group in groups)
         if validation_profile != "strict":
-            return f"想住有{attribute}的酒店", {attribute}
-        return f"住宿必须具备{attribute}", {attribute}
+            return f"想住有{rendered}的酒店", literals
+        return f"住宿必须具备{rendered}", literals
     if kind == "include_entity":
-        name = str(value["names"][0])
+        groups = _string_groups(value, "names")
+        names = "或".join("和".join(group) for group in groups)
+        literals = {item for group in groups for item in group}
         action = (
             {
                 "attraction": "想去",
@@ -309,7 +340,11 @@ def _constraint_clause(
                 "accommodation": "必须入住",
             }[scope]
         )
-        return f"{action}{name}", {name}
+        return f"{action}{names}", literals
+    if kind == "exclude_entity":
+        groups = _string_groups(value, "names")
+        names = "、".join(item for group in groups for item in group)
+        return f"不要安排{names}", {item for group in groups for item in group}
     if kind == "category_budget":
         amount = _format_number(value["amount"])
         if scope == "restaurant":
@@ -331,6 +366,19 @@ def _constraint_clause(
             return f"全程安排{count}个景点", {f"{count}个景点"}
         return f"全程恰好安排{count}个景点", {f"{count}个景点"}
     raise SynthesisError(f"No canonical renderer for constraint kind {kind}.")
+
+
+def _string_groups(value: dict[str, Any], key: str) -> list[list[str]]:
+    any_of = value.get("any_of")
+    raw_groups = any_of if isinstance(any_of, list) else [value.get(key)]
+    groups = [
+        [str(item) for item in group if str(item).strip()]
+        for group in raw_groups
+        if isinstance(group, list)
+    ]
+    if not groups or any(not group for group in groups):
+        raise SynthesisError(f"Constraint has no renderable {key} groups.")
+    return groups
 
 
 def _format_number(value: Any) -> str:

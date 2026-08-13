@@ -4,6 +4,9 @@ import json
 from threading import Lock
 from types import SimpleNamespace
 
+import pytest
+
+from travelweaver.errors import SynthesisError
 from travelweaver.llm import DeepSeekConfig
 from travelweaver.synthesis.artifacts import record_bundle
 from travelweaver.synthesis.models import PilotSlot
@@ -150,7 +153,13 @@ def test_surface_repolish_uses_configured_concurrency_and_writes_audit(
     records_dir = input_dir / "records"
     records_dir.mkdir(parents=True)
     (input_dir / "manifest.json").write_text(
-        json.dumps({"config": {"profile": "pilot_v2_1", "seed": 17}}),
+        json.dumps(
+            {
+                "status": "complete",
+                "completed": 2,
+                "config": {"count": 2, "profile": "pilot_v2_1", "seed": 17},
+            }
+        ),
         encoding="utf-8",
     )
     for index, (origin, destination) in enumerate((("上海", "杭州"), ("北京", "南京"))):
@@ -192,7 +201,13 @@ def test_surface_repolish_canonical_only_makes_no_model_call(tmp_path, monkeypat
     records_dir = input_dir / "records"
     records_dir.mkdir(parents=True)
     (input_dir / "manifest.json").write_text(
-        json.dumps({"config": {"profile": "pilot_v2_1", "seed": 17}}),
+        json.dumps(
+            {
+                "status": "complete",
+                "completed": 1,
+                "config": {"count": 1, "profile": "pilot_v2_1", "seed": 17},
+            }
+        ),
         encoding="utf-8",
     )
     (records_dir / "000.json").write_text(
@@ -220,3 +235,100 @@ def test_surface_repolish_canonical_only_makes_no_model_call(tmp_path, monkeypat
     assert report.api_calls == 0
     assert audit[0]["outcome"] == "canonical_only"
     assert audit[0]["raw_response"] is None
+
+
+def test_surface_repolish_rejects_incomplete_source_by_default(tmp_path) -> None:
+    input_dir = tmp_path / "input"
+    records_dir = input_dir / "records"
+    records_dir.mkdir(parents=True)
+    (input_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "status": "in_progress",
+                "completed": 1,
+                "config": {"count": 2, "profile": "pilot_v2_1", "seed": 17},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (records_dir / "000.json").write_text(
+        json.dumps(_record(0, "上海", "杭州"), ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SynthesisError, match="input batch is incomplete"):
+        SurfaceRepolishPipeline(
+            RepolishConfig(
+                input_dir=input_dir,
+                output_dir=tmp_path / "output",
+                canonical_only=True,
+                max_api_calls=0,
+            ),
+            DeepSeekConfig(api_key="offline-canonical", model="deterministic-canonical"),
+        ).run()
+
+
+def test_surface_repolish_resumes_only_missing_slots_after_failure(
+    tmp_path, monkeypatch
+) -> None:
+    input_dir = tmp_path / "input"
+    records_dir = input_dir / "records"
+    records_dir.mkdir(parents=True)
+    (input_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "completed": 3,
+                "config": {"count": 3, "profile": "pilot_v2_1", "seed": 17},
+            }
+        ),
+        encoding="utf-8",
+    )
+    for index, cities in enumerate(
+        (("上海", "杭州"), ("北京", "南京"), ("广州", "深圳"))
+    ):
+        (records_dir / f"{index:03d}.json").write_text(
+            json.dumps(_record(index, *cities), ensure_ascii=False), encoding="utf-8"
+        )
+    monkeypatch.setattr("travelweaver.synthesis.repolish.TravelReward", _RewardEvaluator)
+    config = RepolishConfig(
+        input_dir=input_dir,
+        output_dir=tmp_path / "output",
+        canonical_only=True,
+        max_api_calls=0,
+    )
+    first = SurfaceRepolishPipeline(
+        config,
+        DeepSeekConfig(api_key="offline-canonical", model="deterministic-canonical"),
+    )
+    original_rewrite = first._rewrite_record
+
+    def fail_middle(record):
+        if int(record["slot"]["index"]) == 1:
+            raise SynthesisError("simulated repolish failure")
+        return original_rewrite(record)
+
+    monkeypatch.setattr(first, "_rewrite_record", fail_middle)
+    with pytest.raises(SynthesisError, match="1 repolish slot"):
+        first.run()
+
+    assert {
+        int(path.stem) for path in (config.output_dir / "records").glob("*.json")
+    } == {0, 2}
+
+    resumed = SurfaceRepolishPipeline(
+        config,
+        DeepSeekConfig(api_key="offline-canonical", model="deterministic-canonical"),
+    )
+    rewritten_indices = []
+    resumed_rewrite = resumed._rewrite_record
+
+    def track_rewrite(record):
+        rewritten_indices.append(int(record["slot"]["index"]))
+        return resumed_rewrite(record)
+
+    monkeypatch.setattr(resumed, "_rewrite_record", track_rewrite)
+    report = resumed.run()
+
+    assert rewritten_indices == [1]
+    assert report.completed == 3

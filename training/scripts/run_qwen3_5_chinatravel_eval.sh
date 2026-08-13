@@ -16,6 +16,12 @@ MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-8192}"
 GPU_HOLD_PYTHON="${GPU_HOLD_PYTHON:-/data2/yzs/.conda/envs/glq_sft/bin/python}"
 GPU_HOLD_SCRIPT="${GPU_HOLD_SCRIPT:-/data2/yzs/gpu_hold.py}"
 GPU_HOLD_HANDOFF="${GPU_HOLD_HANDOFF:-1}"
+KEEP_SERVER_RUNNING="${KEEP_SERVER_RUNNING:-0}"
+
+if [[ "${KEEP_SERVER_RUNNING}" != "0" && "${KEEP_SERVER_RUNNING}" != "1" ]]; then
+    echo "KEEP_SERVER_RUNNING must be 0 or 1." >&2
+    exit 1
+fi
 
 case "${BENCHMARK_SPLIT}" in
     easy)
@@ -240,7 +246,11 @@ from pathlib import Path
 output_path = Path(sys.argv[1])
 error_path = Path(sys.argv[2])
 rows = [json.loads(line) for line in output_path.read_text().splitlines() if line.strip()]
-errors = [json.loads(line) for line in error_path.read_text().splitlines() if line.strip()]
+errors = (
+    [json.loads(line) for line in error_path.read_text().splitlines() if line.strip()]
+    if error_path.exists()
+    else []
+)
 accepted = sum(bool(row.get("success")) for row in rows)
 print(
     json.dumps(
@@ -278,6 +288,8 @@ from pathlib import Path
 
 
 def load_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
@@ -322,6 +334,18 @@ text = json.dumps(comparison, ensure_ascii=False, indent=2, sort_keys=True) + "\
 Path(sys.argv[5]).write_text(text, encoding="utf-8")
 print(text, end="")
 PY
+fi
+
+if [[ "${KEEP_SERVER_RUNNING}" == "1" ]]; then
+    echo "Benchmark finished; keeping vLLM server PID ${server_pid} running at http://${HOST}:${PORT}."
+    echo "Stopping this wrapper later will stop vLLM and restore the GPU 0/1 holder."
+    set +e
+    wait "${server_pid}"
+    server_status=$?
+    set -e
+    if [[ "${runner_status}" -eq 0 ]]; then
+        runner_status=${server_status}
+    fi
 fi
 
 exit "${runner_status}"

@@ -124,6 +124,12 @@ _BASE_KEYS = (
     "outbound_mode",
     "return_mode",
 )
+_LOGIC_DIVERSITY_KEYS = (
+    "attraction_categories_all",
+    "attraction_categories_any",
+    "exclude_attraction",
+    "allowed_innercity_modes",
+)
 _HOTEL_KEYS = {
     "hotel_attribute",
     "hotel_budget",
@@ -151,6 +157,12 @@ _CHINATRAVEL_CONSTRAINT_WEIGHTS = {
     "all_intercity_mode": 0.03,
     "outbound_mode": 0.05,
     "return_mode": 0.05,
+    # These shapes use TaskSpec-v2 semantics that were already accepted by the
+    # parser and Reward, but were not previously sampled by the composer.
+    "attraction_categories_all": 0.015,
+    "attraction_categories_any": 0.015,
+    "exclude_attraction": 0.015,
+    "allowed_innercity_modes": 0.015,
 }
 
 
@@ -419,6 +431,12 @@ def _build_official_hybrid_slots(count: int, seed: int) -> tuple[PilotSlot, ...]
             recipe = ()
         if days[index] == 1:
             recipe = tuple(key for key in recipe if key not in _HOTEL_KEYS)
+            recipe = tuple(
+                "attraction_categories_any"
+                if key == "attraction_categories_all"
+                else key
+                for key in recipe
+            )
         recipe = recipe[: max_constraints[task_type]]
         if task_type == "human_like":
             persona = _persona(travelers[index], seed, index)
@@ -552,7 +570,15 @@ def _build_blended_slots(count: int, seed: int, profile: str) -> tuple[PilotSlot
                 return_mode=return_mode,
                 usage=recipe_usage,
                 pair_usage=pair_usage,
-                family_weights=_mixed_prior(_CHINATRAVEL_CONSTRAINT_WEIGHTS),
+                family_weights=_mixed_prior(
+                    _CHINATRAVEL_CONSTRAINT_WEIGHTS
+                    if profile == BLENDED_V1_1_PROFILE
+                    else {
+                        key: value
+                        for key, value in _CHINATRAVEL_CONSTRAINT_WEIGHTS.items()
+                        if key not in _LOGIC_DIVERSITY_KEYS
+                    }
+                ),
             )
         recipe_usage.update(recipe)
         for left_index, left in enumerate(sorted(recipe)):
@@ -589,7 +615,8 @@ def _build_blended_slots(count: int, seed: int, profile: str) -> tuple[PilotSlot
             )
         include_meal = any(
             key.startswith("restaurant")
-            or key in {"include_restaurant", "innercity_mode"}
+            or key
+            in {"include_restaurant", "innercity_mode", "allowed_innercity_modes"}
             for key in recipe
         ) or any(
             kind in {"shorter_meal_transfer", "higher_dining_share"}
@@ -1148,14 +1175,43 @@ def _recipe(
     elif outbound_mode == return_mode and rng.random() < 0.4:
         selected.append("all_intercity_mode")
 
+    candidate_keys = _BASE_KEYS + (
+        _LOGIC_DIVERSITY_KEYS
+        if family_weights is not None
+        and any(key in family_weights for key in _LOGIC_DIVERSITY_KEYS)
+        else ()
+    )
     available = [
         key
-        for key in _BASE_KEYS
-        if key not in _INTERCITY_MODE_KEYS and (days > 1 or key not in _HOTEL_KEYS)
+        for key in candidate_keys
+        if key not in _INTERCITY_MODE_KEYS
+        and (days > 1 or key not in _HOTEL_KEYS | {"attraction_categories_all"})
     ]
     rng.shuffle(available)
     while len(selected) < constraint_count:
-        candidates = [key for key in available if key not in selected]
+        candidates = [
+            key
+            for key in available
+            if key not in selected
+            and not (
+                key in _LOGIC_DIVERSITY_KEYS
+                and any(item in _LOGIC_DIVERSITY_KEYS for item in selected)
+            )
+            and not (
+                key in {"attraction_category", *_LOGIC_DIVERSITY_KEYS[:2]}
+                and any(
+                    item in {"attraction_category", *_LOGIC_DIVERSITY_KEYS[:2]}
+                    for item in selected
+                )
+            )
+            and not (
+                key in {"innercity_mode", "allowed_innercity_modes"}
+                and any(
+                    item in {"innercity_mode", "allowed_innercity_modes"}
+                    for item in selected
+                )
+            )
+        ]
         if not candidates:
             raise RuntimeError("Unable to construct a complete constraint recipe.")
 
