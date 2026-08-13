@@ -873,10 +873,9 @@ class SynthesisPipeline:
             else 6
         )
         for candidate_index in range(max_candidates):
-            vary_relaxed_long_trip_meal = (
+            is_relaxed_long_trip = (
                 preference_kind == "relaxed_itinerary"
                 and slot.days > 3
-                and bool(candidate_index % 2)
             )
             attractions_per_day = (
                 2
@@ -889,9 +888,12 @@ class SynthesisPipeline:
                 slot,
                 attractions_per_day=attractions_per_day,
                 include_meal=(
-                    slot.include_meal
-                    or preference_kind in {"less_innercity_time", "less_walking"}
-                    or vary_relaxed_long_trip_meal
+                    bool(candidate_index % 2)
+                    if is_relaxed_long_trip
+                    else (
+                        slot.include_meal
+                        or preference_kind in {"less_innercity_time", "less_walking"}
+                    )
                 ),
                 route_mode=route_modes[candidate_index % len(route_modes)],
             )

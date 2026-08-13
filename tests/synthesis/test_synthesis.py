@@ -1494,6 +1494,60 @@ def test_long_relaxed_preference_varies_meal_stop_instead_of_extra_attractions(
     assert len({_preference_metric(row, "relaxed_itinerary") for row in candidates}) == 2
 
 
+def test_long_relaxed_preference_varies_meal_when_slot_already_includes_one(
+    monkeypatch,
+) -> None:
+    slot = replace(
+        build_pilot_slots(500, 20260839, "chinatravel_blended_v1_1")[386],
+        days=4,
+        preference_kinds=("relaxed_itinerary",),
+        include_meal=True,
+    )
+    captured_include_meal: list[bool] = []
+
+    class FakeBackend:
+        @staticmethod
+        def _records(entity_type: str, city: str) -> list[dict[str, object]]:
+            del entity_type, city
+            return []
+
+    class FakeWitnessBuilder:
+        def __init__(self, backend, *, seed: int) -> None:
+            del backend, seed
+
+        def build(self, candidate_slot, *, origin: str, uid: str):
+            del origin, uid
+            captured_include_meal.append(candidate_slot.include_meal)
+            return SimpleNamespace(
+                evidence_bundle={"routes": {}, "cost_items": [], "total_cost": 0.0},
+                route_mode=candidate_slot.route_mode,
+                selected={
+                    "attractions": [{}] * candidate_slot.days,
+                    "restaurant": (
+                        {"place_id": "restaurant"}
+                        if candidate_slot.include_meal
+                        else None
+                    ),
+                },
+            )
+
+    monkeypatch.setattr(
+        "travelweaver.synthesis.pipeline.WitnessBuilder", FakeWitnessBuilder
+    )
+    pipeline = object.__new__(SynthesisPipeline)
+
+    candidates = pipeline._preference_witnesses(
+        FakeBackend(),
+        slot,
+        origin="武汉",
+        uid="long-relaxed-initial-meal-regression",
+        generation_seed=7,
+    )
+
+    assert set(captured_include_meal) == {False, True}
+    assert len({_preference_metric(row, "relaxed_itinerary") for row in candidates}) == 2
+
+
 def test_chinatravel_blended_v1_1_keeps_benchmark_core_and_tail_split() -> None:
     slots = build_pilot_slots(200, 20260808, "chinatravel_blended_v1_1")
 
