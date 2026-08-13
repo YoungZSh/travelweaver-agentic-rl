@@ -6,11 +6,13 @@ requires-python = ">=3.10,<3.11"
 dependencies = [
   "flash-attn==2.8.3",
   "flash-linear-attention[conv1d]==0.5.1",
+  "geopy>=2.4,<3",
   "hf-transfer",
   "liger-kernel",
   "mathruler",
   "qwen-vl-utils",
   "torch==2.10.0",
+  "TransferQueue==0.1.8",
   "transformers==5.5.3",
   "verl[vllm]",
   "vllm==0.19.1",

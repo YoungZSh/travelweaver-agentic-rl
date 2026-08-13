@@ -1,0 +1,2 @@
+- name: travelweaver_agent
+  _target_: travelweaver_grpo_agent_loop.TravelWeaverAgentLoop

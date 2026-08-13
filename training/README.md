@@ -14,6 +14,7 @@ environment remains the lightweight deterministic environment and rollout stack.
 - FlashAttention: `2.8.3`
 - Flash Linear Attention: `0.5.1`
 - FlashInfer: `0.6.6`
+- TransferQueue: `0.1.8`
 - CUDA runtime wheels: `12.8`
 - Training backend: FSDP/FSDP2
 - Rollout backend: vLLM
@@ -221,3 +222,50 @@ unrelated GPU processes.
 Do not launch until every selected GPU is actually free; the script deliberately does not stop GPU
 holders or other users' processes. Additional veRL Hydra overrides may be appended after the script
 name.
+
+## Qwen3.5-4B online GRPO
+
+Online RL uses the same deterministic `travelweaver-reward-v4` evaluator as offline rollout and
+data construction. Build prompt-only Parquet from one or more generated-task artifact directories:
+
+```bash
+PYTHONPATH=training/src:src uv run --project training python \
+  training/scripts/prepare_grpo_prompts.py \
+  --input-dir data/generated/<batch-1> \
+  --input-dir data/generated/<batch-2> \
+  --output data/grpo/<combined-batch>/train.parquet
+```
+
+The two-A800 launcher fixes `rollout.n=8`, disables GRPO standard-deviation normalization, and
+filters every constant-reward group, including constant negative groups. It safely checkpoints and
+stops after ten consecutive valid constant-reward groups; any usable group resets the streak.
+The default response cap is 32,768 tokens and the actor/ref dynamic token budget is 12,288 tokens
+per GPU, which avoids the full-vocabulary-logit peak observed with a 32K per-GPU micro-batch.
+The 1,000-task pilot uses a deterministic 900/100 train/validation split, keeps actor/reference
+parameter, optimizer, and activation offload disabled, and reserves 80% of GPU memory for
+colocated vLLM. The default actor/ref dynamic token cap is 8192 per GPU to leave headroom for
+full-vocabulary logits. Validation runs once before training and again at the final step; both metrics
+and ten sampled validation generations are logged to W&B.
+
+The 1K-prompt profile uses eight prompt groups per global step and eight rollouts per group, for
+64 real trajectories per step. veRL v1 interprets `ppo_mini_batch_size` in prompt-group units and
+internally multiplies it by `rollout.n`; a value of four therefore produces two 32-trajectory actor
+updates with `ppo_epochs=1`. The run uses 112 global steps, validates again only at step 112, and
+retains at most two actor checkpoints.
+
+```bash
+TRAIN_FILE=data/grpo/<batch>/train.parquet \
+MODEL_PATH=training/outputs/<sft-run>/final-model \
+bash training/scripts/run_qwen3_5_4b_travelweaver_grpo.sh --dry-run
+
+TRAIN_FILE=data/grpo/<batch>/train.parquet \
+MODEL_PATH=training/outputs/<sft-run>/final-model \
+GPU_HOLD_HANDOFF=1 \
+bash training/scripts/run_qwen3_5_4b_travelweaver_grpo.sh
+```
+
+The default profile uses vLLM TP=2, FSDP2 plus Ulysses SP=2, and a 65,536-token total context.
+The prompt manifest and launcher preflight reject witness/Reward leakage, hash mismatches, wrong
+model families, incompatible veRL hooks, or a group size other than eight. See
+[`docs/outcome-reward-shaping-v4.md`](../docs/outcome-reward-shaping-v4.md) for the exact A/V/G
+formula, admission behavior, compatibility policy, and pilot metrics.

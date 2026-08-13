@@ -1,0 +1,240 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+
+def _load_sampler_module():
+    path = Path(__file__).resolve().parents[1] / "src" / "travelweaver_grpo_sampler.py"
+    spec = importlib.util.spec_from_file_location("travelweaver_grpo_sampler_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_agent_loop_module():
+    training_root = Path(__file__).resolve().parents[1]
+    repository_root = training_root.parent
+    sys.path.insert(0, str(repository_root / "src"))
+    path = training_root / "src" / "travelweaver_grpo_agent_loop.py"
+    spec = importlib.util.spec_from_file_location("travelweaver_grpo_agent_loop_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_prompt_preparation_module():
+    training_root = Path(__file__).resolve().parents[1]
+    repository_root = training_root.parent
+    sys.path.insert(0, str(repository_root / "src"))
+    sys.path.insert(0, str(training_root / "src"))
+    path = training_root / "scripts" / "prepare_grpo_prompts.py"
+    spec = importlib.util.spec_from_file_location("prepare_grpo_prompts_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_prompt_split_module():
+    training_root = Path(__file__).resolve().parents[1]
+    path = training_root / "scripts" / "split_grpo_prompts.py"
+    name = "split_grpo_prompts_test"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_prompt_source(path: Path, task_id: str) -> None:
+    path.mkdir()
+    public = {"uid": task_id, "query": f"请为{task_id}规划一次旅行。"}
+    oracle = {
+        "uid": task_id,
+        "scenario": {"scenario_id": f"scenario-{task_id}"},
+    }
+    (path / "tasks.public.jsonl").write_text(
+        json.dumps(public, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    (path / "tasks.oracle.jsonl").write_text(
+        json.dumps(oracle, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    (path / "manifest.json").write_text("{}\n", encoding="utf-8")
+
+
+def _reward_info(reward: float, *, valid: bool = True) -> dict[str, float]:
+    return {
+        "travelweaver_reward": reward,
+        "reward_valid": float(valid),
+        "artifact_score": 0.75,
+        "validity_score": 0.5,
+        "goal_score": 0.25,
+    }
+
+
+def test_group_filter_rejects_every_constant_reward_level() -> None:
+    module = _load_sampler_module()
+    classify = module.classify_reward_group
+
+    for reward in (0.0, 1.0, -1.0, -0.375):
+        assert classify(
+            [_reward_info(reward) for _ in range(8)], group_size=8, tolerance=1e-8
+        ) == ("zero_variance", reward)
+    assert classify(
+        [_reward_info(0.0) for _ in range(7)] + [_reward_info(0.25)],
+        group_size=8,
+        tolerance=1e-8,
+    ) == ("usable", None)
+    assert classify(
+        [_reward_info(0.0) for _ in range(7)] + [_reward_info(0.0, valid=False)],
+        group_size=8,
+        tolerance=1e-8,
+    ) == ("invalid", None)
+
+
+def test_ten_consecutive_no_signal_groups_stop_and_usable_group_resets() -> None:
+    module = _load_sampler_module()
+    sampler = module.TravelWeaverReplayBuffer.__new__(module.TravelWeaverReplayBuffer)
+    sampler.max_consecutive_no_signal = 10
+    sampler.consecutive_no_signal = 0
+    sampler.no_signal_history = []
+    sampler.group_size = 8
+    sampler.zero_variance_tolerance = 1e-8
+    sampler._save_state = lambda: None
+    infos = [_reward_info(-0.5) for _ in range(8)]
+
+    for index in range(9):
+        sampler._record_signal_result(
+            f"dry-{index}", "zero_variance", -0.5, infos, index
+        )
+    sampler._record_signal_result("usable", "usable", None, infos, 9)
+    assert sampler.consecutive_no_signal == 0
+
+    for index in range(9):
+        sampler._record_signal_result(
+            f"dry-again-{index}", "zero_variance", -0.5, infos, index + 10
+        )
+    with pytest.raises(module.ConsecutiveNoSignalStop) as caught:
+        sampler._record_signal_result("stop", "zero_variance", -0.5, infos, 19)
+
+    report = caught.value.report
+    assert report["reason"] == "consecutive_zero_variance_groups"
+    assert report["consecutive_no_signal"] == 10
+    assert report["group_size"] == 8
+    assert report["groups"][-1]["dimension_means"] == {
+        "artifact_score": 0.75,
+        "validity_score": 0.5,
+        "goal_score": 0.25,
+    }
+
+
+def test_qwen_parser_view_keeps_parameter_types_while_prompt_keeps_nested_schema() -> None:
+    module = _load_agent_loop_module()
+    from travelweaver.env import TravelWeaverEnv
+
+    submit = next(
+        schema
+        for schema in TravelWeaverEnv.tool_schemas()
+        if schema["function"]["name"] == "submit_plan"
+    )
+    wrapped = module._RawToolSchema(submit)
+
+    assert wrapped.function.parameters.properties["plan"].type == "object"
+    dumped = wrapped.model_dump()
+    itinerary = dumped["function"]["parameters"]["properties"]["plan"]["properties"][
+        "itinerary"
+    ]
+    assert itinerary["type"] == "array"
+    assert "items" in itinerary
+
+
+def test_prompt_preparation_combines_multiple_source_batches(tmp_path: Path) -> None:
+    module = _load_prompt_preparation_module()
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _write_prompt_source(first, "task-1")
+    _write_prompt_source(second, "task-2")
+    output = tmp_path / "train.parquet"
+
+    report = module.prepare([first, second], output)
+
+    assert report["format_version"] == "travelweaver-grpo-prompts-v2"
+    assert report["row_count"] == 2
+    assert [source["row_count"] for source in report["sources"]] == [1, 1]
+    assert report["contains_witness"] is False
+    assert report["contains_reward_labels"] is False
+    assert output.is_file()
+
+
+def test_prompt_preparation_rejects_duplicate_ids_across_batches(tmp_path: Path) -> None:
+    module = _load_prompt_preparation_module()
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _write_prompt_source(first, "duplicate")
+    _write_prompt_source(second, "duplicate")
+
+    with pytest.raises(ValueError, match="Duplicate task_id"):
+        module.prepare([first, second], tmp_path / "train.parquet")
+
+
+def test_grpo_prompt_split_is_exact_deterministic_and_stratified_by_task_type() -> None:
+    module = _load_prompt_split_module()
+    records = [
+        module.SplitRecord(
+            task_id=f"{task_type}-{index}",
+            task_type=task_type,
+            scenario_profile=f"scenario-{index % 2}",
+            constraint_count=2 + index % 3,
+            trip_days=3 + index % 4,
+        )
+        for task_type in ("easy", "medium")
+        for index in range(10)
+    ]
+
+    first = module.split_records(records, validation_count=2, seed=20260813)
+    second = module.split_records(records, validation_count=2, seed=20260813)
+
+    assert first == second
+    assert len(first) == 2
+    selected_types = [record.task_type for record in records if record.task_id in first]
+    assert selected_types.count("easy") == 1
+    assert selected_types.count("medium") == 1
+
+
+def test_grpo_prompt_split_preserves_rare_scenario_quota() -> None:
+    module = _load_prompt_split_module()
+    records = [
+        module.SplitRecord(
+            task_id=f"normal-{index}",
+            task_type="medium",
+            scenario_profile="normal",
+            constraint_count=2 + index % 3,
+            trip_days=2 + index % 4,
+        )
+        for index in range(90)
+    ] + [
+        module.SplitRecord(
+            task_id=f"price-change-{index}",
+            task_type="medium",
+            scenario_profile="price_change",
+            constraint_count=3,
+            trip_days=3,
+        )
+        for index in range(10)
+    ]
+
+    selected = module.split_records(records, validation_count=10, seed=20260813)
+
+    selected_scenarios = [
+        record.scenario_profile for record in records if record.task_id in selected
+    ]
+    assert selected_scenarios.count("normal") == 9
+    assert selected_scenarios.count("price_change") == 1
