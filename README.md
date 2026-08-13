@@ -17,10 +17,9 @@ uv run travelweaver run-agent --task-id e20241028160248698752
 uv run pytest
 ```
 
-The ChinaTravel database and imported task snapshots are not redistributed by this repository.
-The bootstrap command can download the official Google Drive folder, import a local archive, or
-verify an existing manual installation; `import-tasks` recreates the ignored `data/tasks/`
-snapshots from the pinned upstream revision.
+The ChinaTravel database is not redistributed by this repository. The bootstrap command
+can download the official Google Drive folder, import a local archive, or verify an
+existing manual installation.
 
 See [the MVP guide](docs/travelweaver-env-mvp.md), the frozen
 [Reward and evaluation contract](docs/reward-and-evaluation.md), and the broader

@@ -15,7 +15,9 @@ htmlcov/
 
 # Local datasets, downloads, and generated runtime artifacts.
 ckpts/
-/data/
+/data/*
+!/data/tasks/
+!/data/tasks/**
 /checkpoints/
 /logs/
 /ray_results/
