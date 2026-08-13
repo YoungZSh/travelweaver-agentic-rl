@@ -28,10 +28,10 @@ See [the MVP guide](docs/travelweaver-env-mvp.md), the frozen
 ## Version baseline
 
 - Python: `3.10.19`
-- Environment protocol: `travelweaver-environment-v0.6`
+- Environment protocol: `travelweaver-environment-v0.7`
 - Tool protocol: `travelweaver-tools-v5-agent`
-- TaskSpec / Reward: `travelweaver-task-spec-v3` / `travelweaver-reward-v3`
-- Trajectory / model response: `travelweaver-trajectory-v9` /
+- TaskSpec / Reward: `travelweaver-task-spec-v3` / `travelweaver-reward-v4`
+- Trajectory / model response: `travelweaver-trajectory-v10` /
   `travelweaver-model-tool-response-v3`
 - RL training stack: pinned `verl==0.9.0.dev0` in the separate `training/` Linux/CUDA environment
 
@@ -92,12 +92,12 @@ uv run travelweaver rollout-api --task-id e20241028160248698752
 The command loads `.env`, calls the official OpenAI-compatible DeepSeek API, and appends
 the full replayable record to `data/trajectories/deepseek-v4-flash.jsonl`. The rollout
 runner itself is provider-neutral: DeepSeek is currently a configuration preset over the
-shared OpenAI-compatible function-calling client. Each `travelweaver-trajectory-v9`
+shared OpenAI-compatible function-calling client. Each `travelweaver-trajectory-v10`
 record contains canonical `messages`, `tools`, executed `steps`, terminal Reward details,
 RFT acceptance, and a separate audit event stream. Local dotenv files and generated
 trajectories are ignored by Git.
 
-Trajectory v9 canonicalizes malformed or non-object function arguments to `{}` in model history
+Trajectory v10 canonicalizes malformed or non-object function arguments to `{}` in model history
 while retaining the raw model output in the audit stream. The environment still returns an invalid
 tool response, allowing the next model turn to recover without resending malformed JSON to an
 OpenAI-compatible endpoint.

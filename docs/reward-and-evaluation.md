@@ -1,7 +1,10 @@
 # TravelWeaver Reward 与离线评估协议
 
-本文档冻结 TravelEnv 第一版可训练评分协议。它只面向 TravelWeaver 支持的旅行规划
+本文档冻结 TravelEnv 当前可训练评分协议。它只面向 TravelWeaver 支持的旅行规划
 任务，不试图抽象购物、网页操作等其他 Agent 领域。
+
+> Reward v4 的公式、兼容边界和 GRPO 运行约定见
+> [`outcome-reward-shaping-v4.md`](outcome-reward-shaping-v4.md)。
 
 ## 1. 设计边界
 
@@ -70,29 +73,36 @@ v1/v2 快照继续使用包含接驳路线的旧语义，不按 v3 静默重解�
 模型提交错误、伪造 ID 或缺少必需引用属于有效负样本；环境数据损坏、规格不受支持或
 验证器异常属于基础设施问题，返回 `reward_valid=false`。
 
-## 4. TravelReward v3
+## 4. TravelReward v4
 
-每个检查返回 `pass`、`fail` 或 `unverifiable`。硬检查分为两类：
+每个检查具有唯一 A/V/G owner，并返回 `pass`、`fail`、`blocked`、`not_applicable` 或
+`unverifiable`：
 
 1. 环境不变量：Schema、实体落地、时间无重叠、营业时间、路线可达、城际往返、住宿
    覆盖和费用/数量一致；
 2. TaskSpec 约束：预算、时间、交通、酒店、景点、餐饮及包含/排除要求。
 
-第一版全部激活的硬检查等权，全部可评分软约束也等权：
+三个互斥维度分别表示最终产物结构、环境可执行性和冻结目标满足度。每层只对 active、可评分
+检查求平均：
 
 ```text
-H = passed_hard / active_hard
+A = mean(active artifact scores)
+V = mean(active validity scores)
+G = mean(active goal scores)
 S = passed_soft / active_soft
 ```
 
 没有软约束时 `S=1`。终局映射为：
 
-- 基础设施或规格不可验证：`reward=0`、`reward_valid=false`，训练时剔除；
+- 基础设施或规格不可验证：`reward=-1`、`reward_valid=false`，训练时剔除；
 - 未提交可评估计划、步数耗尽或非法终止：`reward=-1`；
-- 任一硬检查失败：`reward=-1+H`，范围 `[-1, 0)`；
+- admission 被拒绝或任一硬检查失败：
+  `reward=min(-1+(A+V+G)/3,-1e-8)`，范围 `[-1, 0)`；
 - 所有硬检查通过：`reward=0.5+0.5*S`，范围 `[0.5, 1]`。
 
-Reward 只在 episode 终态产生，不对普通搜索动作给正奖励，也不向 Actor 暴露隐藏规格
+schema 合法但 admission 被拒绝的 raw plan 使用同一 evaluator collect-all，不再直接压成
+no-plan。模型造成的前置条件缺失使下游检查记 `blocked`，不把它误当基础设施错误，也不重复
+计分。Reward 只在 episode 终态产生，不对普通搜索动作给正奖励，也不向 Actor 暴露隐藏规格
 或评分明细。RFT/SFT 只接纳正常提交、`reward_valid=true` 且所有硬检查通过的轨迹；
 软分仅保留为分析字段。后续 GRPO 直接使用上述标量 Reward。
 

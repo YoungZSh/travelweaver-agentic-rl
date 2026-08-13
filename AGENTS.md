@@ -84,17 +84,17 @@ uv run --project training ruff check training
 
 修改序列化结构或行为时，检查并按需升级对应版本：
 
-- Environment：`travelweaver-environment-v0.6`
+- Environment：`travelweaver-environment-v0.7`
 - Observation：`travelweaver-observation-v4`
 - Tools：`travelweaver-tools-v5-agent`
 - TaskSpec：`travelweaver-task-spec-v3`
 - Blueprint / Surface：`travelweaver-task-blueprint-v2` / `travelweaver-task-surface-v3`
-- Reward：`travelweaver-reward-v3`
-- Trajectory：`travelweaver-trajectory-v9`
+- Reward：`travelweaver-reward-v4`
+- Trajectory：`travelweaver-trajectory-v10`
 - Model tool response：`travelweaver-model-tool-response-v3`（默认 `delta`，兼容 `snapshot`）
 - Scenario：`travelweaver-scenario-v1`
-- Synthesis / artifacts：`travelweaver-synthesis-v12` /
-  `travelweaver-synthesis-artifacts-v10`
+- Synthesis / artifacts：`travelweaver-synthesis-v13` /
+  `travelweaver-synthesis-artifacts-v11`
 - SFT：`travelweaver-sft-v5`
 - Polisher prompt：`travelweaver-zh-polisher-v7`
 

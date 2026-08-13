@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-GENERATOR_VERSION = "travelweaver-synthesis-v12"
+GENERATOR_VERSION = "travelweaver-synthesis-v13"
 PROMPT_VERSION = "travelweaver-zh-polisher-v7"
-ARTIFACT_VERSION = "travelweaver-synthesis-artifacts-v10"
+ARTIFACT_VERSION = "travelweaver-synthesis-artifacts-v11"
 WORLD_SNAPSHOT_VERSION = "chinatravel-pinned-v1"
 
 

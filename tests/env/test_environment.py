@@ -370,7 +370,11 @@ def test_schema_valid_invalid_submission_terminates_without_retry(env: TravelWea
     assert invalid.info["valid_action"]
     assert invalid.terminated
     assert invalid.info["termination_reason"] == "invalid_plan_submitted"
-    assert invalid.reward == -1.0
+    assert -1.0 < invalid.reward < 0.0
+    detail = invalid.info["reward_detail"]
+    assert detail["reward_type"] == "partial_invalid_plan"
+    assert detail["admission_passed"] is False
+    assert detail["reward_valid"] is True
 
 
 def test_submit_rejects_candidate_saved_for_the_wrong_purpose(

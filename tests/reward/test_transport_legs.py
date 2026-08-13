@@ -50,4 +50,9 @@ def test_transport_mode_constraints_score_outbound_and_return_independently(env)
     task_checks = {check.id: check for check in result.checks if check.source == "task_spec"}
     assert task_checks["outbound"].status == "pass"
     assert task_checks["return"].status == "pass"
-    assert result.reward == 1.0
+    # Changing only the declared activity type does not change frozen candidate evidence.
+    # Goal constraints pass independently, while environment validity correctly rejects it.
+    assert next(check for check in result.checks if check.id == "candidate_usage").status == (
+        "fail"
+    )
+    assert result.reward < 0.0

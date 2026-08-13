@@ -60,6 +60,25 @@ def test_entity_category_supports_multivalue_and_any_of_groups() -> None:
     ).status == "pass"
 
 
+def test_positive_entity_group_uses_best_partial_coverage_for_shaping() -> None:
+    constraint = ConstraintSpec(
+        id="partial",
+        kind="entity_category",
+        operator="contains",
+        value={"any_of": [["公园", "博物馆"], ["古迹", "美术馆", "动物园"]]},
+        scope="attraction",
+        hardness="hard",
+        source_text="任选一组完整覆盖",
+    )
+    plan = {"activities": [{"activity_type": "attraction", "candidate_id": "park"}]}
+    evidence = {"entities": {"park": {"category": "公园"}}}
+
+    result = evaluate_constraint(constraint, _spec(constraint), plan, evidence)
+
+    assert result.status == "fail"
+    assert result.score == 0.5
+
+
 def test_transport_mode_negative_set_rejects_only_forbidden_modes() -> None:
     constraint = ConstraintSpec(
         id="allowed",

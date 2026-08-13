@@ -20,9 +20,16 @@ def test_environment_returns_strict_terminal_reward(env) -> None:
 
     assert terminal["reward"] == 1.0
     detail = terminal["info"]["reward_detail"]
-    assert detail["reward_version"] == "travelweaver-reward-v3"
+    assert detail["reward_version"] == "travelweaver-reward-v4"
     assert detail["reward_type"] == "strict_valid_plan"
     assert detail["all_hard_pass"] is True
+    assert detail["admission_passed"] is True
+    assert set(detail["dimension_scores"]) == {
+        "artifact_conformance",
+        "environment_validity",
+        "goal_satisfaction",
+    }
+    assert all(score == 1.0 for score in detail["dimension_scores"].values())
     assert all(check["status"] == "pass" for check in detail["checks"])
 
 

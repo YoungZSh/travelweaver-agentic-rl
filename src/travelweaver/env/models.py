@@ -65,6 +65,7 @@ class EvidenceBundle:
     cost_items: tuple[dict[str, Any], ...]
     total_cost: float | None
     quantity_rules_version: str
+    candidate_usages: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

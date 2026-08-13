@@ -18,6 +18,7 @@ def _result(
     *,
     required: Any = None,
     actual: Any = None,
+    score: float | None = None,
 ) -> CheckResult:
     return CheckResult(
         id=constraint.id,
@@ -26,6 +27,7 @@ def _result(
         status=status,
         message=message,
         evidence={"required": required, "actual": actual},
+        score=score,
     )
 
 
@@ -72,6 +74,25 @@ def _compare(operator: str, actual: Any, expected: Any) -> bool | None:
     return None
 
 
+def _numeric_score(operator: str, actual: Any, expected: Any, passed: bool) -> float:
+    if passed:
+        return 1.0
+    actual_number = _number(actual)
+    expected_number = _number(expected)
+    if actual_number is None or expected_number is None:
+        return 0.0
+    if operator == "lte":
+        return max(0.0, min(expected_number / actual_number, 1.0)) if actual_number else 0.0
+    if operator == "gte":
+        return max(0.0, min(actual_number / expected_number, 1.0)) if expected_number else 0.0
+    if operator == "eq":
+        if actual_number * expected_number < 0:
+            return 0.0
+        larger = max(abs(actual_number), abs(expected_number))
+        return min(abs(actual_number), abs(expected_number)) / larger if larger else 0.0
+    return 0.0
+
+
 def _required_groups(value: Any, key: str) -> list[set[str]] | None:
     if not isinstance(value, Mapping):
         return None
@@ -95,6 +116,24 @@ def _contains_groups(actual_values: set[str], groups: list[set[str]]) -> bool:
         all(any(required in actual for actual in actual_values) for required in group)
         or all(required in normalized_actual for required in group)
         for group in groups
+    )
+
+
+def _group_coverage(actual_values: set[str], groups: list[set[str]]) -> float:
+    """Return completion of the best alternative group for positive obligations."""
+
+    normalized_actual = "\n".join(actual_values)
+    return max(
+        (
+            sum(
+                any(required in actual for actual in actual_values)
+                or required in normalized_actual
+                for required in group
+            )
+            / max(1, len(group))
+            for group in groups
+        ),
+        default=0.0,
     )
 
 
@@ -146,12 +185,14 @@ def _total_budget(
     passed = _compare(constraint.operator, actual, required)
     if passed is None:
         return _result(constraint, CHECK_UNVERIFIABLE, "Budget evidence is incomplete.")
+    score = _numeric_score(constraint.operator, actual, required, passed)
     return _result(
         constraint,
         CHECK_PASS if passed else CHECK_FAIL,
         "Total budget check completed.",
         required=required,
         actual=actual,
+        score=score,
     )
 
 
@@ -176,7 +217,16 @@ def _category_budget(
         if isinstance(item, Mapping) and item.get("activity_type") in activity_types
     ]
     amounts = [_number(item.get("amount")) for item in items]
-    if not items or any(amount is None for amount in amounts):
+    if not items:
+        return _result(
+            constraint,
+            CHECK_FAIL,
+            "No activity contributes to the requested category budget.",
+            required=required,
+            actual=0.0,
+            score=0.0,
+        )
+    if any(amount is None for amount in amounts):
         return _result(constraint, CHECK_UNVERIFIABLE, "Category cost evidence is incomplete.")
     total = sum(amount for amount in amounts if amount is not None)
     if basis == "per_person_per_activity":
@@ -186,12 +236,16 @@ def _category_budget(
     else:
         return _result(constraint, CHECK_UNVERIFIABLE, "Unknown category budget basis.")
     passed = _compare(constraint.operator, actual, required)
+    if passed is None:
+        return _result(constraint, CHECK_UNVERIFIABLE, "Category budget operator is unsupported.")
+    score = _numeric_score(constraint.operator, actual, required, bool(passed))
     return _result(
         constraint,
         CHECK_PASS if passed else CHECK_FAIL,
         "Category budget check completed.",
         required=required,
         actual=round(actual, 4),
+        score=score,
     )
 
 
@@ -262,12 +316,28 @@ def _transport_mode(
         passed = actual.isdisjoint(set().union(*groups))
     else:
         return _result(constraint, CHECK_UNVERIFIABLE, "Unsupported mode operator.")
+    if constraint.operator in {"not_in", "exclude"}:
+        score = float(passed)
+    elif constraint.operator == "eq":
+        score = max(
+            (
+                len(actual & required) / max(1, len(actual | required))
+                for required in groups
+            ),
+            default=0.0,
+        )
+    else:
+        score = max(
+            (len(actual & required) / max(1, len(required)) for required in groups),
+            default=0.0,
+        )
     return _result(
         constraint,
         CHECK_PASS if passed else CHECK_FAIL,
         "Transport mode check completed.",
         required={"leg": leg, "mode_groups": [sorted(group) for group in groups]},
         actual=sorted(actual),
+        score=score,
     )
 
 
@@ -295,12 +365,18 @@ def _entity_category(
         return _result(constraint, CHECK_UNVERIFIABLE, "Entity category evidence is incomplete.")
     matched = _contains_groups(actual, groups)
     passed = not matched if constraint.operator == "not_contains" else matched
+    score = (
+        float(passed)
+        if constraint.operator == "not_contains"
+        else _group_coverage(actual, groups)
+    )
     return _result(
         constraint,
         CHECK_PASS if passed else CHECK_FAIL,
         "Entity category check completed.",
         required=[sorted(group) for group in groups],
         actual=sorted(actual),
+        score=score,
     )
 
 
@@ -323,6 +399,11 @@ def _entity_attribute(
         "Entity attribute check completed.",
         required=[sorted(group) for group in groups],
         actual=sorted(actual),
+        score=(
+            float(passed)
+            if constraint.operator == "not_contains"
+            else _group_coverage(actual, groups)
+        ),
     )
 
 
@@ -345,6 +426,11 @@ def _entity_name(
         "Entity inclusion check completed.",
         required=[sorted(group) for group in groups],
         actual=sorted(actual),
+        score=(
+            float(passed)
+            if constraint.kind == "exclude_entity"
+            else _group_coverage(actual, groups)
+        ),
     )
 
 
@@ -361,17 +447,35 @@ def _room_value(
         item.get("rooms" if key == "count" else key)
         for item in _scope_activities(plan, "accommodation")
     ]
-    if required is None or not actual or any(value is None for value in actual):
+    if required is None:
+        return _result(constraint, CHECK_UNVERIFIABLE, "Room selection evidence is incomplete.")
+    if not actual:
+        return _result(
+            constraint,
+            CHECK_FAIL,
+            "No accommodation supplies the requested room selection.",
+            required=required,
+            actual=[],
+            score=0.0,
+        )
+    if any(value is None for value in actual):
         return _result(constraint, CHECK_UNVERIFIABLE, "Room selection evidence is incomplete.")
     outcomes = [_compare(constraint.operator, value, required) for value in actual]
     if any(value is None for value in outcomes):
         return _result(constraint, CHECK_UNVERIFIABLE, "Room comparison is unsupported.")
+    score = sum(
+        _numeric_score(constraint.operator, value, required, bool(outcome))
+        if constraint.kind == "room_count"
+        else float(bool(outcome))
+        for value, outcome in zip(actual, outcomes, strict=True)
+    ) / len(outcomes)
     return _result(
         constraint,
         CHECK_PASS if all(outcomes) else CHECK_FAIL,
         "Room selection check completed.",
         required=required,
         actual=actual,
+        score=score,
     )
 
 
@@ -391,12 +495,14 @@ def _activity_count(
     passed = _compare(constraint.operator, len(activities), required)
     if passed is None:
         return _result(constraint, CHECK_UNVERIFIABLE, "Activity count is malformed.")
+    score = _numeric_score(constraint.operator, len(activities), required, passed)
     return _result(
         constraint,
         CHECK_PASS if passed else CHECK_FAIL,
         "Activity count check completed.",
         required=required,
         actual=len(activities),
+        score=score,
     )
 
 
@@ -431,7 +537,18 @@ def _time_window(
         elif leg == "return" and entity.get("destination_city") == spec.trip.origin:
             selected.append(activity)
     actual_values = [_minutes(activity.get(field)) for activity in selected]
-    if required is None or not selected or any(value is None for value in actual_values):
+    if required is None:
+        return _result(constraint, CHECK_UNVERIFIABLE, "Intercity time evidence is incomplete.")
+    if not selected:
+        return _result(
+            constraint,
+            CHECK_FAIL,
+            "No intercity activity exists for the requested time window.",
+            required=value.get("time"),
+            actual=[],
+            score=0.0,
+        )
+    if any(value is None for value in actual_values):
         return _result(constraint, CHECK_UNVERIFIABLE, "Intercity time evidence is incomplete.")
     outcomes = [_compare(constraint.operator, actual, required) for actual in actual_values]
     return _result(
@@ -440,6 +557,7 @@ def _time_window(
         "Intercity time window check completed.",
         required=value.get("time"),
         actual=[activity.get(field) for activity in selected],
+        score=sum(bool(outcome) for outcome in outcomes) / len(outcomes),
     )
 
 

@@ -152,11 +152,11 @@ def test_api_agent_executes_model_tool_call_and_records_trajectory(env) -> None:
     assert "observation" in run.steps[0]["result"]
     assert len(run.tools) == 15
     persisted = run.to_dict(include_trajectory=True)
-    assert persisted["trajectory_version"] == "travelweaver-trajectory-v9"
+    assert persisted["trajectory_version"] == "travelweaver-trajectory-v10"
     assert persisted["user_content_format"] == "travelweaver-natural-query-v1"
     assert persisted["tool_response_mode"] == "delta"
     assert persisted["model_tool_response_version"] == MODEL_TOOL_RESPONSE_VERSION
-    assert persisted["final_reward"] == -1.0
+    assert -1.0 < persisted["final_reward"] < 0.0
     assert persisted["rft_accepted"] is False
     assert {"messages", "tools", "steps", "trajectory"} <= persisted.keys()
     assert "not-a-real-secret" not in repr(config)

@@ -21,11 +21,11 @@ from .ids import make_route_id
 from .models import EvidenceBundle, Observation, PlanSnapshot, StepResult
 from .tool_schemas import parameter_schema, tool_schemas
 
-ENVIRONMENT_VERSION = "travelweaver-environment-v0.6"
+ENVIRONMENT_VERSION = "travelweaver-environment-v0.7"
 OBSERVATION_VERSION = "travelweaver-observation-v4"
 TOOLS_VERSION = "travelweaver-tools-v5-agent"
 PLAN_SNAPSHOT_VERSION = "travelweaver-plan-snapshot-v2"
-EVIDENCE_BUNDLE_VERSION = "travelweaver-evidence-v2"
+EVIDENCE_BUNDLE_VERSION = "travelweaver-evidence-v3"
 QUANTITY_RULES_VERSION = "travelweaver-quantity-rules-v1"
 DEFAULT_MAX_VALID_STEPS = 50
 
@@ -128,7 +128,11 @@ class TravelWeaverEnv:
             outcome = self._execute(tool, arguments)
         except (BackendQueryError, TravelWeaverError, ValueError, TypeError) as error:
             if tool == "submit_plan":
-                return self._rejected_submission(error)
+                raw_plan = arguments.get("plan")
+                return self._rejected_submission(
+                    error,
+                    raw_plan if isinstance(raw_plan, Mapping) else {},
+                )
             return self._invalid_step(error)
 
         self._valid_steps += 1
@@ -600,6 +604,15 @@ class TravelWeaverEnv:
             cost_items=tuple(cost_items),
             total_cost=total_cost,
             quantity_rules_version=QUANTITY_RULES_VERSION,
+            candidate_usages={
+                candidate_id: {
+                    "candidate_id": candidate_id,
+                    "entity_type": candidate.get("entity_type"),
+                    "purpose": candidate.get("purpose"),
+                }
+                for candidate_id, candidate in self._candidates.items()
+                if candidate_id in used_entities
+            },
         )
 
         return {
@@ -897,13 +910,21 @@ class TravelWeaverEnv:
             },
         )
 
-    def _rejected_submission(self, error: Exception) -> StepResult:
+    def _rejected_submission(
+        self, error: Exception, raw_plan: Mapping[str, Any]
+    ) -> StepResult:
         """Terminate after the first schema-valid submit_plan, even when it is invalid."""
 
         self._valid_steps += 1
         self._invalid_streak = 0
         self._done = True
-        reward_result = self.reward_evaluator.no_plan("invalid_plan_submitted")
+        reward_result = self.reward_evaluator.evaluate_submission(
+            self._require_task_spec(),
+            raw_plan,
+            self._candidates,
+            self._routes,
+            termination_reason="invalid_plan_submitted",
+        )
         result = {
             "tool": "submit_plan",
             "status": "rejected",

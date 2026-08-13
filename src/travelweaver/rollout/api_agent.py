@@ -31,7 +31,7 @@ __all__ = [
     "render_task_user_content",
 ]
 
-TRAJECTORY_VERSION = "travelweaver-trajectory-v9"
+TRAJECTORY_VERSION = "travelweaver-trajectory-v10"
 SUPPORTED_TRAJECTORY_VERSIONS = frozenset(
     {
         "travelweaver-trajectory-v3",
@@ -40,6 +40,7 @@ SUPPORTED_TRAJECTORY_VERSIONS = frozenset(
         "travelweaver-trajectory-v6",
         "travelweaver-trajectory-v7",
         "travelweaver-trajectory-v8",
+        "travelweaver-trajectory-v9",
         TRAJECTORY_VERSION,
     }
 )

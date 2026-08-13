@@ -10,7 +10,7 @@ MVP 将 ChinaTravel 的固定数据快照包装为一个可回放的进程内 Py
 reset(task) -> 查询证据 -> 管理候选 -> submit_plan -> terminal
 ```
 
-环境已经包含完整的 17 工具状态闭环、确定性 Demo Agent、OpenAI-compatible
+环境已经包含完整的 15 工具状态闭环、确定性 Demo Agent、OpenAI-compatible
 function-calling rollout、通用 TravelTaskSpec、终局 TravelReward 和严格 RFT 过滤。
 普通查询动作 Reward 为 `0.0`，只有提交或截断产生终局 Reward。SFT 数据加工和训练循环位于
 隔离的 `training/` 项目中；根目录环境不引入 GPU 依赖，项目不引入 MCP。
@@ -20,10 +20,10 @@ function-calling rollout、通用 TravelTaskSpec、终局 TravelReward 和严格
 - Python `3.10.19`，项目约束 `>=3.10,<3.11`；
 - ChinaTravel submodule commit `456b60a28ce0626875a968666c07094e3c90520e`；
 - 训练使用独立 Linux/CUDA 环境和固定 commit 的 `verl==0.9.0.dev`；
-- 环境、Observation、工具协议分别为 `travelweaver-environment-v0.6`、
+- 环境、Observation、工具协议分别为 `travelweaver-environment-v0.7`、
   `travelweaver-observation-v4`、`travelweaver-tools-v5-agent`；
 - TaskSpec、Reward 和轨迹协议分别为 `travelweaver-task-spec-v3`、
-  `travelweaver-reward-v3`、`travelweaver-trajectory-v9`；模型可见工具返回协议为
+  `travelweaver-reward-v4`、`travelweaver-trajectory-v10`；模型可见工具返回协议为
   `travelweaver-model-tool-response-v3`。
 
 ## 2. 安装与数据准备
@@ -135,9 +135,10 @@ env.close()
 通过安全 AST 适配器转换，654 行当前全部覆盖且绝不执行源码；自由文本任务可通过
 `LLMTaskSpecCompiler` 的单一 function call 生成候选 Spec，再以确定性校验失败关闭。
 
-所有检查返回 `pass | fail | unverifiable`。设硬检查通过率为 `H`、软约束满足率为
-`S`：无可评估提交为 `-1`；硬约束失败为 `-1+H`；全部硬约束通过为
-`0.5+0.5×S`；基础设施不可验证为 `0` 且 `reward_valid=false`。严格 RFT 过滤只接纳
+所有检查归属互斥的 A/V/G 维度，并返回
+`pass | fail | blocked | not_applicable | unverifiable`。无可评估提交为 `-1`；admission
+被拒绝或硬约束失败为 `min(-1+(A+V+G)/3,-1e-8)`；全部硬约束通过为
+`0.5+0.5×S`；基础设施不可验证设置 `reward_valid=false` 并从训练剔除。严格 RFT 过滤只接纳
 正常提交、Reward 有效且全部硬约束通过的轨迹。完整协议见
 [Reward 与离线评估协议](reward-and-evaluation.md)。
 
@@ -168,14 +169,14 @@ cp .env.example .env
 uv run travelweaver rollout-api --task-id e20241028160248698752
 ```
 
-默认模型为 `deepseek-v4-flash`，完整轨迹按 `travelweaver-trajectory-v9` 写入
+默认模型为 `deepseek-v4-flash`，完整轨迹按 `travelweaver-trajectory-v10` 写入
 `data/trajectories/deepseek-v4-flash.jsonl`。轨迹以标准 OpenAI-compatible
 `messages + tools` 作为可重放对话，同时独立保存已执行 `steps`、审计事件、终止状态
 和 token usage，但不会包含 API key。每个 assistant 回合只执行一个工具；若模型返回
 并行调用，规范化消息只保留第一个，其余调用只进入审计事件，避免出现未响应的
 `tool_call_id`。
 
-V9 对 malformed 或解析后非 object 的 function arguments 使用可恢复历史：原始坏字符串写入
+V10 对 malformed 或解析后非 object 的 function arguments 使用可恢复历史：原始坏字符串写入
 `tool_argument_normalization` 审计事件和 step 的 `raw_tool_call`，实际环境动作与下一轮模型历史
 统一规范为 `{}`。该动作仍会得到 invalid tool response，模型可以在下一轮修正，同时避免把坏
 JSON 原样发回 OpenAI-compatible 服务而触发 HTTP 400。
