@@ -273,8 +273,15 @@ On the eight-A800 `g0008` host, the four-GPU profile uses GPUs 0-3. It preserves
 eight prompt groups, eight rollouts per group, PPO mini-batch of four, two actor updates per global
 step, 112 steps, and 7,168 total training trajectories. The extra GPUs provide two colocated TP=2
 vLLM replicas with 16 AgentLoop workers; FSDP uses SP=2 and DP=2. Its per-GPU dynamic token cap is
-24,576 and its vLLM memory fraction is 75%. A real launch refuses to start if any selected GPU has a
-compute process. A CPU-only dry-run remains safe while GPUs are occupied.
+24,576 and its vLLM memory fraction is 75%. A real launch keeps the four verified tmux holder
+sessions alive through CPU preflight, stops those sessions immediately before GRPO, and restores
+their exact commands on `EXIT`, `HUP`, `INT`, or `TERM`. Any other selected-GPU compute process still
+causes the launcher to refuse startup. A CPU-only dry-run never hands off the holders.
+
+Every completed AgentLoop attempt, including groups later filtered and refilled, is atomically saved
+under `${RUN_DIR}/rollout-traces-all/` with decoded prompt/response text, response-mask runs, Reward,
+and the complete TravelWeaver environment audit. veRL's standard accepted training and validation
+dumps are also enabled under `${RUN_DIR}/rollouts/` and `${RUN_DIR}/validation-rollouts/`.
 
 ```bash
 TRAIN_FILE=/ssd/home/zc/travelweaver-agentic-rl/data/grpo/chinatravel-grpo-v4-1000-split90-10-zca800/train.parquet \

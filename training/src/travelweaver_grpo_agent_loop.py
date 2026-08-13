@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import time
+import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -68,6 +72,60 @@ class TravelWeaverAgentLoop(ToolAgentLoop):
         self._task_id: str | None = None
         self._audit_steps: list[dict[str, Any]] = []
         self._trajectory_length_exceeded = False
+
+    def _write_rollout_trace(
+        self, output: AgentLoopOutput, *, task_id: str, task_dir: str, kwargs: dict[str, Any]
+    ) -> None:
+        trace_root = os.environ.get("TRAVELWEAVER_ROLLOUT_TRACE_DIR")
+        if not trace_root:
+            return
+        destination = Path(trace_root)
+        destination.mkdir(parents=True, exist_ok=True)
+
+        response_mask_rle: list[list[int]] = []
+        for raw_value in output.response_mask:
+            value = int(raw_value)
+            if response_mask_rle and response_mask_rle[-1][0] == value:
+                response_mask_rle[-1][1] += 1
+            else:
+                response_mask_rle.append([value, 1])
+
+        metadata = {
+            key: kwargs[key]
+            for key in ("index", "scenario_id", "data_source", "extra_info")
+            if key in kwargs
+        }
+        payload = {
+            "format_version": "travelweaver-grpo-rollout-trace-v1",
+            "task_id": task_id,
+            "task_dir": task_dir,
+            "metadata": metadata,
+            "prompt_text": self.tokenizer.decode(
+                output.prompt_ids, skip_special_tokens=False
+            ),
+            "response_text": self.tokenizer.decode(
+                output.response_ids, skip_special_tokens=False
+            ),
+            "prompt_token_count": len(output.prompt_ids),
+            "response_token_count": len(output.response_ids),
+            "response_mask_rle": response_mask_rle,
+            "num_turns": int(output.num_turns),
+            "reward_score": float(output.reward_score),
+            "reward_extra_info": output.extra_fields.get("reward_extra_info"),
+            "travelweaver_audit": output.extra_fields.get("travelweaver_audit"),
+        }
+        final_path = destination / (
+            f"{time.time_ns()}-{os.getpid()}-{uuid.uuid4().hex}.json"
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=destination, prefix=".trace-", delete=False
+        ) as handle:
+            json.dump(payload, handle, ensure_ascii=False, default=_json_encode_default)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary_path = Path(handle.name)
+        os.replace(temporary_path, final_path)
 
     def _mark_trajectory_length_exceeded(self) -> None:
         self._trajectory_length_exceeded = True
@@ -162,6 +220,9 @@ class TravelWeaverAgentLoop(ToolAgentLoop):
                     "sequence_tokens": sequence_tokens,
                     "trajectory_max_tokens": self.trajectory_max_tokens,
                 }
+                self._write_rollout_trace(
+                    output, task_id=task_id, task_dir=task_dir, kwargs=kwargs
+                )
                 return output
             if self._terminal_result is None:
                 reason = "model_stopped_without_terminal_action"
@@ -196,6 +257,9 @@ class TravelWeaverAgentLoop(ToolAgentLoop):
                 "reward_detail": detail,
                 "steps": self._audit_steps,
             }
+            self._write_rollout_trace(
+                output, task_id=task_id, task_dir=task_dir, kwargs=kwargs
+            )
             return output
         finally:
             self._env.close()
@@ -245,6 +309,19 @@ class TravelWeaverAgentLoop(ToolAgentLoop):
         if state == AgentState.TERMINATED:
             self._mark_trajectory_length_exceeded()
         return state
+
+
+def _json_encode_default(value: Any) -> Any:
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except ValueError:
+            pass
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def trajectory_response_budget(

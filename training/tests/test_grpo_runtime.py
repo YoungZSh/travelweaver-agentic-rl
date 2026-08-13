@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -303,6 +304,13 @@ def test_four_gpu_launcher_preserves_two_gpu_training_semantics() -> None:
         'export MAX_TOKEN_LEN_PER_GPU="24576"',
         'export GPU_MEMORY_UTILIZATION="0.75"',
     }
+    assert "omini_sft_gpu_reservation_gpu" in wrapper
+    assert "Data_gen_Mass_V3/gpu_occupy.py" in wrapper
+    assert "trap restore_holders EXIT HUP INT TERM" in wrapper
+    preflight_offset = wrapper.index('SKIP_PREFLIGHT=0 DRY_RUN=1 "${BASE_LAUNCHER}"')
+    stop_offset = wrapper.rindex("\nstop_holders\n")
+    assert preflight_offset < stop_offset
+
     assert all(export in wrapper for export in expected_exports)
 
     base_launcher = (
@@ -312,3 +320,50 @@ def test_four_gpu_launcher_preserves_two_gpu_training_semantics() -> None:
     assert "actor_rollout_ref.rollout.data_parallel_size=${ROLLOUT_DP_SIZE}" in base_launcher
     assert 'GPU_PROCESS_REPORT="$(selected_gpu_processes)"' in base_launcher
     assert "TRAIN_BATCH_SIZE / PPO_MINI_BATCH_SIZE * PPO_EPOCHS != 2" in base_launcher
+    assert "trainer.rollout_data_dir=${ROLLOUT_DATA_DIR}" in base_launcher
+    assert "trainer.validation_data_dir=${VALIDATION_DATA_DIR}" in base_launcher
+    assert 'export TRAVELWEAVER_ROLLOUT_TRACE_DIR="${ALL_ROLLOUT_TRACE_DIR}"' in base_launcher
+
+
+def test_agent_loop_writes_complete_rollout_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_agent_loop_module()
+    monkeypatch.setenv("TRAVELWEAVER_ROLLOUT_TRACE_DIR", str(tmp_path))
+
+    class FakeTokenizer:
+        def decode(self, token_ids, *, skip_special_tokens: bool) -> str:
+            assert skip_special_tokens is False
+            return "|".join(str(token_id) for token_id in token_ids)
+
+    loop = module.TravelWeaverAgentLoop.__new__(module.TravelWeaverAgentLoop)
+    loop.tokenizer = FakeTokenizer()
+    output = SimpleNamespace(
+        prompt_ids=[1, 2],
+        response_ids=[3, 4, 5],
+        response_mask=[1, 1, 0],
+        num_turns=2,
+        reward_score=0.75,
+        extra_fields={
+            "reward_extra_info": {"travelweaver_reward": 0.75},
+            "travelweaver_audit": {"steps": [{"action": {"tool": "search"}}]},
+        },
+    )
+
+    loop._write_rollout_trace(
+        output,
+        task_id="task-1",
+        task_dir="/tasks",
+        kwargs={"index": 7, "scenario_id": "scenario-1"},
+    )
+
+    trace_files = list(tmp_path.glob("*.json"))
+    assert len(trace_files) == 1
+    trace = json.loads(trace_files[0].read_text(encoding="utf-8"))
+    assert trace["format_version"] == "travelweaver-grpo-rollout-trace-v1"
+    assert trace["task_id"] == "task-1"
+    assert trace["prompt_text"] == "1|2"
+    assert trace["response_text"] == "3|4|5"
+    assert trace["response_mask_rle"] == [[1, 2], [0, 1]]
+    assert trace["reward_score"] == 0.75
+    assert trace["travelweaver_audit"]["steps"][0]["action"]["tool"] == "search"
