@@ -236,21 +236,21 @@ PYTHONPATH=training/src:src uv run --project training python \
   --output data/grpo/<combined-batch>/train.parquet
 ```
 
-The two-A800 launcher fixes `rollout.n=8`, disables GRPO standard-deviation normalization, and
-filters every constant-reward group, including constant negative groups. It safely checkpoints and
-stops after ten consecutive valid constant-reward groups; any usable group resets the streak.
+The two-A800 baseline launcher fixes `rollout.n=8`, disables GRPO standard-deviation normalization,
+and filters every constant-reward group, including constant negative groups. It safely checkpoints
+and stops after ten consecutive valid constant-reward groups; any usable group resets the streak.
 The strict trajectory cap is 32,768 total tokens, including the initial prompt, assistant output,
 and serialized tool observations. The AgentLoop derives each sample's response budget after prompt
 tokenization. A trajectory terminated by the cap invalidates its whole eight-rollout group, which is
 discarded and refilled without affecting the consecutive no-signal counter. Validation keeps capped
 samples in its denominator and reports them as failures plus a separate overflow rate.
 The 1,000-task pilot uses a deterministic 900/100 train/validation split, keeps actor/reference
-parameter, optimizer, and activation offload disabled, and reserves 80% of GPU memory for
-colocated vLLM. With Ulysses SP=2, the actor/ref dynamic token cap is 16,384 per GPU, giving a 32K
-effective sequence budget. Liger, veRL's Triton fused log-prob/cross-entropy path, fused AdamW, and
-TF32 reduce memory and compute overhead without enabling CPU offload. Validation runs once before
-training and again at the final step; both metrics and ten sampled validation generations are logged
-to W&B.
+parameter, optimizer, and activation offload disabled. The colocated vLLM memory fraction is capped
+at 65%; 80% cannot remap the KV cache after a GPU-only actor update. With Ulysses SP=2, the actor/ref
+dynamic token cap is 16,384 per GPU, giving a 32K effective sequence budget. Liger, veRL's Triton
+fused log-prob/cross-entropy path, fused AdamW, and TF32 reduce memory and compute overhead without
+enabling CPU offload. Validation runs once before training and again at the final step; both metrics
+and ten sampled validation generations are logged to W&B.
 
 The 1K-prompt profile uses eight prompt groups per global step and eight rollouts per group, for
 64 real trajectories per step. veRL v1 interprets `ppo_mini_batch_size` in prompt-group units and
@@ -267,6 +267,19 @@ TRAIN_FILE=data/grpo/<batch>/train.parquet \
 MODEL_PATH=training/outputs/<sft-run>/final-model \
 GPU_HOLD_HANDOFF=1 \
 bash training/scripts/run_qwen3_5_4b_travelweaver_grpo.sh
+```
+
+On the eight-A800 `g0008` host, the four-GPU profile uses GPUs 0-3. It preserves the baseline's
+eight prompt groups, eight rollouts per group, PPO mini-batch of four, two actor updates per global
+step, 112 steps, and 7,168 total training trajectories. The extra GPUs provide two colocated TP=2
+vLLM replicas with 16 AgentLoop workers; FSDP uses SP=2 and DP=2. A real launch refuses to start if
+any selected GPU has a compute process. A CPU-only dry-run remains safe while GPUs are occupied.
+
+```bash
+TRAIN_FILE=/ssd/home/zc/travelweaver-agentic-rl/data/grpo/chinatravel-grpo-v4-1000-split90-10-zca800/train.parquet \
+VAL_FILE=/ssd/home/zc/travelweaver-agentic-rl/data/grpo/chinatravel-grpo-v4-1000-split90-10-zca800/validation.parquet \
+MODEL_PATH=/ssd/home/zc/travelweaver-agentic-rl/training/outputs/travelweaver-sft/chinatravel-deepseek-react-1500-train90-test10-3ep-a800x2-seed20260811/checkpoints/global_step_252/huggingface \
+bash training/scripts/run_qwen3_5_4b_travelweaver_grpo_4gpu.sh --dry-run
 ```
 
 The default profile uses vLLM TP=2, FSDP2 plus Ulysses SP=2, and a strict 32,768-token trajectory cap.

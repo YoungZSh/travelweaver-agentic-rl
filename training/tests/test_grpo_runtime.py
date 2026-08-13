@@ -279,3 +279,34 @@ def test_grpo_prompt_split_preserves_rare_scenario_quota() -> None:
     ]
     assert selected_scenarios.count("normal") == 9
     assert selected_scenarios.count("price_change") == 1
+
+
+def test_four_gpu_launcher_preserves_two_gpu_training_semantics() -> None:
+    training_root = Path(__file__).resolve().parents[1]
+    wrapper = (
+        training_root / "scripts" / "run_qwen3_5_4b_travelweaver_grpo_4gpu.sh"
+    ).read_text(encoding="utf-8")
+    expected_exports = {
+        'export CUDA_VISIBLE_DEVICES="0,1,2,3"',
+        'export NUM_GPUS="4"',
+        'export GROUP_SIZE="8"',
+        'export TRAIN_BATCH_SIZE="8"',
+        'export PPO_MINI_BATCH_SIZE="4"',
+        'export PPO_EPOCHS="1"',
+        'export TOTAL_STEPS="112"',
+        'export SP_SIZE="2"',
+        'export ROLLOUT_TP_SIZE="2"',
+        'export ROLLOUT_DP_SIZE="1"',
+        'export ROLLOUT_MAX_NUM_SEQS="8"',
+        'export AGENT_NUM_WORKERS="16"',
+        'export DATALOADER_NUM_WORKERS="4"',
+    }
+    assert all(export in wrapper for export in expected_exports)
+
+    base_launcher = (
+        training_root / "scripts" / "run_qwen3_5_4b_travelweaver_grpo.sh"
+    ).read_text(encoding="utf-8")
+    assert "num_replicas = world_size // rollout_world_size" in base_launcher
+    assert "actor_rollout_ref.rollout.data_parallel_size=${ROLLOUT_DP_SIZE}" in base_launcher
+    assert 'GPU_PROCESS_REPORT="$(selected_gpu_processes)"' in base_launcher
+    assert "TRAIN_BATCH_SIZE / PPO_MINI_BATCH_SIZE * PPO_EPOCHS != 2" in base_launcher
