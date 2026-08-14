@@ -12,6 +12,143 @@ from typing import Any
 import transfer_queue as tq
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
 
+GroupRecord = tuple[str, list[dict[str, Any]]]
+QUALITY_DIMENSIONS = ("artifact_score", "validity_score", "goal_score")
+
+
+def build_sampling_metrics(
+    *,
+    initial_uids: set[str],
+    group_records: dict[str, GroupRecord],
+    refill_groups: int,
+    selected_uids: set[str],
+    group_size: int,
+) -> dict[str, float | int]:
+    """Summarize fixed initial sampling separately from adaptive refill traffic."""
+
+    prefix = "training"
+    initial_records = {
+        uid: record for uid, record in group_records.items() if uid in initial_uids
+    }
+    initial_infos = [info for _, infos in initial_records.values() for info in infos]
+    valid_rewards = [
+        float(info["travelweaver_reward"])
+        for info in initial_infos
+        if bool(float(info.get("reward_valid", 0.0)))
+        and "travelweaver_reward" in info
+    ]
+    initial_successes = [
+        bool(float(info.get("reward_valid", 0.0)))
+        and bool(float(info.get("all_hard_pass", 0.0)))
+        for info in initial_infos
+    ]
+    complete_initial_groups = [
+        infos for _, infos in initial_records.values() if len(infos) == group_size
+    ]
+    outcome_counts: Counter[str] = Counter()
+    for infos in complete_initial_groups:
+        successes = sum(
+            bool(float(info.get("reward_valid", 0.0)))
+            and bool(float(info.get("all_hard_pass", 0.0)))
+            for info in infos
+        )
+        if successes == 0:
+            outcome_counts["unsolved"] += 1
+        elif successes == group_size:
+            outcome_counts["mastered"] += 1
+        else:
+            outcome_counts["frontier"] += 1
+
+    classification_counts = Counter(classification for classification, _ in group_records.values())
+    filtered_outcomes: Counter[str] = Counter()
+    for classification, infos in group_records.values():
+        if classification != "zero_variance" or len(infos) != group_size:
+            continue
+        successes = sum(
+            bool(float(info.get("reward_valid", 0.0)))
+            and bool(float(info.get("all_hard_pass", 0.0)))
+            for info in infos
+        )
+        if successes == 0:
+            filtered_outcomes["unsolved"] += 1
+        elif successes == group_size:
+            filtered_outcomes["mastered"] += 1
+        else:
+            filtered_outcomes["other"] += 1
+
+    initial_group_count = len(initial_uids)
+    completed_initial_count = len(complete_initial_groups)
+    dispatched_groups = initial_group_count + refill_groups
+    completed_trajectories = sum(len(infos) for _, infos in group_records.values())
+    metrics: dict[str, float | int] = {
+        f"{prefix}/policy_quality/raw_initial/completed_groups": completed_initial_count,
+        f"{prefix}/policy_quality/raw_initial/reward_valid_rate": (
+            sum(bool(float(info.get("reward_valid", 0.0))) for info in initial_infos)
+            / len(initial_infos)
+            if initial_infos
+            else 0.0
+        ),
+        f"{prefix}/policy_quality/raw_initial/reward_mean": (
+            sum(valid_rewards) / len(valid_rewards) if valid_rewards else 0.0
+        ),
+        f"{prefix}/policy_quality/raw_initial/success_avg_at_{group_size}": (
+            sum(initial_successes) / len(initial_successes) if initial_successes else 0.0
+        ),
+        f"{prefix}/policy_quality/raw_initial/pass_at_{group_size}": (
+            (outcome_counts["frontier"] + outcome_counts["mastered"])
+            / completed_initial_count
+            if completed_initial_count
+            else 0.0
+        ),
+        f"{prefix}/policy_quality/raw_initial/unsolved_at_{group_size}": (
+            outcome_counts["unsolved"] / completed_initial_count
+            if completed_initial_count
+            else 0.0
+        ),
+        f"{prefix}/policy_quality/raw_initial/frontier_at_{group_size}": (
+            outcome_counts["frontier"] / completed_initial_count
+            if completed_initial_count
+            else 0.0
+        ),
+        f"{prefix}/policy_quality/raw_initial/mastered_at_{group_size}": (
+            outcome_counts["mastered"] / completed_initial_count
+            if completed_initial_count
+            else 0.0
+        ),
+        f"{prefix}/sampler/initial_groups": initial_group_count,
+        f"{prefix}/sampler/refill_groups": refill_groups,
+        f"{prefix}/sampler/dispatched_groups": dispatched_groups,
+        f"{prefix}/sampler/completed_groups": len(group_records),
+        f"{prefix}/sampler/selected_groups": len(selected_uids),
+        f"{prefix}/sampler/filtered_zero_variance_groups": classification_counts[
+            "zero_variance"
+        ],
+        f"{prefix}/sampler/filtered_unsolved_groups": filtered_outcomes["unsolved"],
+        f"{prefix}/sampler/filtered_mastered_groups": filtered_outcomes["mastered"],
+        f"{prefix}/sampler/filtered_other_zero_variance_groups": filtered_outcomes[
+            "other"
+        ],
+        f"{prefix}/sampler/invalid_groups": classification_counts["invalid"],
+        f"{prefix}/sampler/length_exceeded_groups": classification_counts[
+            "length_exceeded"
+        ],
+        f"{prefix}/sampler/refill_overhead_ratio": (
+            refill_groups / initial_group_count if initial_group_count else 0.0
+        ),
+        f"{prefix}/sampler/dispatched_trajectories": dispatched_groups * group_size,
+        f"{prefix}/sampler/completed_trajectories": completed_trajectories,
+    }
+    for dimension in QUALITY_DIMENSIONS:
+        values = [
+            float(info[dimension])
+            for info in initial_infos
+            if bool(float(info.get("reward_valid", 0.0))) and dimension in info
+        ]
+        metrics[f"{prefix}/policy_quality/raw_initial/{dimension}_mean"] = (
+            sum(values) / len(values) if values else 0.0
+        )
+    return metrics
+
 
 def classify_reward_group(
     reward_infos: list[dict[str, Any]], *, group_size: int, tolerance: float
@@ -67,18 +204,28 @@ class TravelWeaverReplayBuffer(ReplayBuffer):
         self._classification: dict[str, dict[str, tuple[str, float | None]]] = defaultdict(dict)
         self._length_diagnostics: dict[str, dict[str, tuple[int, float]]] = defaultdict(dict)
         self._length_max_since_sample = 0.0
+        self._upstream_refill_fn = kwargs.pop("refill_fn")
+        self._sampling_initial_uids: set[str] | None = None
+        self._sampling_group_records: dict[str, GroupRecord] | None = None
+        self._sampling_refill_groups = 0
         self.consecutive_no_signal = 0
         self.no_signal_history: list[dict[str, Any]] = []
         self._load_state()
         super().__init__(
             *args,
             **kwargs,
+            refill_fn=self._tracked_refill,
             filter_groups_metric="travelweaver_reward",
             train_batch_size=int(sampler_kwargs.get("train_batch_size", 1)),
             gen_batch_size=1,
             max_inflight_gen_batches=1,
             sync_refill_failed_groups=True,
         )
+
+    def _tracked_refill(self, num_prompts: int) -> int:
+        if self._sampling_group_records is not None:
+            self._sampling_refill_groups += num_prompts
+        return int(self._upstream_refill_fn(num_prompts))
 
     def _dapo_filtered_keys(self, partition_id: str) -> tuple[set[str], Counter]:
         if partition_id == "val":
@@ -124,6 +271,8 @@ class TravelWeaverReplayBuffer(ReplayBuffer):
                 tolerance=self.zero_variance_tolerance,
             )
             cache[uid] = (classification, shared)
+            if self._sampling_group_records is not None:
+                self._sampling_group_records[uid] = (classification, reward_infos)
             length_diagnostics[uid] = (
                 sum(
                     bool(float(info.get("trajectory_length_exceeded", 0.0)))
@@ -192,7 +341,32 @@ class TravelWeaverReplayBuffer(ReplayBuffer):
         self, global_steps: int, partition_id: str, batch_size: int
     ) -> tuple[Any, dict[str, Any]]:
         self._length_max_since_sample = 0.0
-        batch, metrics = super().sample(global_steps, partition_id, batch_size)
+        if partition_id == "train":
+            self._sync_metadata_from_transfer_queue()
+            self._sampling_initial_uids = set(self.prompt_global_steps[partition_id])
+            self._sampling_group_records = {}
+            self._sampling_refill_groups = 0
+        try:
+            batch, metrics = super().sample(global_steps, partition_id, batch_size)
+            if partition_id == "train":
+                selected_uids = {
+                    key.split("_")[0]
+                    for key, tag in zip(batch.keys, batch.tags, strict=True)
+                    if not tag.get("is_padding", False)
+                }
+                metrics.update(
+                    build_sampling_metrics(
+                        initial_uids=self._sampling_initial_uids or set(),
+                        group_records=self._sampling_group_records or {},
+                        refill_groups=self._sampling_refill_groups,
+                        selected_uids=selected_uids,
+                        group_size=self.group_size,
+                    )
+                )
+        finally:
+            self._sampling_initial_uids = None
+            self._sampling_group_records = None
+            self._sampling_refill_groups = 0
         selected_lengths = [
             float(tag["seq_len"])
             for tag in batch.tags

@@ -71,16 +71,55 @@ def _write_prompt_source(path: Path, task_id: str) -> None:
     (path / "manifest.json").write_text("{}\n", encoding="utf-8")
 
 
-def _reward_info(reward: float, *, valid: bool = True) -> dict[str, float]:
+def _reward_info(
+    reward: float, *, valid: bool = True, hard_pass: bool | None = None
+) -> dict[str, float]:
+    if hard_pass is None:
+        hard_pass = reward == 1.0
     return {
         "travelweaver_reward": reward,
         "reward_valid": float(valid),
+        "all_hard_pass": float(hard_pass),
         "artifact_score": 0.75,
         "validity_score": 0.5,
         "goal_score": 0.25,
         "trajectory_length_exceeded": 0.0,
         "sequence_tokens": 1024.0,
     }
+
+
+def test_sampling_metrics_keep_initial_quality_separate_from_adaptive_refills() -> None:
+    module = _load_sampler_module()
+    mastered = [_reward_info(1.0) for _ in range(8)]
+    frontier = [
+        *[_reward_info(1.0) for _ in range(4)],
+        *[_reward_info(0.0) for _ in range(4)],
+    ]
+    refill_unsolved = [_reward_info(0.0) for _ in range(8)]
+
+    metrics = module.build_sampling_metrics(
+        initial_uids={"initial-mastered", "initial-frontier"},
+        group_records={
+            "initial-mastered": ("zero_variance", mastered),
+            "initial-frontier": ("usable", frontier),
+            "refill-unsolved": ("zero_variance", refill_unsolved),
+        },
+        refill_groups=1,
+        selected_uids={"initial-frontier", "another-frontier"},
+        group_size=8,
+    )
+
+    assert metrics["training/policy_quality/raw_initial/success_avg_at_8"] == 0.75
+    assert metrics["training/policy_quality/raw_initial/pass_at_8"] == 1.0
+    assert metrics["training/policy_quality/raw_initial/unsolved_at_8"] == 0.0
+    assert metrics["training/policy_quality/raw_initial/frontier_at_8"] == 0.5
+    assert metrics["training/policy_quality/raw_initial/mastered_at_8"] == 0.5
+    assert metrics["training/sampler/initial_groups"] == 2
+    assert metrics["training/sampler/refill_groups"] == 1
+    assert metrics["training/sampler/selected_groups"] == 2
+    assert metrics["training/sampler/filtered_unsolved_groups"] == 1
+    assert metrics["training/sampler/filtered_mastered_groups"] == 1
+    assert metrics["training/sampler/refill_overhead_ratio"] == 0.5
 
 
 def test_group_filter_rejects_every_constant_reward_level() -> None:
