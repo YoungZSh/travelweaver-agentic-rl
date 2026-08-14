@@ -15,6 +15,7 @@ SP_SIZE="${SP_SIZE:-2}"
 ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-2}"
 ROLLOUT_DP_SIZE="${ROLLOUT_DP_SIZE:-1}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-1}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-4}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-2}"
@@ -100,7 +101,8 @@ if [[ "${GPU_MEMORY_UTILIZATION}" != "${EXPECTED_GPU_MEMORY_UTILIZATION}" ]]; th
 fi
 for value in \
     "${NUM_GPUS}" "${GROUP_SIZE}" "${SP_SIZE}" "${ROLLOUT_TP_SIZE}" \
-    "${ROLLOUT_DP_SIZE}" "${TRAIN_BATCH_SIZE}" "${PPO_MINI_BATCH_SIZE}" \
+    "${ROLLOUT_DP_SIZE}" "${TRAIN_BATCH_SIZE}" "${VAL_BATCH_SIZE}" \
+    "${PPO_MINI_BATCH_SIZE}" \
     "${PPO_EPOCHS}" "${DATALOADER_NUM_WORKERS}" "${AGENT_NUM_WORKERS}" \
     "${ROLLOUT_MAX_NUM_SEQS}" \
     "${TOTAL_STEPS}" "${SAVE_FREQ}" "${TEST_FREQ}" "${MAX_ACTOR_CKPT_TO_KEEP}" \
@@ -192,7 +194,8 @@ if [[ "${SKIP_PREFLIGHT}" != "1" ]]; then
         "${TRAIN_FILE}" "${VAL_FILE}" "${MODEL_PATH}" "${GROUP_SIZE}" \
         "${NUM_GPUS}" "${SP_SIZE}" "${MAX_PROMPT_LENGTH}" "${MAX_RESPONSE_LENGTH}" \
         "${TRAJECTORY_MAX_TOKENS}" "${MAX_TOKEN_LEN_PER_GPU}" \
-        "${TRAIN_BATCH_SIZE}" "${PPO_MINI_BATCH_SIZE}" "${PPO_EPOCHS}" \
+        "${TRAIN_BATCH_SIZE}" "${VAL_BATCH_SIZE}" "${PPO_MINI_BATCH_SIZE}" \
+        "${PPO_EPOCHS}" \
         "${ROLLOUT_TP_SIZE}" "${ROLLOUT_DP_SIZE}" "${ROLLOUT_MAX_NUM_SEQS}" \
         "${AGENT_NUM_WORKERS}" "${DATALOADER_NUM_WORKERS}" "${TOTAL_STEPS}" <<'PY'
 import hashlib
@@ -224,6 +227,7 @@ train_file, val_file, model_path = map(Path, sys.argv[1:4])
     trajectory_max_tokens,
     max_token_len_per_gpu,
     train_batch_size,
+    val_batch_size,
     ppo_mini_batch_size,
     ppo_epochs,
     rollout_tp_size,
@@ -242,6 +246,12 @@ expected_batch = (8, 4, 1)
 if (train_batch_size, ppo_mini_batch_size, ppo_epochs) != expected_batch:
     raise SystemExit(
         "The audited profiles keep train/PPO-mini/epochs=(8, 4, 1) across GPU counts."
+    )
+expected_val_batch_size = 1 if num_gpus == 2 else 16
+if val_batch_size != expected_val_batch_size:
+    raise SystemExit(
+        f"The audited {num_gpus}-GPU profile requires val_batch_size="
+        f"{expected_val_batch_size}."
     )
 if (rollout_tp_size, rollout_dp_size) != (2, 1):
     raise SystemExit("Audited rollout parallelism is TP=2 and per-engine DP=1.")
@@ -323,6 +333,7 @@ print(
             "event": "grpo_preflight_ok",
             "group_size": group_size,
             "train_batch_size_groups": train_batch_size,
+            "validation_batch_size": val_batch_size,
             "ppo_mini_batch_size_groups": ppo_mini_batch_size,
             "ppo_epochs": ppo_epochs,
             "trajectories_per_step": train_batch_size * group_size,
@@ -368,7 +379,7 @@ OVERRIDES=(
     "data.prompt_key=prompt"
     "data.train_batch_size=${TRAIN_BATCH_SIZE}"
     "data.gen_batch_size=1"
-    "data.val_batch_size=1"
+    "data.val_batch_size=${VAL_BATCH_SIZE}"
     "data.max_prompt_length=${MAX_PROMPT_LENGTH}"
     "data.max_response_length=${MAX_RESPONSE_LENGTH}"
     "data.filter_overlong_prompts=true"

@@ -333,6 +333,7 @@ def test_four_gpu_launcher_preserves_two_gpu_training_semantics() -> None:
         'export NUM_GPUS="4"',
         'export GROUP_SIZE="8"',
         'export TRAIN_BATCH_SIZE="8"',
+        'export VAL_BATCH_SIZE="16"',
         'export PPO_MINI_BATCH_SIZE="4"',
         'export PPO_EPOCHS="1"',
         'export TOTAL_STEPS="112"',
@@ -361,6 +362,8 @@ def test_four_gpu_launcher_preserves_two_gpu_training_semantics() -> None:
     assert "actor_rollout_ref.rollout.data_parallel_size=${ROLLOUT_DP_SIZE}" in base_launcher
     assert 'GPU_PROCESS_REPORT="$(selected_gpu_processes)"' in base_launcher
     assert "TRAIN_BATCH_SIZE / PPO_MINI_BATCH_SIZE * PPO_EPOCHS != 2" in base_launcher
+    assert 'VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-1}"' in base_launcher
+    assert 'data.val_batch_size=${VAL_BATCH_SIZE}' in base_launcher
     assert "trainer.rollout_data_dir=${ROLLOUT_DATA_DIR}" in base_launcher
     assert "trainer.validation_data_dir=${VALIDATION_DATA_DIR}" in base_launcher
     assert 'export TRAVELWEAVER_ROLLOUT_TRACE_DIR="${ALL_ROLLOUT_TRACE_DIR}"' in base_launcher
