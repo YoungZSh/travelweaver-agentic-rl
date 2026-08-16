@@ -15,6 +15,7 @@ from ..llm import DEFAULT_DEEPSEEK_CONCURRENCY, DeepSeekConfig
 from ..reward import TravelReward
 from ..tasks import TaskBlueprint, materialize_task_spec
 from .artifacts import ArtifactStore, record_bundle
+from .catalog import BLENDED_V1_1_PROFILE
 from .models import (
     GENERATOR_VERSION,
     PROMPT_VERSION,
@@ -103,7 +104,12 @@ class SurfaceRepolishPipeline:
                 "use allow_partial_input."
             )
         count = len(source_records)
-        profile = str(source_config.get("profile", "pilot_v2_1"))
+        profile = source_config.get("profile")
+        if profile != BLENDED_V1_1_PROFILE:
+            raise SynthesisError(
+                "Repolish only supports the current synthesis profile "
+                f"{BLENDED_V1_1_PROFILE!r}; found {profile!r}."
+            )
         seed = int(source_config.get("seed", 0))
         store = ArtifactStore(
             self.config.output_dir,

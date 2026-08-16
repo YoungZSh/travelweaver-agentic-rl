@@ -69,7 +69,13 @@ class _CanonicalClient:
         )
 
 
-def _record(index: int, origin: str, destination: str) -> dict[str, object]:
+def _record(
+    index: int,
+    origin: str,
+    destination: str,
+    *,
+    task_type: str = "medium_like",
+) -> dict[str, object]:
     slot = PilotSlot(
         index=index,
         origin=origin,
@@ -87,6 +93,7 @@ def _record(index: int, origin: str, destination: str) -> dict[str, object]:
         tightness="medium",
         scenario_profile="normal",
         surface_style="direct",
+        task_type=task_type,
         validation_profile="benchmark_natural",
     )
     blueprint = TaskBlueprint(
@@ -157,14 +164,28 @@ def test_surface_repolish_uses_configured_concurrency_and_writes_audit(
             {
                 "status": "complete",
                 "completed": 2,
-                "config": {"count": 2, "profile": "pilot_v2_1", "seed": 17},
+                "config": {
+                    "count": 2,
+                    "profile": "chinatravel_blended_v1_1",
+                    "seed": 17,
+                },
             }
         ),
         encoding="utf-8",
     )
-    for index, (origin, destination) in enumerate((("上海", "杭州"), ("北京", "南京"))):
+    for index, (origin, destination) in enumerate(
+        (("上海", "杭州"), ("北京", "南京"))
+    ):
         (records_dir / f"{index:03d}.json").write_text(
-            json.dumps(_record(index, origin, destination), ensure_ascii=False),
+            json.dumps(
+                _record(
+                    index,
+                    origin,
+                    destination,
+                    task_type=("medium_like", "easy_like")[index],
+                ),
+                ensure_ascii=False,
+            ),
             encoding="utf-8",
         )
     monkeypatch.setattr("travelweaver.synthesis.repolish.TravelReward", _RewardEvaluator)
@@ -205,7 +226,11 @@ def test_surface_repolish_canonical_only_makes_no_model_call(tmp_path, monkeypat
             {
                 "status": "complete",
                 "completed": 1,
-                "config": {"count": 1, "profile": "pilot_v2_1", "seed": 17},
+                "config": {
+                    "count": 1,
+                    "profile": "chinatravel_blended_v1_1",
+                    "seed": 17,
+                },
             }
         ),
         encoding="utf-8",
@@ -246,7 +271,11 @@ def test_surface_repolish_rejects_incomplete_source_by_default(tmp_path) -> None
             {
                 "status": "in_progress",
                 "completed": 1,
-                "config": {"count": 2, "profile": "pilot_v2_1", "seed": 17},
+                "config": {
+                    "count": 2,
+                    "profile": "chinatravel_blended_v1_1",
+                    "seed": 17,
+                },
             }
         ),
         encoding="utf-8",
@@ -257,6 +286,41 @@ def test_surface_repolish_rejects_incomplete_source_by_default(tmp_path) -> None
     )
 
     with pytest.raises(SynthesisError, match="input batch is incomplete"):
+        SurfaceRepolishPipeline(
+            RepolishConfig(
+                input_dir=input_dir,
+                output_dir=tmp_path / "output",
+                canonical_only=True,
+                max_api_calls=0,
+            ),
+            DeepSeekConfig(api_key="offline-canonical", model="deterministic-canonical"),
+        ).run()
+
+
+def test_surface_repolish_rejects_retired_profile(tmp_path) -> None:
+    input_dir = tmp_path / "input"
+    records_dir = input_dir / "records"
+    records_dir.mkdir(parents=True)
+    (input_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "completed": 1,
+                "config": {
+                    "count": 1,
+                    "profile": "chinatravel_blended_v1",
+                    "seed": 17,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (records_dir / "000.json").write_text(
+        json.dumps(_record(0, "上海", "杭州"), ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SynthesisError, match="only supports the current synthesis profile"):
         SurfaceRepolishPipeline(
             RepolishConfig(
                 input_dir=input_dir,
@@ -279,7 +343,11 @@ def test_surface_repolish_resumes_only_missing_slots_after_failure(
             {
                 "status": "complete",
                 "completed": 3,
-                "config": {"count": 3, "profile": "pilot_v2_1", "seed": 17},
+                "config": {
+                    "count": 3,
+                    "profile": "chinatravel_blended_v1_1",
+                    "seed": 17,
+                },
             }
         ),
         encoding="utf-8",
@@ -288,7 +356,15 @@ def test_surface_repolish_resumes_only_missing_slots_after_failure(
         (("上海", "杭州"), ("北京", "南京"), ("广州", "深圳"))
     ):
         (records_dir / f"{index:03d}.json").write_text(
-            json.dumps(_record(index, *cities), ensure_ascii=False), encoding="utf-8"
+            json.dumps(
+                _record(
+                    index,
+                    *cities,
+                    task_type=("human_like", "medium_like", "easy_like")[index],
+                ),
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
         )
     monkeypatch.setattr("travelweaver.synthesis.repolish.TravelReward", _RewardEvaluator)
     config = RepolishConfig(

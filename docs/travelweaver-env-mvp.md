@@ -1,6 +1,6 @@
 # TravelWeaverEnv Agent 闭环 MVP
 
-本文档记录第一阶段已经落地的查询环境、数据准备流程和版本边界。更完整的候选管理、行程提交、Reward、SFT 和 GRPO 设计见[项目设计记录](project-design.md)。
+本文档记录第一阶段已经落地的查询环境、数据准备流程和版本边界。当前端到端训练流程与实验结果见[项目 README](../README.md)，Reward 边界见[Reward 与评测契约](reward-and-evaluation.md)。
 
 ## 1. 目标与边界
 

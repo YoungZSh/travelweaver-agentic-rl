@@ -56,6 +56,7 @@ from ..synthesis import (
     SynthesisConfig,
     SynthesisPipeline,
 )
+from ..synthesis.catalog import BLENDED_V1_1_PROFILE, SUPPORTED_PROFILES
 
 
 def _print(payload: Any) -> None:
@@ -206,7 +207,7 @@ def _synthesize_tasks(args: argparse.Namespace) -> int:
     output_dir = (
         Path(args.output_dir)
         if args.output_dir
-        else project_root() / "data" / "generated" / "pilot-100-v2.1"
+        else project_root() / "data" / "generated" / "chinatravel-blended"
     )
     report = SynthesisPipeline(
         SynthesisConfig(
@@ -536,13 +537,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     synthesize.add_argument(
         "--profile",
-        choices=[
-            "pilot_v2_1",
-            "chinatravel_blended_v1",
-            "chinatravel_blended_v1_1",
-            "chinatravel_official_hybrid_v2",
-        ],
-        default="pilot_v2_1",
+        choices=SUPPORTED_PROFILES,
+        default=BLENDED_V1_1_PROFILE,
     )
     synthesize.set_defaults(handler=_synthesize_tasks)
 
@@ -612,7 +608,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     programmatic_sft = subparsers.add_parser(
         "generate-programmatic-sft",
-        help="Build deterministic 8:1:1 policy trajectories from synthesis witnesses.",
+        help=(
+            "Build deterministic evidence-grounded tool-call graph trajectories from "
+            "synthesis witnesses."
+        ),
     )
     programmatic_sft.add_argument("--input-dir", required=True)
     programmatic_sft.add_argument("--output", required=True)

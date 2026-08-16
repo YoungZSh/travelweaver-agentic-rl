@@ -139,22 +139,6 @@ class WitnessBuilder:
         usable_return = [
             item for item in usable_return if self._public_page_index(item) == 0
         ]
-        if (
-            slot.synthesis_profile == "chinatravel_official_hybrid_v2"
-            and slot.days == 1
-        ):
-            outbound_limit = 11 * 60 if slot.include_meal else 13 * 60
-            return_limit = 17 * 60 if slot.include_meal else 16 * 60
-            usable_outbound = [
-                item
-                for item in usable_outbound
-                if _minutes(item["arrival_time"]) <= outbound_limit
-            ]
-            usable_return = [
-                item
-                for item in usable_return
-                if _minutes(item["departure_time"]) >= return_limit
-            ]
         if not usable_outbound or not usable_return:
             raise SynthesisError(
                 f"No same-day {slot.outbound_mode}/{slot.return_mode} transport for "
@@ -204,11 +188,7 @@ class WitnessBuilder:
     ) -> WitnessResult:
         needs_restaurant = slot.include_meal
         hotel = self._select_hotel(slot, route_mode) if slot.days > 1 else None
-        attraction_targets = _attraction_targets(
-            slot,
-            outbound_arrival=str(outbound["arrival_time"]),
-            return_departure=str(return_transport["departure_time"]),
-        )
+        attraction_targets = (slot.attractions_per_day,) * slot.days
         attractions = self._select_attractions(
             slot,
             outbound_arrival=str(outbound["arrival_time"]),
@@ -1197,28 +1177,6 @@ class WitnessBuilder:
         return (preferred,) if preferred == "walk" else tuple(
             dict.fromkeys((preferred, "taxi"))
         )
-
-
-def _attraction_targets(
-    slot: PilotSlot,
-    *,
-    outbound_arrival: str,
-    return_departure: str,
-) -> tuple[int, ...]:
-    """Keep complete days dense while respecting the smaller first/last-day envelope."""
-
-    desired = slot.attractions_per_day
-    if slot.synthesis_profile != "chinatravel_official_hybrid_v2":
-        return (desired,) * slot.days
-    targets: list[int] = []
-    for day in range(1, slot.days + 1):
-        target = desired
-        if day == 1 and _minutes(outbound_arrival) > 10 * 60:
-            target = min(target, 1)
-        if day == slot.days and _minutes(return_departure) < 18 * 60:
-            target = min(target, 1)
-        targets.append(max(1, target))
-    return tuple(targets)
 
 
 def _count_gap_page_priority(page_index: int | None) -> tuple[int, int]:

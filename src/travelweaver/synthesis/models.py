@@ -29,7 +29,7 @@ class PilotSlot:
     tightness: str
     scenario_profile: str
     surface_style: str
-    synthesis_profile: str = "pilot_v2_1"
+    synthesis_profile: str = "chinatravel_blended_v1_1"
     task_type: str = "pilot"
     validation_profile: str = "strict"
     persona_context: str | None = None

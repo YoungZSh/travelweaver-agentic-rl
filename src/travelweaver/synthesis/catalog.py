@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
 from typing import TypeVar
 
 from .models import PilotSlot
@@ -20,19 +19,9 @@ _MODE_WEIGHTS = {
     ("train", "airplane"): 0.2,
     ("airplane", "train"): 0.2,
 }
-_DAY_WEIGHTS = {1: 0.10, 2: 0.30, 3: 0.35, 4: 0.15, 5: 0.10}
-_TRAVELER_WEIGHTS = {1: 0.225, 2: 0.225, 3: 0.225, 4: 0.225, 5: 0.05, 6: 0.05}
-_CONSTRAINT_WEIGHTS = {1: 0.10, 2: 0.20, 3: 0.30, 4: 0.25, 5: 0.10, 6: 0.05}
 _ROUTE_WEIGHTS = {"taxi": 0.4, "metro": 0.35, "walk": 0.25}
 _STRATEGY_WEIGHTS = {"early": 0.25, "cheap": 0.25, "short": 0.25, "balanced": 0.25}
 _DIFFICULTY_WEIGHTS = {"easy": 0.25, "medium": 0.50, "hard": 0.25}
-_SCENARIO_WEIGHTS = {
-    "normal": 0.70,
-    "poi_closure": 0.08,
-    "hotel_unavailable": 0.06,
-    "transport_cancellation": 0.08,
-    "price_change": 0.08,
-}
 _SURFACE_STYLE_WEIGHTS = {
     "direct": 0.1,
     "conversational": 0.1,
@@ -45,16 +34,9 @@ _SURFACE_STYLE_WEIGHTS = {
     "question": 0.1,
     "compact": 0.1,
 }
-BLENDED_PROFILE = "chinatravel_blended_v1"
 BLENDED_V1_1_PROFILE = "chinatravel_blended_v1_1"
-OFFICIAL_HYBRID_V2_PROFILE = "chinatravel_official_hybrid_v2"
-DEFAULT_PROFILE = "pilot_v2_1"
-SUPPORTED_PROFILES = (
-    DEFAULT_PROFILE,
-    BLENDED_PROFILE,
-    BLENDED_V1_1_PROFILE,
-    OFFICIAL_HYBRID_V2_PROFILE,
-)
+DEFAULT_PROFILE = BLENDED_V1_1_PROFILE
+SUPPORTED_PROFILES = (DEFAULT_PROFILE,)
 
 _BLENDED_TYPE_QUOTAS = {
     "easy_like": 50,
@@ -175,321 +157,12 @@ def build_pilot_slots(
 
     if count <= 0:
         raise ValueError("Synthesis count must be positive.")
-    if profile == OFFICIAL_HYBRID_V2_PROFILE:
-        return _build_official_hybrid_slots(count, seed)
-    if profile in {BLENDED_PROFILE, BLENDED_V1_1_PROFILE}:
-        return _build_blended_slots(count, seed, profile)
     if profile != DEFAULT_PROFILE:
         raise ValueError(f"Unknown synthesis profile: {profile}")
-
-    destinations = _quota_values(
-        count,
-        {city: 1.0 for city in _CITIES},
-        seed=seed,
-        scope="destinations",
-    )
-    origins = _balanced_origins(destinations, seed)
-    days = _quota_values(count, _DAY_WEIGHTS, seed=seed, scope="days")
-    travelers = _quota_values(count, _TRAVELER_WEIGHTS, seed=seed, scope="travelers")
-    constraint_counts = _quota_values(
-        count,
-        _CONSTRAINT_WEIGHTS,
-        seed=seed,
-        scope="constraint-counts",
-    )
-    patterns = _transport_patterns(destinations, seed)
-    route_modes = _quota_values(count, _ROUTE_WEIGHTS, seed=seed, scope="route-modes")
-    strategies = _quota_values(
-        count,
-        _STRATEGY_WEIGHTS,
-        seed=seed,
-        scope="transport-strategies",
-    )
-    tightnesses = _quota_values(
-        count,
-        _DIFFICULTY_WEIGHTS,
-        seed=seed,
-        scope="difficulties",
-    )
-    scenario_profiles = _quota_values(
-        count,
-        _SCENARIO_WEIGHTS,
-        seed=seed,
-        scope="scenario-profiles",
-    )
-    surface_styles = _quota_values(
-        count,
-        _SURFACE_STYLE_WEIGHTS,
-        seed=seed,
-        scope="surface-styles",
-    )
-    rich_flags = _quota_values(
-        count,
-        {False: 0.65, True: 0.35},
-        seed=seed,
-        scope="rich-itineraries",
-    )
-    meal_flags = _quota_values(
-        count,
-        {False: 0.55, True: 0.45},
-        seed=seed,
-        scope="meal-itineraries",
-    )
-
-    # Long trips remain below the 35-step rollout budget by using one attraction per day.
-    attractions_per_day = [
-        2 if rich and day <= 3 else 1
-        for rich, day in zip(rich_flags, days, strict=True)
-    ]
-    for index, profile in enumerate(scenario_profiles):
-        if profile == "hotel_unavailable" and days[index] == 1:
-            scenario_profiles[index] = "poi_closure"
-
-    recipe_usage: Counter[str] = Counter()
-    pair_usage: Counter[tuple[str, str]] = Counter()
-    slots: list[PilotSlot] = []
-    for index in range(count):
-        outbound_mode, return_mode = patterns[index]
-        recipe = _recipe(
-            index=index,
-            seed=seed,
-            days=days[index],
-            constraint_count=constraint_counts[index],
-            outbound_mode=outbound_mode,
-            return_mode=return_mode,
-            usage=recipe_usage,
-            pair_usage=pair_usage,
-        )
-        recipe_usage.update(recipe)
-        for left_index, left in enumerate(sorted(recipe)):
-            for right in sorted(recipe)[left_index + 1 :]:
-                pair_usage[(left, right)] += 1
-        include_meal = meal_flags[index] or any(
-            key.startswith("restaurant")
-            or key in {"include_restaurant", "innercity_mode"}
-            for key in recipe
-        )
-        slots.append(
-            PilotSlot(
-                index=index,
-                origin=origins[index],
-                destination=destinations[index],
-                days=days[index],
-                travelers=travelers[index],
-                outbound_mode=outbound_mode,
-                return_mode=return_mode,
-                constraint_count=constraint_counts[index],
-                recipe=recipe,
-                attractions_per_day=attractions_per_day[index],
-                include_meal=include_meal,
-                route_mode=route_modes[index],
-                transport_strategy=strategies[index],
-                tightness=tightnesses[index],
-                scenario_profile=scenario_profiles[index],
-                surface_style=surface_styles[index],
-                synthesis_profile=profile,
-            )
-        )
-    _validate_slots(slots)
-    return tuple(slots)
+    return _build_blended_slots(count, seed)
 
 
-def _build_official_hybrid_slots(count: int, seed: int) -> tuple[PilotSlot, ...]:
-    """Build the official-core plus generalization-tail v2 profile."""
-
-    base = list(_build_blended_slots(count, seed, BLENDED_V1_1_PROFILE))
-    batch_core = {
-        20260821: (184, 92, 94, 30),
-        20260822: (184, 92, 94, 30),
-        20260823: (184, 91, 94, 31),
-        20260824: (184, 91, 94, 31),
-        20260825: (183, 92, 95, 30),
-        20260826: (183, 92, 95, 30),
-        20260827: (183, 92, 94, 31),
-        20260828: (183, 92, 94, 31),
-    }
-    if count == 500 and seed in batch_core:
-        easy, medium, human, preference_base = batch_core[seed]
-        quotas = {
-            "easy_like": easy,
-            "medium_like": medium,
-            "human_like": human,
-            "preference_base": preference_base,
-            "preference_like": 50,
-            "generalization": 50,
-        }
-    else:
-        quotas = _scaled_quotas(
-            count,
-            {
-                "easy_like": 184,
-                "medium_like": 92,
-                "human_like": 94,
-                "preference_base": 30,
-                "preference_like": 50,
-                "generalization": 50,
-            },
-            seed,
-            "official-hybrid-types",
-        )
-    task_types = _exact_values(quotas, seed, "official-hybrid-types")
-    days = _quota_values(
-        count,
-        {1: 0.10, 2: 0.45, 3: 0.34, 4: 0.07, 5: 0.03, 6: 0.01},
-        seed=seed,
-        scope="official-hybrid-days",
-    )
-    travelers = _quota_values(
-        count,
-        {1: 0.30, 2: 0.30, 3: 0.22, 4: 0.16, 5: 0.01, 6: 0.005, 7: 0.005},
-        seed=seed,
-        scope="official-hybrid-travelers",
-    )
-    preference_indices = [
-        index for index, task_type in enumerate(task_types) if task_type == "preference_like"
-    ]
-    preference_batch_counts = {
-        20260821: (9, 9, 8, 8, 8, 8),
-        20260822: (8, 9, 9, 8, 8, 8),
-        20260823: (8, 8, 9, 9, 8, 8),
-        20260824: (8, 8, 8, 9, 9, 8),
-        20260825: (8, 8, 8, 8, 9, 9),
-        20260826: (9, 8, 8, 8, 8, 9),
-        20260827: (9, 9, 8, 8, 8, 8),
-        20260828: (8, 8, 9, 9, 8, 8),
-    }
-    if len(preference_indices) == 50 and seed in preference_batch_counts:
-        preference_quota = dict(
-            zip(_OFFICIAL_PREFERENCES, preference_batch_counts[seed], strict=True)
-        )
-        preferences = _exact_values(
-            preference_quota, seed, "official-hybrid-preferences"
-        )
-    else:
-        preferences = _balanced_repetitions(
-            _OFFICIAL_PREFERENCES,
-            len(preference_indices),
-            seed,
-            "official-hybrid-preferences",
-        )
-    preference_by_index = dict(zip(preference_indices, preferences, strict=True))
-    preference_kinds = [
-        (preference_by_index[index],) if index in preference_by_index else ()
-        for index in range(count)
-    ]
-    _ensure_preference_day_compatibility(task_types, preference_kinds, days)
-
-    scenario_indices = [
-        index for index, task_type in enumerate(task_types) if task_type == "generalization"
-    ]
-    scenario_values = _exact_values(
-        _scaled_quotas(
-            len(scenario_indices),
-            {
-                "price_change": 15,
-                "transport_cancellation": 13,
-                "poi_closure": 12,
-                "hotel_unavailable": 10,
-            },
-            seed,
-            "official-hybrid-scenarios",
-        ),
-        seed,
-        "official-hybrid-scenarios",
-    )
-    scenario_by_index = dict(zip(scenario_indices, scenario_values, strict=True))
-    for index in scenario_indices:
-        if scenario_by_index[index] != "hotel_unavailable" or days[index] > 1:
-            continue
-        replacement = next(
-            (
-                other
-                for other in scenario_indices
-                if scenario_by_index[other] != "hotel_unavailable" and days[other] > 1
-            ),
-            None,
-        )
-        if replacement is not None:
-            days[index], days[replacement] = days[replacement], days[index]
-
-    max_constraints = {
-        "easy_like": 2,
-        "medium_like": 4,
-        "human_like": 3,
-        "preference_base": 2,
-        "preference_like": 2,
-        "generalization": 4,
-    }
-    slots: list[PilotSlot] = []
-    for index, source in enumerate(base):
-        task_type = task_types[index]
-        recipe = tuple(key for key in source.recipe if key != "attraction_count")
-        # Preference candidates must remain comparable under one shared hard-feasible set.
-        # The official preference tail therefore varies only the audited preference metric;
-        # baseline hard-constraint coverage is supplied by the separate preference_base rows.
-        if task_type == "preference_like":
-            recipe = ()
-        if days[index] == 1:
-            recipe = tuple(key for key in recipe if key not in _HOTEL_KEYS)
-            recipe = tuple(
-                "attraction_categories_any"
-                if key == "attraction_categories_all"
-                else key
-                for key in recipe
-            )
-        recipe = recipe[: max_constraints[task_type]]
-        if task_type == "human_like":
-            persona = _persona(travelers[index], seed, index)
-            metadata_prefix = _metadata_prefix(
-                persona,
-                seed,
-                index,
-                profile=BLENDED_V1_1_PROFILE,
-                origin=source.origin,
-                destination=source.destination,
-                travelers=travelers[index],
-                days=days[index],
-            )
-        else:
-            persona = None
-            metadata_prefix = None
-        # The official-completeness profile always supplies one reasonable meal per day.
-        # Meal-related recipes still control what is stated as a hard user constraint.
-        include_meal = True
-        attractions_per_day = (
-            1
-            if days[index] >= 4
-            else deterministic_rng(seed, "official-hybrid-density", index).choices(
-                (1, 2, 3), weights=(0.20, 0.60, 0.20), k=1
-            )[0]
-        )
-        slots.append(
-            replace(
-                source,
-                days=days[index],
-                travelers=travelers[index],
-                constraint_count=len(recipe),
-                recipe=recipe,
-                attractions_per_day=attractions_per_day,
-                include_meal=include_meal,
-                scenario_profile=scenario_by_index.get(index, "normal"),
-                synthesis_profile=OFFICIAL_HYBRID_V2_PROFILE,
-                task_type=task_type,
-                validation_profile=(
-                    "human_conservative" if task_type == "human_like" else "benchmark_natural"
-                ),
-                persona_context=persona,
-                metadata_prefix=metadata_prefix,
-                preference_kinds=preference_kinds[index],
-            )
-        )
-    _validate_slots(slots)
-    if Counter(slot.task_type for slot in slots) != Counter(quotas):
-        raise RuntimeError("Official hybrid task-type quotas drifted.")
-    return tuple(slots)
-
-
-def _build_blended_slots(count: int, seed: int, profile: str) -> tuple[PilotSlot, ...]:
+def _build_blended_slots(count: int, seed: int) -> tuple[PilotSlot, ...]:
     type_quotas = blended_task_type_quotas(count, seed)
     task_types = _exact_values(type_quotas, seed, "blended-task-types")
     constraint_quotas = {
@@ -514,22 +187,8 @@ def _build_blended_slots(count: int, seed: int, profile: str) -> tuple[PilotSlot
         scope="blended-destinations",
     )
     origins = _balanced_origins(destinations, seed)
-    if profile == BLENDED_V1_1_PROFILE:
-        days = _v1_1_days(task_types, seed)
-        travelers = _v1_1_travelers(task_types, seed)
-    else:
-        days = _quota_values(
-            count,
-            _mixed_prior(_DAY_WEIGHTS),
-            seed=seed,
-            scope="blended-days",
-        )
-        travelers = _quota_values(
-            count,
-            _mixed_prior(_TRAVELER_WEIGHTS),
-            seed=seed,
-            scope="blended-travelers",
-        )
+    days = _v1_1_days(task_types, seed)
+    travelers = _v1_1_travelers(task_types, seed)
     patterns = _transport_patterns(destinations, seed)
     route_modes = _quota_values(count, _ROUTE_WEIGHTS, seed=seed, scope="blended-routes")
     strategies = _quota_values(
@@ -540,7 +199,7 @@ def _build_blended_slots(count: int, seed: int, profile: str) -> tuple[PilotSlot
     )
     _move_hotel_scenarios_to_multiday(scenarios, days)
     tightnesses = _blended_tightnesses(task_types, seed)
-    styles = _blended_styles(task_types, seed, profile)
+    styles = _blended_styles(task_types, seed)
     metadata_flags = _human_metadata_flags(task_types, seed)
     human_preference_counts = _human_preference_counts(task_types, seed)
     preference_like_kinds = _preference_like_kinds(task_types, seed)
@@ -558,7 +217,6 @@ def _build_blended_slots(count: int, seed: int, profile: str) -> tuple[PilotSlot
                 seed,
                 index,
                 preference_like_kinds[index][0],
-                profile,
             )
         else:
             recipe = _recipe(
@@ -570,15 +228,7 @@ def _build_blended_slots(count: int, seed: int, profile: str) -> tuple[PilotSlot
                 return_mode=return_mode,
                 usage=recipe_usage,
                 pair_usage=pair_usage,
-                family_weights=_mixed_prior(
-                    _CHINATRAVEL_CONSTRAINT_WEIGHTS
-                    if profile == BLENDED_V1_1_PROFILE
-                    else {
-                        key: value
-                        for key, value in _CHINATRAVEL_CONSTRAINT_WEIGHTS.items()
-                        if key not in _LOGIC_DIVERSITY_KEYS
-                    }
-                ),
+                family_weights=_mixed_prior(_CHINATRAVEL_CONSTRAINT_WEIGHTS),
             )
         recipe_usage.update(recipe)
         for left_index, left in enumerate(sorted(recipe)):
@@ -590,7 +240,6 @@ def _build_blended_slots(count: int, seed: int, profile: str) -> tuple[PilotSlot
                 persona,
                 seed,
                 index,
-                profile=profile,
                 origin=origins[index],
                 destination=destinations[index],
                 travelers=travelers[index],
@@ -601,17 +250,13 @@ def _build_blended_slots(count: int, seed: int, profile: str) -> tuple[PilotSlot
         )
         preferences = preference_like_kinds[index]
         if task_type == "human_like":
-            preferences = (
-                _pick_human_preferences_v1_1(
-                    human_preference_counts[index],
-                    seed,
-                    index,
-                    days=days[index],
-                    recipe=recipe,
-                    route_mode=route_modes[index],
-                )
-                if profile == BLENDED_V1_1_PROFILE
-                else _pick_human_preferences(human_preference_counts[index], seed, index)
+            preferences = _pick_human_preferences_v1_1(
+                human_preference_counts[index],
+                seed,
+                index,
+                days=days[index],
+                recipe=recipe,
+                route_mode=route_modes[index],
             )
         include_meal = any(
             key.startswith("restaurant")
@@ -640,9 +285,9 @@ def _build_blended_slots(count: int, seed: int, profile: str) -> tuple[PilotSlot
                 tightness=tightnesses[index],
                 scenario_profile=scenarios[index],
                 surface_style=styles[index],
-                synthesis_profile=profile,
+                synthesis_profile=BLENDED_V1_1_PROFILE,
                 task_type=task_type,
-                validation_profile=_validation_profile(task_type, seed, index, profile),
+                validation_profile=_validation_profile(task_type, seed, index),
                 persona_context=persona,
                 metadata_prefix=metadata_prefix,
                 preference_kinds=preferences,
@@ -817,19 +462,14 @@ def _dimension_by_type(
     return result
 
 
-def _blended_styles(
-    task_types: Sequence[str], seed: int, profile: str
-) -> list[str]:
+def _blended_styles(task_types: Sequence[str], seed: int) -> list[str]:
     strict_styles = tuple(_SURFACE_STYLE_WEIGHTS)
     result: list[str] = []
     for index, task_type in enumerate(task_types):
         if task_type == "human_like":
-            if profile == BLENDED_V1_1_PROFILE:
-                result.append(
-                    "human_v1_1_metadata" if index % 2 else "human_v1_1_dialogue"
-                )
-            else:
-                result.append("human_metadata" if index % 2 else "human_dialogue")
+            result.append(
+                "human_v1_1_metadata" if index % 2 else "human_v1_1_dialogue"
+            )
         else:
             result.append(deterministic_rng(seed, "blended-style", index).choice(strict_styles))
     return result
@@ -952,12 +592,6 @@ def _ensure_preference_day_compatibility(
         days[left], days[right] = days[right], days[left]
 
 
-def _pick_human_preferences(count: int, seed: int, index: int) -> tuple[str, ...]:
-    values = list(_HUMAN_PREFERENCES)
-    deterministic_rng(seed, "human-preferences", index).shuffle(values)
-    return tuple(values[:count])
-
-
 def _pick_human_preferences_v1_1(
     count: int,
     seed: int,
@@ -994,20 +628,15 @@ def _metadata_prefix(
     seed: int,
     index: int,
     *,
-    profile: str,
     origin: str,
     destination: str,
     travelers: int,
     days: int,
 ) -> str:
-    if profile == BLENDED_V1_1_PROFILE:
-        return (
-            f"[当前位置{origin},目标位置{destination},旅行人数{travelers},"
-            f"旅行天数{days},出行背景{persona}]"
-        )
-    labels = ("出行情况", "同行背景", "旅行背景", "人员情况", "这次出游", "同行关系", "出游方式")
-    label = deterministic_rng(seed, "metadata-label", index).choice(labels)
-    return f"[{label}：{persona}]"
+    return (
+        f"[当前位置{origin},目标位置{destination},旅行人数{travelers},"
+        f"旅行天数{days},出行背景{persona}]"
+    )
 
 
 def _preference_recipe(
@@ -1015,33 +644,27 @@ def _preference_recipe(
     seed: int,
     index: int,
     preference_kind: str,
-    profile: str,
 ) -> tuple[str, ...]:
-    if profile == BLENDED_V1_1_PROFILE:
-        safe = [
-            "total_budget",
-            "outbound_time",
-            "return_time",
-            "attraction_count",
-            "outbound_mode",
-            "return_mode",
-            "innercity_mode",
-        ]
-        if preference_kind in {"more_attractions", "relaxed_itinerary"}:
-            safe.remove("attraction_count")
-        if preference_kind == "less_walking":
-            safe.remove("innercity_mode")
-    else:
-        safe = ["outbound_mode", "return_mode", "innercity_mode"]
+    safe = [
+        "total_budget",
+        "outbound_time",
+        "return_time",
+        "attraction_count",
+        "outbound_mode",
+        "return_mode",
+        "innercity_mode",
+    ]
+    if preference_kind in {"more_attractions", "relaxed_itinerary"}:
+        safe.remove("attraction_count")
+    if preference_kind == "less_walking":
+        safe.remove("innercity_mode")
     deterministic_rng(seed, "preference-recipes", index).shuffle(safe)
     return tuple(safe[:count])
 
 
-def _validation_profile(task_type: str, seed: int, index: int, profile: str) -> str:
+def _validation_profile(task_type: str, seed: int, index: int) -> str:
     if task_type == "human_like":
         return "human_conservative"
-    if profile != BLENDED_V1_1_PROFILE:
-        return "strict"
     natural_share = {
         "easy_like": 0.70,
         "medium_like": 0.55,

@@ -100,6 +100,11 @@ uses only FSDP for training and vLLM for rollout generation.
 
 ## Qwen3.5 action-only and ReAct SFT data
 
+当前报告的 step 252 checkpoint 使用 1,500 条程序化 Tool-Graph ReAct 数据。工具动作由
+TravelWeaver 的可行 witness、证据依赖和真实环境执行确定；DeepSeek 只对冻结后的可见决策说明
+做受约束语言润色，不生成或修改动作策略。根目录的
+[`docs/tool-call-graph-sft.md`](../docs/tool-call-graph-sft.md)记录了构造与接纳边界。
+
 The root environment produces replay-verified `travelweaver-sft-v5` JSONL with an explicit
 `supervision_mode`. Action-only samples supervise tool calls, while clean ReAct samples also
 supervise visible `assistant.content` from thinking-disabled rollouts. Supplier-private

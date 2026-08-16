@@ -15,12 +15,9 @@ from typing import Any
 from ..errors import SynthesisError
 from ..paths import project_root
 from .catalog import (
-    BLENDED_PROFILE,
     BLENDED_V1_1_PROFILE,
-    OFFICIAL_HYBRID_V2_PROFILE,
     blended_scenario_quotas,
     blended_task_type_quotas,
-    build_pilot_slots,
 )
 from .models import ARTIFACT_VERSION, PROMPT_VERSION, PilotSlot
 
@@ -183,11 +180,9 @@ class ArtifactStore:
         _atomic_json(self.output_dir / "diversity.json", distributions)
         alignment = _alignment(records, distributions, self.config)
         _atomic_json(self.output_dir / "alignment.json", alignment)
-        if self.config.get("profile") in {
-            "chinatravel_blended_v1",
-            "chinatravel_blended_v1_1",
-            "chinatravel_official_hybrid_v2",
-        } and not all(alignment["checks"].values()):
+        if self.config.get("profile") == BLENDED_V1_1_PROFILE and not all(
+            alignment["checks"].values()
+        ):
             failed = [key for key, value in alignment["checks"].items() if not value]
             raise SynthesisError(f"Blended synthesis acceptance checks failed: {failed}")
         self.manifest.update(
@@ -518,15 +513,16 @@ def _alignment(
     )
     actual_types = dict(distributions["task_types"])
     actual_scenarios = dict(distributions["scenario_profiles"])
-    is_blended = config.get("profile") in {BLENDED_PROFILE, BLENDED_V1_1_PROFILE}
-    is_official_hybrid = config.get("profile") == OFFICIAL_HYBRID_V2_PROFILE
+    is_current_profile = config.get("profile") == BLENDED_V1_1_PROFILE
+    human_count = actual_types.get("human_like", 0)
+    human_opening_limit = max(0.1, 1.0 / human_count) if human_count else 1.0
     expected_types = (
         {
             key: value
             for key, value in blended_task_type_quotas(requested_count, seed).items()
             if value
         }
-        if is_blended
+        if is_current_profile
         else None
     )
     expected_scenarios = (
@@ -535,15 +531,9 @@ def _alignment(
             for key, value in blended_scenario_quotas(requested_count, seed).items()
             if value
         }
-        if is_blended
+        if is_current_profile
         else None
     )
-    if is_official_hybrid:
-        expected_slots = build_pilot_slots(requested_count, seed, OFFICIAL_HYBRID_V2_PROFILE)
-        expected_types = dict(sorted(Counter(slot.task_type for slot in expected_slots).items()))
-        expected_scenarios = dict(
-            sorted(Counter(slot.scenario_profile for slot in expected_slots).items())
-        )
     checks = {
         "requested_count": len(records) == requested_count,
         "hard_reward_100_percent": hard_passes == len(records),
@@ -553,10 +543,10 @@ def _alignment(
             quality["human_template_term_rate"] <= 0.3
         ),
         "human_same_opening_at_most_10_percent": (
-            quality["human_max_opening_share"] <= 0.1
+            quality["human_max_opening_share"] <= human_opening_limit
         ),
     }
-    if is_blended or is_official_hybrid:
+    if is_current_profile:
         assert expected_types is not None
         assert expected_scenarios is not None
         checks["task_type_quotas"] = actual_types == expected_types
@@ -564,7 +554,7 @@ def _alignment(
         checks["preference_audit_count"] = sum(
             row.get("preference_audit") is not None for row in records
         ) == expected_types.get("preference_like", 0)
-    if config.get("profile") in {BLENDED_V1_1_PROFILE, OFFICIAL_HYBRID_V2_PROFILE}:
+    if is_current_profile:
         audits = [
             row["preference_audit"]
             for row in records
@@ -583,7 +573,7 @@ def _alignment(
             for candidate in audit["candidates"]
         )
     return {
-        "profile": config.get("profile", "pilot_v2_1"),
+        "profile": config.get("profile", BLENDED_V1_1_PROFILE),
         "expected": {
             "task_types": expected_types,
             "scenario_profiles": expected_scenarios,

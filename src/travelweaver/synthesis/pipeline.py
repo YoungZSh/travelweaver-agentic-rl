@@ -22,7 +22,7 @@ from ..llm import DEFAULT_DEEPSEEK_CONCURRENCY, DeepSeekConfig
 from ..reward import TravelReward
 from ..tasks import TaskBlueprint, materialize_task_spec
 from .artifacts import ArtifactStore, record_bundle
-from .catalog import BLENDED_V1_1_PROFILE, OFFICIAL_HYBRID_V2_PROFILE, build_pilot_slots
+from .catalog import BLENDED_V1_1_PROFILE, SUPPORTED_PROFILES, build_pilot_slots
 from .compose import compose_blueprint
 from .models import (
     GENERATOR_VERSION,
@@ -96,7 +96,7 @@ class SynthesisConfig:
     count: int = 100
     seed: int = 20260807
     max_api_calls: int = 300
-    profile: str = "pilot_v2_1"
+    profile: str = BLENDED_V1_1_PROFILE
     validation_policy: str = "minimal_semantic"
     llm_concurrency: int = DEFAULT_DEEPSEEK_CONCURRENCY
     witness_concurrency: int = min(32, os.cpu_count() or 1)
@@ -116,6 +116,8 @@ class SynthesisConfig:
             )
         if self.validation_policy not in {"strict", "minimal_semantic"}:
             raise ValueError("Synthesis validation policy is unsupported.")
+        if self.profile not in SUPPORTED_PROFILES:
+            raise ValueError(f"Synthesis profile is unsupported: {self.profile}")
 
 
 @dataclass(frozen=True)
@@ -235,11 +237,10 @@ class SynthesisPipeline:
         )
         starting_api_calls = store.api_calls
         pending_slots = [slot for slot in slots if slot.index not in completed]
-        uid_version = "v3" if self.config.profile == OFFICIAL_HYBRID_V2_PROFILE else "v2"
         duplicate_task_ids = [
-            f"tw_syn_{uid_version}_{self.config.seed}_{slot.index:04d}"
+            f"tw_syn_v2_{self.config.seed}_{slot.index:04d}"
             for slot in pending_slots
-            if f"tw_syn_{uid_version}_{self.config.seed}_{slot.index:04d}" in task_ids
+            if f"tw_syn_v2_{self.config.seed}_{slot.index:04d}" in task_ids
         ]
         if duplicate_task_ids:
             raise SynthesisError(
@@ -538,8 +539,7 @@ class SynthesisPipeline:
     def _prepare_slot(
         self, slot: PilotSlot, blocked_blueprint_ids: frozenset[str]
     ) -> tuple[_PreparedCandidate, list[dict[str, Any]]]:
-        uid_version = "v3" if self.config.profile == OFFICIAL_HYBRID_V2_PROFILE else "v2"
-        uid = f"tw_syn_{uid_version}_{self.config.seed}_{slot.index:04d}"
+        uid = f"tw_syn_v2_{self.config.seed}_{slot.index:04d}"
         quarantine_rows: list[dict[str, Any]] = []
         errors: list[str] = []
         for candidate_attempt, (candidate_slot, origin) in enumerate(
@@ -607,9 +607,7 @@ class SynthesisPipeline:
         ).getrandbits(63)
         effective_slot = replace(slot, origin=origin)
         if (
-            effective_slot.synthesis_profile
-            in {BLENDED_V1_1_PROFILE, OFFICIAL_HYBRID_V2_PROFILE}
-            and effective_slot.task_type == "human_like"
+            effective_slot.task_type == "human_like"
             and effective_slot.metadata_prefix is not None
         ):
             effective_slot = replace(
@@ -652,27 +650,8 @@ class SynthesisPipeline:
                 uid=uid,
             )
             preference_audit = None
-        if effective_slot.synthesis_profile == OFFICIAL_HYBRID_V2_PROFILE:
-            selected_ids = {
-                str(item.get("place_id") or item.get("transport_id"))
-                for value in witness.selected.values()
-                for item in (value if isinstance(value, list) else [value])
-                if isinstance(item, Mapping)
-            }
-            changed_selected = sorted(
-                effect.target_id
-                for effect in scenario.effects
-                if effect.target_id in selected_ids
-            )
-            if changed_selected:
-                raise SynthesisError(
-                    "Official-hybrid Scenario changed a selected witness entity: "
-                    + ", ".join(changed_selected)
-                )
         if (
-            effective_slot.synthesis_profile
-            in {BLENDED_V1_1_PROFILE, OFFICIAL_HYBRID_V2_PROFILE}
-            and effective_slot.task_type == "human_like"
+            effective_slot.task_type == "human_like"
             and "less_walking" in effective_slot.preference_kinds
             and witness.route_mode == "walk"
         ):
@@ -862,16 +841,9 @@ class SynthesisPipeline:
         candidates: list[WitnessResult] = []
         errors: list[str] = []
         preference_kind = slot.preference_kinds[0]
-        vary_route = (
-            slot.synthesis_profile in {BLENDED_V1_1_PROFILE, OFFICIAL_HYBRID_V2_PROFILE}
-            and "innercity_mode" not in slot.recipe
-        )
+        vary_route = "innercity_mode" not in slot.recipe
         route_modes = (slot.route_mode,) if not vary_route else ("taxi", "metro", "walk")
-        max_candidates = (
-            12
-            if slot.synthesis_profile in {BLENDED_V1_1_PROFILE, OFFICIAL_HYBRID_V2_PROFILE}
-            else 6
-        )
+        max_candidates = 12
         for candidate_index in range(max_candidates):
             is_relaxed_long_trip = (
                 preference_kind == "relaxed_itinerary"
@@ -921,21 +893,14 @@ class SynthesisPipeline:
                 continue
             candidates.append(candidate)
             metrics = [_preference_metric(item, preference_kind) for item in candidates]
-            if len(candidates) >= 3 and (
-                slot.synthesis_profile
-                not in {BLENDED_V1_1_PROFILE, OFFICIAL_HYBRID_V2_PROFILE}
-                or len(set(metrics)) >= 2
-            ):
+            if len(candidates) >= 3 and len(set(metrics)) >= 2:
                 break
         if len(candidates) < 2:
             raise SynthesisError(
                 "Preference witness selection needs at least two feasible candidates: "
                 + " | ".join(errors[-2:])
             )
-        if (
-            slot.synthesis_profile in {BLENDED_V1_1_PROFILE, OFFICIAL_HYBRID_V2_PROFILE}
-            and len({_preference_metric(item, preference_kind) for item in candidates}) < 2
-        ):
+        if len({_preference_metric(item, preference_kind) for item in candidates}) < 2:
             raise SynthesisError(
                 f"Preference metric {preference_kind} did not distinguish feasible candidates."
             )

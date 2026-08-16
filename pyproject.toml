@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "travelweaver-agentic-rl"
 version = "0.1.0"
-description = "A deterministic query environment for long-horizon travel-planning agents."
+description = "A deterministic environment and post-training stack for travel-planning agents."
 readme = "README.md"
 requires-python = ">=3.10,<3.11"
 authors = [{ name = "TravelWeaver contributors" }]
